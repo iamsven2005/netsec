@@ -110,12 +110,13 @@ def make_neighbor(router_id, ip_address):
     }
 
 
-def make_context(interface_name, source_ip, router_id, area, mask, hello_interval, verbose):
+def make_context(interface_name, source_ip, router_id, area, mask, hello_interval, verbose, service_ip=None):
     return {
         "interface_name": interface_name,
         "source_ip": source_ip,
         "router_id": router_id,
         "ospf_area": area,
+        "service_ip": service_ip,
         "network_mask": mask,
         "designated_router": "0.0.0.0",
         "backup_designated_router": "0.0.0.0",
@@ -824,6 +825,7 @@ def main():
     parser = argparse.ArgumentParser(prog="ospf_full_adjacency.py")
     parser.add_argument("--iface", default=default_iface())
     parser.add_argument("--router-id", default=None)
+    parser.add_argument("--service-ip", default=None)
     parser.add_argument("--area", default="0.0.0.0")
     parser.add_argument("--mask", default="255.255.255.0")
     parser.add_argument("--interval", default=HELLO_INTERVAL, type=int)
@@ -832,12 +834,15 @@ def main():
 
     source_ip = get_local_ip(args.iface)
     router_id = args.router_id or source_ip
+    service_ip = str(ipaddress.IPv4Address(args.service_ip)) if args.service_ip else None
     log_message("=" * 52)
     log_message("  OSPFv2 Full Adjacency Engine")
     log_message(f"  iface={args.iface}  src={source_ip}  rid={router_id}  area={args.area}")
+    if service_ip:
+        log_message(f"  service-ip={service_ip}")
     log_message("=" * 52)
 
-    context = make_context(args.iface, source_ip, router_id, args.area, args.mask, args.interval, args.verbose)
+    context = make_context(args.iface, source_ip, router_id, args.area, args.mask, args.interval, args.verbose, service_ip=service_ip)
     refresh_local_router_lsa(context)
     run_engine(context)
 
