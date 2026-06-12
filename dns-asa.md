@@ -196,3 +196,282 @@ Check logs:
 show logging
 ```
 
+# S1 and S2 - OSPF Authentication
+
+On every OSPF transit interface:
+
+```cisco
+router ospf 1
+ router-id 1.1.1.1
+```
+
+S1:
+
+```cisco
+interface Gi0/1
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 CISCO123
+```
+
+S2:
+
+```cisco
+interface Gi0/1
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 CISCO123
+```
+
+Verify:
+
+```cisco
+show ip ospf neighbor
+```
+
+Result:
+
+```text
+Neighbor State = FULL
+```
+
+Attacker without key:
+
+```text
+No adjacency formed
+```
+
+---
+
+# S1 and S2 - Passive Interfaces
+
+Prevent clients from becoming OSPF neighbors.
+
+```cisco
+router ospf 1
+
+ passive-interface default
+
+ no passive-interface Gi0/1
+ no passive-interface Gi0/2
+```
+
+Where:
+
+```text
+Gi0/1 = S1-S2 link
+Gi0/2 = Router uplink
+```
+
+User VLAN interfaces remain passive.
+
+Verify:
+
+```cisco
+show ip protocols
+```
+
+---
+
+# S1 and S2 - Route Filtering
+
+Accept only known routes.
+
+```cisco
+ip prefix-list VALID_ROUTES seq 5 permit 192.168.1.0/24
+ip prefix-list VALID_ROUTES seq 10 permit 10.10.10.0/24
+```
+
+```cisco
+router ospf 1
+ distribute-list prefix VALID_ROUTES in
+```
+
+Result:
+
+```text
+Malicious OSPF routes rejected
+```
+
+---
+
+# DHCP Snooping
+
+Globally:
+
+```cisco
+ip dhcp snooping
+
+ip dhcp snooping vlan 10,20
+```
+
+---
+
+# Trust Only DHCP Server Port
+
+If DHCP server is connected to Gi0/24:
+
+```cisco
+interface Gi0/24
+ ip dhcp snooping trust
+```
+
+Everything else remains untrusted.
+
+---
+
+# Limit DHCP Packets
+
+User ports:
+
+```cisco
+interface range Gi0/1-23
+
+ ip dhcp snooping limit rate 10
+```
+
+Result:
+
+```text
+Rogue DHCP offers dropped
+DHCP starvation mitigated
+```
+
+---
+
+# Dynamic ARP Inspection
+
+Uses DHCP Snooping database.
+
+```cisco
+ip arp inspection vlan 10,20
+```
+
+Trust uplinks:
+
+```cisco
+interface Gi0/24
+ ip arp inspection trust
+```
+
+Verify:
+
+```cisco
+show ip arp inspection
+```
+
+---
+
+# IP Source Guard
+
+User-facing ports:
+
+```cisco
+interface range Gi0/1-23
+
+ ip verify source
+```
+
+Result:
+
+```text
+Host cannot spoof another IP
+```
+
+---
+
+# Port Security
+
+User-facing interfaces:
+
+```cisco
+interface range Gi0/1-23
+
+ switchport mode access
+
+ switchport port-security
+
+ switchport port-security maximum 1
+
+ switchport port-security mac-address sticky
+
+ switchport port-security violation shutdown
+```
+
+Verify:
+
+```cisco
+show port-security
+```
+
+---
+
+# BPDU Guard
+
+Stops rogue switches.
+
+```cisco
+spanning-tree portfast default
+
+spanning-tree portfast bpduguard default
+```
+
+---
+
+# DHCP Attack Detection Commands
+
+```cisco
+show ip dhcp snooping
+
+show ip dhcp snooping binding
+```
+
+You should see:
+
+```text
+Trusted ports
+Binding table
+Dropped DHCP packets
+```
+
+---
+
+# OSPF Attack Detection Commands
+
+```cisco
+show ip ospf neighbor
+
+show ip ospf database
+
+show ip route ospf
+```
+
+Before attack:
+
+```text
+Known neighbors only
+```
+
+Attack attempt:
+
+```text
+Neighbor fails authentication
+```
+
+---
+
+# TunnelVision-Specific Defense
+
+If you are using DHCP Option 121 for the demo:
+
+Monitor:
+
+```cisco
+debug ip dhcp server packet
+```
+
+and ensure DHCP pools only advertise:
+
+```cisco
+default-router
+dns-server
+```
+
