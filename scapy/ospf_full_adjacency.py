@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import platform
-import socket
+import subprocess
 import sys
 import threading
 import time
@@ -35,6 +35,9 @@ HELLO_INTERVAL = 10
 INITIAL_DBD_SEQ = 1000
 BASE_LSA_SEQUENCE = 0x80000001
 FULL_ADJACENCY_BUFFER_HELLOS = 2
+BACKBONE_AREA = "0.0.0.0"
+DEFAULT_ROUTER_ID = "99.99.99.99"
+OSPF_NBR_ROUTES_DB = {}
 
 DOWN = "DOWN"
 INIT = "INIT"
@@ -46,8 +49,14 @@ FULL = "FULL"
 
 ACTIVE_NEIGHBOR_STATES = (INIT, TWO_WAY, EXSTART, EXCHANGE, LOADING, FULL)
 DBD_READY_STATES = (EXSTART, EXCHANGE, LOADING, FULL)
-MENU_HELP_TEXT = "[MENU] 1=add Router-LSA route  2=show neighbors  3=show LSDB  q=close menu prompt"
+MENU_HELP_TEXT = (
+    "[MENU] Available commands: '1' adds a Router-LSA route, '2' shows neighbours, "
+    "'3' shows the LSDB, '4' shows OSPF_NBR_ROUTES_DB, 'q' hides the menu prompt, and "
+    "'m' shows it again."
+)
 MENU_PROMPT = "ospf-menu> "
+MENU_HIDDEN_PROMPT = "ospf-menu(hidden)> "
+MENU_HIDDEN_TEXT = "[MENU] The menu prompt is hidden. Type 'm' to show it again."
 
 
 def log_message(message):
@@ -57,12 +66,12 @@ def log_message(message):
 
 def default_iface():
     try:
-        interface_name = str(scapy_conf.iface)
+        interface_name = getattr(scapy_conf.iface, "name", str(scapy_conf.iface))
         if interface_name and interface_name != "None":
             return interface_name
     except Exception:
         pass
-    return {"Windows": "Ethernet", "Darwin": "en0"}.get(platform.system(), "eth0")
+    return "Ethernet" if platform.system() == "Windows" else "eth0"
 
 
 def read_interface_ip(interface_name):
@@ -72,23 +81,80 @@ def read_interface_ip(interface_name):
             return address
     except Exception:
         pass
+    if platform.system() == "Windows":
+        try:
+            if interface_name.startswith("\\Device\\"):
+                alias = scapy_conf.ifaces.dev_from_networkname(interface_name).name
+                address = get_if_addr(alias)
+            else:
+                network_name = scapy_conf.ifaces.dev_from_name(interface_name).network_name
+                address = get_if_addr(network_name)
+            if address and address != "0.0.0.0":
+                return address
+        except Exception:
+            pass
     return None
 
 
-def get_local_ip(interface_name):
-    address = read_interface_ip(interface_name)
-    if address:
-        return address
+def read_interface_netmask(interface_name):
     try:
-        socket_obj = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        socket_obj.connect(("8.8.8.8", 80))
-        address = socket_obj.getsockname()[0]
-        socket_obj.close()
-        if address and address != "0.0.0.0":
-            return address
+        if platform.system() == "Windows":
+            alias = interface_name
+            try:
+                if interface_name.startswith("\\Device\\"):
+                    alias = scapy_conf.ifaces.dev_from_networkname(interface_name).name
+                else:
+                    alias = scapy_conf.ifaces.dev_from_name(interface_name).name
+            except Exception:
+                pass
+            result = subprocess.run(
+                [
+                    "netsh",
+                    "interface",
+                    "ipv4",
+                    "show",
+                    "addresses",
+                    f"name={alias}",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            prefix_text = ""
+            for line in result.stdout.splitlines():
+                if "(mask " in line:
+                    prefix_text = line.split("(mask ", 1)[1].split(")", 1)[0].strip()
+                    break
+                if "Subnet Mask" in line:
+                    prefix_text = line.split(":", 1)[1].strip()
+                    break
+        else:
+            result = subprocess.run(
+                ["ip", "-o", "-f", "inet", "addr", "show", "dev", interface_name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            prefix_text = ""
+            for token in result.stdout.split():
+                if "/" in token and token.count(".") == 3:
+                    prefix_text = token.split("/", 1)[1]
+                    break
+        if prefix_text.count(".") == 3:
+            return prefix_text
+        if prefix_text.isdigit():
+            return str(ipaddress.IPv4Network(f"0.0.0.0/{prefix_text}", strict=False).netmask)
     except Exception:
         pass
-    sys.exit(f"[!] No usable IP for '{interface_name}'. Use --router-id.")
+    return None
+
+
+def read_interface_state(interface_name):
+    address = read_interface_ip(interface_name)
+    netmask = read_interface_netmask(interface_name) if address else None
+    if address and netmask:
+        return address, netmask
+    return None, None
 
 
 def make_neighbor(router_id, ip_address):
@@ -107,27 +173,23 @@ def make_neighbor(router_id, ip_address):
     }
 
 
-def make_context(interface_name, source_ip, router_id, area, mask, hello_interval, service_ip=None):
+def make_context(interface_name, source_ip, network_mask, hello_interval):
     return {
         "interface_name": interface_name,
         "source_ip": source_ip,
-        "router_id": router_id,
-        "ospf_area": area,
-        "service_ip": service_ip,
-        "network_mask": mask,
+        "router_id": DEFAULT_ROUTER_ID,
+        "network_mask": network_mask,
         "designated_router": "0.0.0.0",
         "backup_designated_router": "0.0.0.0",
         "hello_interval": hello_interval,
         "local_lsdb": [],
         "neighbors": {},
         "lock": threading.RLock(),
-        "interactive_enabled": True,
         "manual_router_links": [],
         "adjacency_ready_event": threading.Event(),
         "stop_event": threading.Event(),
         "full_adjacency_since": None,
         "menu_suppressed": False,
-        "menu_prompt_active": False,
         "source_ip_available": True,
     }
 
@@ -149,7 +211,7 @@ def send_packet(context, payload, destination=ALL_SPF_MULTICAST):
 
 
 def build_header(context, packet_type):
-    return OSPF_Hdr(version=2, type=packet_type, src=context["router_id"], area=context["ospf_area"])
+    return OSPF_Hdr(version=2, type=packet_type, src=context["router_id"], area=BACKBONE_AREA)
 
 
 def build_ls_update(context, lsa_packets):
@@ -191,14 +253,6 @@ def build_dbd(context, _neighbor_entry, is_initial_packet=False, has_more_packet
     return database_description_packet
 
 
-def describe_dbd_flags(flag_value):
-    return "".join([
-        "I" if flag_value & 0x04 else "-",
-        "M" if flag_value & 0x02 else "-",
-        "S" if flag_value & 0x01 else "-",
-    ])
-
-
 def normalize_metric(metric):
     metric_value = int(metric)
     if not 0 <= metric_value <= 0xFFFF:
@@ -230,6 +284,48 @@ def get_lsa_key(lsa_packet):
     return (lsa_packet.type, lsa_packet.id, lsa_packet.adrouter)
 
 
+def rebuild_ospf_nbr_routes_db(context):
+    global OSPF_NBR_ROUTES_DB
+    route_map = {}
+    full_neighbor_ids = {
+        neighbor["router_id"]
+        for neighbor in context["neighbors"].values()
+        if neighbor["state"] == FULL
+    }
+    for lsa_packet in context["local_lsdb"]:
+        if getattr(lsa_packet, "type", None) != 1:
+            continue
+        advertising_router = str(getattr(lsa_packet, "adrouter", "0.0.0.0"))
+        if advertising_router not in full_neighbor_ids:
+            continue
+        routes = []
+        for link in getattr(lsa_packet, "linklist", []):
+            if int(getattr(link, "type", 0)) != 3:
+                continue
+            network, netmask = normalize_network(
+                str(getattr(link, "id", "0.0.0.0")),
+                str(getattr(link, "data", "0.0.0.0")),
+            )
+            routes.append({
+                "network": network,
+                "netmask": netmask,
+                "metric": int(getattr(link, "metric", 0)),
+                "lsa_id": str(getattr(lsa_packet, "id", "0.0.0.0")),
+                "advertising_router": advertising_router,
+                "sequence": f"0x{getattr(lsa_packet, 'seq', 0):08x}",
+            })
+        if routes:
+            route_map[advertising_router] = routes
+    OSPF_NBR_ROUTES_DB = route_map
+
+
+def format_neighbor_status(neighbor):
+    status_message = f"[STATUS] {neighbor['router_id']} state={neighbor['state']} ip={neighbor['ip_address']}"
+    if neighbor["designated_router"] != "0.0.0.0" and neighbor["ip_address"] == neighbor["designated_router"]:
+        status_message += f" dr={neighbor['designated_router']}"
+    return status_message
+
+
 def find_lsa(context, lsa_type, lsa_id, advertising_router):
     for lsa_packet in context["local_lsdb"]:
         if get_lsa_key(lsa_packet) == (lsa_type, lsa_id, advertising_router):
@@ -244,9 +340,11 @@ def upsert_lsa(context, lsa_packet):
             continue
         if getattr(lsa_packet, "seq", 0) >= getattr(existing_lsa, "seq", 0):
             context["local_lsdb"][index] = lsa_packet.copy()
+            rebuild_ospf_nbr_routes_db(context)
             return True
         return False
     context["local_lsdb"].append(lsa_packet.copy())
+    rebuild_ospf_nbr_routes_db(context)
     return True
 
 
@@ -270,16 +368,12 @@ def flood_lsa_packets(context, lsa_packets):
             if neighbor["state"] == FULL
         ]
     if not full_neighbor_ids:
-        log_message("[LSUPD] No FULL neighbors available yet. LSA kept in the local LSDB only.")
         return False
-    log_message(
-        f"[LSUPD] Flooding {len(lsa_packets)} LSA(s) -> {ALL_DR_MULTICAST} "
-        f"(FULL neighbors: {', '.join(full_neighbor_ids)})"
-    )
     send_packet(context, build_ls_update(context, lsa_packets), destination=ALL_DR_MULTICAST)
     return True
 
 
+# Manual route advertisement only runs after stable FULL adjacency via the menu gate.
 def add_router_stub_route(context, prefix, mask, metric=10):
     network_prefix, network_mask = normalize_network(prefix, mask)
     stub_link = OSPF_Link(type=3, id=network_prefix, data=network_mask, metric=normalize_metric(metric))
@@ -293,11 +387,12 @@ def add_router_stub_route(context, prefix, mask, metric=10):
         sequence_number = next_lsa_sequence(context, 1, context["router_id"], context["router_id"])
         router_lsa = build_router_lsa(context, sequence_number=sequence_number)
         upsert_lsa(context, router_lsa)
+    flooded = flood_lsa_packets(context, [router_lsa])
+    scope_text = "and flooded to FULL neighbors" if flooded else "in the local LSDB only"
     log_message(
-        f"[LSDB] Updated Router-LSA adv={router_lsa.adrouter} stub={stub_link.id} mask={stub_link.data} "
-        f"metric={stub_link.metric} seq=0x{router_lsa.seq:08x}"
+        f"[ROUTES] Added Router-LSA route net={stub_link.id} mask={stub_link.data} "
+        f"metric={stub_link.metric} seq=0x{router_lsa.seq:08x} {scope_text}."
     )
-    flood_lsa_packets(context, [router_lsa])
     return router_lsa
 
 
@@ -323,8 +418,6 @@ def reorigin_self_router_lsa(context, sequence_number, reason=None):
     with context["lock"]:
         router_lsa = build_router_lsa(context, sequence_number=sequence_number)
         upsert_lsa(context, router_lsa)
-    if reason:
-        log_message(f"[LSDB] Re-originating self Router-LSA: {reason} seq=0x{router_lsa.seq:08x}")
     flood_lsa_packets(context, [router_lsa])
     return router_lsa
 
@@ -339,80 +432,72 @@ def refresh_local_router_lsa(context, bump_sequence=False):
         upsert_lsa(context, build_router_lsa(context, sequence_number=sequence_number))
 
 
-def sync_local_lsdb(context):
-    refresh_local_router_lsa(context)
-
-
 def reset_adjacency_state(context, reason):
     with context["lock"]:
-        neighbor_ids = sorted(context["neighbors"])
         context["neighbors"].clear()
         context["designated_router"] = "0.0.0.0"
         context["backup_designated_router"] = "0.0.0.0"
         context["full_adjacency_since"] = None
         context["adjacency_ready_event"].clear()
         context["menu_suppressed"] = False
+        rebuild_ospf_nbr_routes_db(context)
     log_message(f"[RESET] {reason}")
-    if neighbor_ids:
-        log_message(f"[RESET] Cleared neighbors: {', '.join(neighbor_ids)}")
-    else:
-        log_message("[RESET] No neighbors were active.")
 
 
 def refresh_runtime_source_ip(context):
-    current_ip = read_interface_ip(context["interface_name"])
+    current_ip, current_mask = read_interface_state(context["interface_name"])
     with context["lock"]:
         previous_ip = context["source_ip"]
+        previous_mask = context["network_mask"]
         ip_was_available = context["source_ip_available"]
 
-    if not current_ip:
+    if not current_ip or not current_mask:
         if ip_was_available:
             with context["lock"]:
                 context["source_ip_available"] = False
             reset_adjacency_state(
                 context,
-                f"Interface {context['interface_name']} lost its usable IPv4 address. Pausing hellos until a new address appears.",
+                f"Interface {context['interface_name']} lost its usable IPv4 address or netmask. Pausing hellos until a valid address returns.",
             )
         return False
 
     if not ip_was_available:
         with context["lock"]:
             context["source_ip"] = current_ip
+            context["network_mask"] = current_mask
             context["source_ip_available"] = True
         refresh_local_router_lsa(context, bump_sequence=True)
         reset_adjacency_state(
             context,
             f"Interface {context['interface_name']} recovered with IPv4 address {current_ip}. Restarting adjacency discovery.",
         )
-        if context["router_id"] == previous_ip:
-            log_message(
-                f"[INFO] Router ID remains {context['router_id']}. Restart the script or pass --router-id "
-                "if you want the router ID to match the recovered interface IP."
-            )
         return True
 
-    if current_ip == previous_ip:
+    if current_ip == previous_ip and current_mask == previous_mask:
         return True
 
     with context["lock"]:
         context["source_ip"] = current_ip
+        context["network_mask"] = current_mask
     refresh_local_router_lsa(context, bump_sequence=True)
-    reset_adjacency_state(
-        context,
-        f"Interface {context['interface_name']} changed IPv4 address {previous_ip} -> {current_ip}. Refreshing self-originated Router-LSA.",
-    )
-    if context["router_id"] == previous_ip:
-        log_message(
-            f"[INFO] Router ID remains {context['router_id']}. Restart the script or pass --router-id "
-            "if you want the router ID to match the new interface IP."
+    if current_ip != previous_ip:
+        reason = (
+            f"Interface {context['interface_name']} changed IPv4 address {previous_ip} -> {current_ip}. "
+            "Refreshing self-originated Router-LSA."
         )
+    else:
+        reason = (
+            f"Interface {context['interface_name']} changed IPv4 netmask {previous_mask} -> {current_mask}. "
+            "Refreshing self-originated Router-LSA."
+        )
+    reset_adjacency_state(context, reason)
     return True
 
 
 def show_neighbors(context):
     with context["lock"]:
         lines = [
-            f"[STATUS] {neighbor['router_id']} state={neighbor['state']} ip={neighbor['ip_address']} dr={neighbor['designated_router']}"
+            format_neighbor_status(neighbor)
             for neighbor in sorted(context["neighbors"].values(), key=lambda neighbor: neighbor["router_id"])
         ]
     if not lines:
@@ -423,8 +508,6 @@ def show_neighbors(context):
 
 
 def update_full_adjacency_gate(context):
-    if not context["interactive_enabled"]:
-        return
     ready_message = None
     lost_message = None
     with context["lock"]:
@@ -438,7 +521,7 @@ def update_full_adjacency_gate(context):
                 context["adjacency_ready_event"].set()
                 ready_message = (
                     "[MENU] FULL adjacency has been stable for 2 hello intervals. "
-                    "Use '1' to add a Router-LSA stub route or '2' to view neighbors."
+                    "Type 'help' to view the available menu commands."
                 )
         else:
             if context["adjacency_ready_event"].is_set():
@@ -453,11 +536,108 @@ def update_full_adjacency_gate(context):
         log_message(lost_message)
 
 
-def transition_neighbor(neighbor, new_state):
-    log_message(f"[STATE] {neighbor['router_id']}  {neighbor['state']} -> {new_state}")
+# Adjacency forms in protocol order before any manual route advertisement is allowed.
+def transition_neighbor(context, neighbor, new_state):
+    previous_state = neighbor["state"]
     neighbor["state"] = new_state
+    if previous_state == FULL and new_state != FULL:
+        rebuild_ospf_nbr_routes_db(context)
     if new_state == FULL:
-        log_message(f"[STATUS] {neighbor['router_id']} state=FULL")
+        state_full(context, neighbor)
+
+
+def state_down(context, neighbor):
+    if neighbor["state"] == DOWN:
+        transition_neighbor(context, neighbor, INIT)
+
+
+def state_init(context, neighbor, hello_packet):
+    if neighbor["state"] == INIT and context["router_id"] in (hello_packet.neighbors or []):
+        transition_neighbor(context, neighbor, TWO_WAY)
+
+
+def state_two_way(context, neighbor, packet, hello_packet):
+    if neighbor["state"] != TWO_WAY:
+        return
+    neighbor_is_dr_or_bdr = packet[IP].src in {hello_packet.router, hello_packet.backup} and packet[IP].src != "0.0.0.0"
+    if not neighbor_is_dr_or_bdr:
+        return
+    transition_neighbor(context, neighbor, EXSTART)
+    neighbor["database_sequence"] = INITIAL_DBD_SEQ
+    neighbor["is_master"] = True
+    send_packet(
+        context,
+        build_dbd(
+            context,
+            neighbor,
+            is_initial_packet=True,
+            has_more_packets=True,
+            is_master_packet=True,
+            sequence_number=neighbor["database_sequence"],
+        ),
+        destination=neighbor["ip_address"],
+    )
+
+
+def state_exstart(context, neighbor, router_id, master_bit, sequence_number):
+    if neighbor["state"] != EXSTART:
+        return False
+    try:
+        neighbor_is_master = int(ipaddress.IPv4Address(router_id)) > int(ipaddress.IPv4Address(context["router_id"]))
+    except Exception:
+        neighbor_is_master = False
+    if neighbor_is_master:
+        neighbor["is_master"] = False
+        neighbor["database_sequence"] = sequence_number
+        send_packet(context, build_dbd(context, neighbor, is_master_packet=False, sequence_number=sequence_number), destination=neighbor["ip_address"])
+        transition_neighbor(context, neighbor, EXCHANGE)
+        send_lsdb_summary(context, neighbor)
+    elif not master_bit and sequence_number == neighbor["database_sequence"]:
+        transition_neighbor(context, neighbor, EXCHANGE)
+        send_lsdb_summary(context, neighbor)
+    return True
+
+
+def state_exchange(context, neighbor, packet, more_bit):
+    if neighbor["state"] != EXCHANGE:
+        return False
+    neighbor["requested_lsas"] = collect_unknown_lsas(context, packet)
+    if not more_bit:
+        if neighbor["requested_lsas"]:
+            transition_neighbor(context, neighbor, LOADING)
+            ls_request_packet = build_header(context, 3)
+            for lsa_type, lsa_id, adv_router in neighbor["requested_lsas"]:
+                ls_request_packet = ls_request_packet / OSPF_LSReq(type=lsa_type, id=lsa_id, adrouter=adv_router)
+            send_packet(context, ls_request_packet, destination=neighbor["ip_address"])
+        else:
+            transition_neighbor(context, neighbor, FULL)
+        return True
+    if neighbor["is_master"]:
+        neighbor["database_sequence"] += 1
+    send_packet(
+        context,
+        build_dbd(context, neighbor, is_master_packet=neighbor["is_master"], sequence_number=neighbor["database_sequence"]),
+        destination=neighbor["ip_address"],
+    )
+    return True
+
+
+def state_loading(context, neighbor, packet):
+    if neighbor["state"] != LOADING:
+        return None
+    neighbor["mac_address"] = packet[Ether].src
+    neighbor["requested_lsas"].clear()
+    transition_neighbor(context, neighbor, FULL)
+    refresh_local_router_lsa(context)
+    self_lsa = find_lsa(context, 1, context["router_id"], context["router_id"])
+    if self_lsa is None:
+        self_lsa = build_router_lsa(context)
+    return self_lsa
+
+
+def state_full(context, neighbor):
+    rebuild_ospf_nbr_routes_db(context)
+    log_message(format_neighbor_status(neighbor))
 
 
 def collect_unknown_lsas(context, packet):
@@ -478,8 +658,7 @@ def collect_unknown_lsas(context, packet):
     return requested_lsas
 
 def send_lsdb_summary(context, neighbor):
-    log_message(f"[EXCHANGE] Summary -> {neighbor['router_id']}")
-    sync_local_lsdb(context)
+    refresh_local_router_lsa(context)
     if neighbor["is_master"]:
         neighbor["database_sequence"] += 1
     lsa_packets = local_lsdb_entries(context)
@@ -515,32 +694,9 @@ def handle_hello(context, packet):
             context["designated_router"] = hello_packet.router
         if hello_packet.backup != "0.0.0.0":
             context["backup_designated_router"] = hello_packet.backup
-        if neighbor["state"] == DOWN:
-            transition_neighbor(neighbor, INIT)
-        if neighbor["state"] == INIT and context["router_id"] in (hello_packet.neighbors or []):
-            transition_neighbor(neighbor, TWO_WAY)
-        neighbor_is_dr_or_bdr = packet[IP].src in {hello_packet.router, hello_packet.backup} and packet[IP].src != "0.0.0.0"
-        if neighbor["state"] == TWO_WAY and neighbor_is_dr_or_bdr:
-            transition_neighbor(neighbor, EXSTART)
-            neighbor["database_sequence"] = INITIAL_DBD_SEQ
-            neighbor["is_master"] = True
-            log_message(f"[EXSTART] -> {neighbor['router_id']}  seq={neighbor['database_sequence']}")
-            log_message(
-                f"[DBD-OUT] {neighbor['router_id']}  state=EXSTART  flags={describe_dbd_flags(0x07)}  "
-                f"seq={neighbor['database_sequence']}  mtu=1500"
-            )
-            send_packet(
-                context,
-                build_dbd(
-                    context,
-                    neighbor,
-                    is_initial_packet=True,
-                    has_more_packets=True,
-                    is_master_packet=True,
-                    sequence_number=neighbor["database_sequence"],
-                ),
-                destination=neighbor["ip_address"],
-            )
+        state_down(context, neighbor)
+        state_init(context, neighbor, hello_packet)
+        state_two_way(context, neighbor, packet, hello_packet)
 
     send_packet(context, build_hello(context))
 
@@ -560,63 +716,16 @@ def handle_dbd(context, packet):
         more_bit = flags & 0x02
         master_bit = flags & 0x01
         sequence_number = database_description.ddseq
-        log_message(
-            f"[DBD-IN] {router_id}  state={neighbor['state']}  flags={describe_dbd_flags(flags)}  "
-            f"seq={sequence_number}  mtu={database_description.mtu}"
-        )
 
-        if neighbor["state"] == EXSTART:
-            try:
-                neighbor_is_master = int(ipaddress.IPv4Address(router_id)) > int(ipaddress.IPv4Address(context["router_id"]))
-            except Exception:
-                neighbor_is_master = False
-            if neighbor_is_master:
-                neighbor["is_master"] = False
-                neighbor["database_sequence"] = sequence_number
-                log_message(f"[EXSTART] {router_id}=Master  We=Slave")
-                log_message(f"[DBD-OUT] {router_id}  state=EXSTART  flags={describe_dbd_flags(0x01)}  seq={sequence_number}  mtu=1500")
-                send_packet(context, build_dbd(context, neighbor, is_master_packet=False, sequence_number=sequence_number), destination=neighbor["ip_address"])
-                transition_neighbor(neighbor, EXCHANGE)
-                send_lsdb_summary(context, neighbor)
-            elif not master_bit and sequence_number == neighbor["database_sequence"]:
-                log_message(f"[EXSTART] We=Master  {router_id}=Slave")
-                transition_neighbor(neighbor, EXCHANGE)
-                send_lsdb_summary(context, neighbor)
+        if state_exstart(context, neighbor, router_id, master_bit, sequence_number):
             return
-
-        if neighbor["state"] == EXCHANGE:
-            neighbor["requested_lsas"] = collect_unknown_lsas(context, packet)
-            if not more_bit:
-                if neighbor["requested_lsas"]:
-                    transition_neighbor(neighbor, LOADING)
-                    log_message(f"[LOADING] LSReq -> {neighbor['router_id']}  ({len(neighbor['requested_lsas'])} LSA(s))")
-                    ls_request_packet = build_header(context, 3)
-                    for lsa_type, lsa_id, adv_router in neighbor["requested_lsas"]:
-                        ls_request_packet = ls_request_packet / OSPF_LSReq(type=lsa_type, id=lsa_id, adrouter=adv_router)
-                    send_packet(context, ls_request_packet, destination=neighbor["ip_address"])
-                else:
-                    transition_neighbor(neighbor, FULL)
-                    log_message(f"[FULL] {router_id} -- DR claimed.")
-            else:
-                if neighbor["is_master"]:
-                    neighbor["database_sequence"] += 1
-                flags = 0x01 if neighbor["is_master"] else 0x00
-                log_message(
-                    f"[DBD-OUT] {router_id}  state=EXCHANGE  flags={describe_dbd_flags(flags)}  "
-                    f"seq={neighbor['database_sequence']}  mtu=1500"
-                )
-                send_packet(
-                    context,
-                    build_dbd(context, neighbor, is_master_packet=neighbor["is_master"], sequence_number=neighbor["database_sequence"]),
-                    destination=neighbor["ip_address"],
-                )
+        state_exchange(context, neighbor, packet, more_bit)
 
 
 def handle_lsupd(context, packet):
     router_id = packet[OSPF_Hdr].src
     lsa_list = getattr(packet[OSPF_LSUpd], "lsalist", []) if packet.haslayer(OSPF_LSUpd) else []
     if lsa_list:
-        log_message(f"[LSUPD] {len(lsa_list)} LSA(s) from {router_id}. ACK.")
         fight_back_lsa = None
         with context["lock"]:
             for lsa_packet in lsa_list:
@@ -629,7 +738,7 @@ def handle_lsupd(context, packet):
                     if fight_back_lsa is None or getattr(lsa_packet, "seq", BASE_LSA_SEQUENCE - 1) > getattr(fight_back_lsa, "seq", BASE_LSA_SEQUENCE - 1):
                         fight_back_lsa = lsa_packet.copy()
                 upsert_lsa(context, lsa_packet)
-            sync_local_lsdb(context)
+            refresh_local_router_lsa(context)
         send_packet(
             context,
             build_header(context, 5) / OSPF_LSAck(lsaheaders=[OSPF_LSA_Hdr(bytes(lsa_packet)[:20]) for lsa_packet in lsa_list]),
@@ -641,25 +750,19 @@ def handle_lsupd(context, packet):
                 reason=f"newer copy seen from {router_id}",
             )
 
+    self_lsa = None
     with context["lock"]:
         neighbor = context["neighbors"].get(router_id)
-        if not neighbor or neighbor["state"] != LOADING:
+        if not neighbor:
             return
-        neighbor["mac_address"] = packet[Ether].src
-        neighbor["requested_lsas"].clear()
-        transition_neighbor(neighbor, FULL)
-        log_message(f"[FULL] {router_id} -- Local LSDB synchronized.")
-        refresh_local_router_lsa(context)
-        self_lsa = find_lsa(context, 1, context["router_id"], context["router_id"])
-        if self_lsa is None:
-            self_lsa = build_router_lsa(context)
-    send_packet(context, build_ls_update(context, [self_lsa]), destination=ALL_DR_MULTICAST)
+        self_lsa = state_loading(context, neighbor, packet)
+    if self_lsa is not None:
+        send_packet(context, build_ls_update(context, [self_lsa]), destination=ALL_DR_MULTICAST)
 
 
 def handle_lsreq(context, packet):
-    log_message(f"[LSREQ] {packet[OSPF_Hdr].src} -- Responding.")
     with context["lock"]:
-        sync_local_lsdb(context)
+        refresh_local_router_lsa(context)
         neighbor = context["neighbors"].get(packet[OSPF_Hdr].src)
         if neighbor:
             neighbor["mac_address"] = packet[Ether].src
@@ -672,88 +775,81 @@ def handle_lsreq(context, packet):
                     requested_lsa_packets.append(local_lsa.copy())
             request_layer = request_layer.payload
         response_lsa_packets = local_lsdb_entries(context, copy_packets=True)
-    log_message(
-        f"[LSREQ] requested={len(requested_lsa_packets)}  replying_with={len(response_lsa_packets)} LSA(s)"
-    )
     send_packet(context, build_ls_update(context, response_lsa_packets), destination=packet[IP].src)
 
 
 def dispatch_packet(context, packet):
     if not packet.haslayer(OSPF_Hdr):
         return
+    if packet[OSPF_Hdr].area != BACKBONE_AREA:
+        return
     if packet.haslayer(IP) and packet[IP].src == context["source_ip"] and packet[OSPF_Hdr].src == context["router_id"]:
         return
     ospf_packet_type = packet[OSPF_Hdr].type
-    handlers = {
-        1: handle_hello,
-        2: handle_dbd,
-        3: handle_lsreq,
-        4: handle_lsupd,
-        5: lambda _context, received_packet: log_message(f"[LSACK] {received_packet[OSPF_Hdr].src}"),
-    }
-    handlers.get(ospf_packet_type, lambda _context, _packet: None)(context, packet)
-
-
-def prompt_for_router_lsa_route(context):
-    if not context["adjacency_ready_event"].is_set():
-        log_message("[MENU] Wait until all discovered neighbors stay FULL for 2 hello intervals before flooding a manual Router-LSA.")
-        return
-    try:
-        prefix = prompt_menu_input(context, "  Router-LSA network: ").strip()
-        mask = prompt_menu_input(context, "  Router-LSA mask: ").strip()
-        metric_text = prompt_menu_input(context, "  Router-LSA metric [10]: ").strip()
-        metric = int(metric_text) if metric_text else 10
-        add_router_stub_route(context, prefix, mask, metric=metric)
-    except ValueError as exc:
-        log_message(f"[MENU] Could not update Router-LSA: {exc}")
-    except EOFError:
-        return
-
-
-def prompt_menu_input(context, prompt_text):
-    with context["lock"]:
-        context["menu_prompt_active"] = True
-    try:
-        return input(prompt_text)
-    finally:
-        with context["lock"]:
-            context["menu_prompt_active"] = False
+    if ospf_packet_type == 1:
+        handle_hello(context, packet)
+    elif ospf_packet_type == 2:
+        handle_dbd(context, packet)
+    elif ospf_packet_type == 3:
+        handle_lsreq(context, packet)
+    elif ospf_packet_type == 4:
+        handle_lsupd(context, packet)
 
 
 def runtime_console(context):
-    if not context["interactive_enabled"]:
-        log_message("[INFO] Manual Router-LSA route injection is disabled.")
-        return
     log_message(
-        "[MENU] Waiting for all discovered neighbors to hold FULL adjacency for "
-        f"{FULL_ADJACENCY_BUFFER_HELLOS} hello intervals."
+        "[MENU] Waiting for FULL adjacency to stay stable for "
+        f"{FULL_ADJACENCY_BUFFER_HELLOS} hello intervals before enabling manual actions."
     )
     while not context["stop_event"].is_set():
         if not context["adjacency_ready_event"].wait(timeout=1):
             continue
-        suppress_menu = False
         with context["lock"]:
             suppress_menu = context["menu_suppressed"]
-        if suppress_menu:
-            time.sleep(1)
-            continue
         try:
-            command = prompt_menu_input(context, MENU_PROMPT).strip().lower()
+            command = input(MENU_HIDDEN_PROMPT if suppress_menu else MENU_PROMPT).strip().lower()
         except EOFError:
             continue
         except KeyboardInterrupt:
             context["stop_event"].set()
             return
-        if command in ("", "help", "?"):
+        if suppress_menu:
+            if command == "" or command == "q":
+                continue
+            if command == "m":
+                with context["lock"]:
+                    context["menu_suppressed"] = False
+                log_message("[MENU] The menu prompt is enabled again. Type 'help' to view the available commands.")
+                continue
+            log_message(MENU_HIDDEN_TEXT)
+            continue
+        if command == "":
+            continue
+        if command == "help":
             log_message(MENU_HELP_TEXT)
             continue
-        if command in ("1", "add", "add-route", "add-router"):
-            prompt_for_router_lsa_route(context)
+        if command == "m":
+            log_message("[MENU] The menu prompt is already enabled. Type 'help' to view the available commands.")
             continue
-        if command in ("2", "neighbors", "show neighbors"):
+        if command == "1":
+            if not context["adjacency_ready_event"].is_set():
+                log_message("[MENU] Wait until all discovered neighbors stay FULL for 2 hello intervals before flooding a manual Router-LSA.")
+                continue
+            try:
+                prefix = input("  Router-LSA network: ").strip()
+                mask = input("  Router-LSA mask: ").strip()
+                metric_text = input("  Router-LSA metric [10]: ").strip()
+                metric = int(metric_text) if metric_text else 10
+                add_router_stub_route(context, prefix, mask, metric=metric)
+            except ValueError as exc:
+                log_message(f"[MENU] Could not update Router-LSA: {exc}")
+            except EOFError:
+                continue
+            continue
+        if command == "2":
             show_neighbors(context)
             continue
-        if command in ("3", "lsdb", "show lsdb"):
+        if command == "3":
             lsa_packets = local_lsdb_entries(context)
             if not lsa_packets:
                 log_message("[LSDB] Local LSDB is empty.")
@@ -764,12 +860,27 @@ def runtime_console(context):
                     f"seq=0x{getattr(lsa_packet, 'seq', 0):08x}"
                 )
             continue
-        if command in ("q", "quit", "close"):
+        if command == "4":
+            route_map = {
+                advertising_router: [route.copy() for route in routes]
+                for advertising_router, routes in OSPF_NBR_ROUTES_DB.items()
+            }
+            if not route_map:
+                log_message("[ROUTES] OSPF_NBR_ROUTES_DB is empty.")
+                continue
+            for advertising_router in sorted(route_map):
+                for route in route_map[advertising_router]:
+                    log_message(
+                        f"[ROUTES] adv={advertising_router} net={route['network']} "
+                        f"mask={route['netmask']} metric={route['metric']} seq={route['sequence']}"
+                    )
+            continue
+        if command == "q":
             with context["lock"]:
                 context["menu_suppressed"] = True
-            log_message("[MENU] Runtime menu hidden. It will reopen after FULL adjacency changes and stabilizes again.")
+            log_message(MENU_HIDDEN_TEXT)
             continue
-        log_message(f"[MENU] Unknown command '{command}'. Type 'help' for available actions.")
+        log_message(f"[MENU] Unknown command '{command}'. Type 'help' to view the available commands.")
 
 
 def run_engine(context):
@@ -782,7 +893,6 @@ def run_engine(context):
     log_message(f"[*] Sniffer on {context['interface_name']}")
     log_message("[*] Hellos sending -- Ctrl+C to stop.\n")
 
-    hello_count = 0
     try:
         while True:
             if not refresh_runtime_source_ip(context):
@@ -790,20 +900,6 @@ def run_engine(context):
                 time.sleep(context["hello_interval"])
                 continue
             send_packet(context, build_hello(context))
-            hello_count += 1
-            with context["lock"]:
-                suppress_hello_logs = (
-                    context["adjacency_ready_event"].is_set()
-                    and context["menu_prompt_active"]
-                    and not context["menu_suppressed"]
-                )
-            if not suppress_hello_logs:
-                log_message(f"[Hello #{hello_count}] -> {ALL_SPF_MULTICAST}")
-
-            if hello_count % 3 == 0 and not suppress_hello_logs:
-                with context["lock"]:
-                    for router_id, neighbor in context["neighbors"].items():
-                        log_message(f"[STATUS] {router_id}  state={neighbor['state']}  dr={neighbor['designated_router']}")
 
             with context["lock"]:
                 expired = [
@@ -813,6 +909,8 @@ def run_engine(context):
                 ]
                 for router_id in expired:
                     del context["neighbors"][router_id]
+                if expired:
+                    rebuild_ospf_nbr_routes_db(context)
             for router_id in expired:
                 log_message(f"[DEAD] {router_id} expired.")
 
@@ -820,30 +918,24 @@ def run_engine(context):
             time.sleep(context["hello_interval"])
     except KeyboardInterrupt:
         context["stop_event"].set()
-        log_message("\n[*] Stopped.")
+        log_message("\n[*] Exiting.")
 
 
 def main():
     parser = argparse.ArgumentParser(prog="ospf_full_adjacency.py")
     parser.add_argument("--iface", default=default_iface())
-    parser.add_argument("--router-id", default=None)
-    parser.add_argument("--service-ip", default=None)
-    parser.add_argument("--area", default="0.0.0.0")
-    parser.add_argument("--mask", default="255.255.255.0")
     parser.add_argument("--interval", default=HELLO_INTERVAL, type=int)
     args = parser.parse_args()
 
-    source_ip = get_local_ip(args.iface)
-    router_id = args.router_id or source_ip
-    service_ip = str(ipaddress.IPv4Address(args.service_ip)) if args.service_ip else None
+    source_ip, network_mask = read_interface_state(args.iface)
+    if not source_ip or not network_mask:
+        sys.exit(f"[!] No usable IPv4 address or netmask for '{args.iface}'.")
     log_message("=" * 52)
     log_message("  OSPFv2 Full Adjacency Engine")
-    log_message(f"  iface={args.iface}  src={source_ip}  rid={router_id}  area={args.area}")
-    if service_ip:
-        log_message(f"  service-ip={service_ip}")
+    log_message(f"  iface={args.iface}  src={source_ip}  rid={DEFAULT_ROUTER_ID}")
     log_message("=" * 52)
 
-    context = make_context(args.iface, source_ip, router_id, args.area, args.mask, args.interval, service_ip=service_ip)
+    context = make_context(args.iface, source_ip, network_mask, args.interval)
     refresh_local_router_lsa(context)
     run_engine(context)
 

@@ -5,6 +5,7 @@ This program lets your device join an OSPF broadcast segment as a `DROther` rout
 ## What It Does
 
 - Sends OSPF Hello packets with `priority = 0`, so the local device does not compete to become DR or BDR.
+- Uses OSPF area `0.0.0.0` only and advertises the fixed router ID `99.99.99.99`.
 - Tracks neighbors and moves through the OSPF states from `Down` to `Full`.
 - Uses a small local LSDB so the router can answer LSAs during database exchange.
 - Replies to LSRequests and acknowledges LSUpdates using the correct OSPF packet types.
@@ -34,30 +35,19 @@ If the neighbor stays in `Loading` or drops back to `Down`, check the interface 
 sudo python3 scapy/ospf_full_adjacency.py --iface eth0
 ```
 
-Useful options:
-
-```bash
-sudo python3 scapy/ospf_full_adjacency.py --iface eth0 --router-id 10.10.10.10
-sudo python3 scapy/ospf_full_adjacency.py --iface eth0 --area 0.0.0.0
-sudo python3 scapy/ospf_full_adjacency.py --iface eth0 --interval 10
-sudo python3 scapy/ospf_full_adjacency.py --iface eth0 --verbose
-```
-
 ## Command Line Flags
 
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--iface` | auto-detected | Interface to sniff and send on |
-| `--router-id` | interface IP | OSPF Router ID to advertise |
-| `--area` | `0.0.0.0` | OSPF area ID |
-| `--mask` | `255.255.255.0` | Network mask used in Hello packets |
 | `--interval` | `10` | Hello interval in seconds |
-| `--verbose` | off | Print detailed packet output |
 
 ## Quick Notes
 
 - Use a broadcast OSPF segment with a real DR and BDR already elected.
 - Set the local device to priority `0` so it stays a DROther.
+- The script auto-detects the interface IPv4 address and netmask for its Hello packets and self Router-LSA.
+- The tool is scoped to backbone area `0.0.0.0` and always uses router ID `99.99.99.99`.
 - After FULL adjacency is stable for 2 hello intervals, use the runtime menu option `1` to advertise a stub network with a Type-1 Router-LSA.
 - Option `1` updates the existing self Router-LSA; it does not create a Type-3 Summary-LSA.
 - If the neighbor does not progress cleanly, verify MTU, interface IP settings, and OSPF packet flow in Wireshark.
