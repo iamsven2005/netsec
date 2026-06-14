@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import platform
+import socket
 import subprocess
 import sys
 import threading
 import time
+from ospf_route_addition import prompt_and_add_router_stub_route
 
 try:
     from scapy.all import Ether, IP, conf as scapy_conf, get_if_addr, sendp, sniff
@@ -28,13 +30,12 @@ ALL_SPF_MULTICAST = "224.0.0.5"
 ALL_DR_MULTICAST = "224.0.0.6"
 ALL_SPF_MAC = "01:00:5e:00:00:05"
 ALL_DR_MAC = "01:00:5e:00:00:06"
-OSPF_PROTO = 89
+OSPF_PROTO = getattr(socket, "IPPROTO_OSPF", 89)
 OSPF_OPTIONS = 0x02
 DEAD_INTERVAL = 40
 HELLO_INTERVAL = 10
 INITIAL_DBD_SEQ = 1000
 BASE_LSA_SEQUENCE = 0x80000001
-FULL_ADJACENCY_BUFFER_HELLOS = 2
 BACKBONE_AREA = "0.0.0.0"
 DEFAULT_ROUTER_ID = "99.99.99.99"
 OSPF_NBR_ROUTES_DB = {}
@@ -188,13 +189,72 @@ def make_context(interface_name, source_ip, network_mask, hello_interval):
         "manual_router_links": [],
         "adjacency_ready_event": threading.Event(),
         "stop_event": threading.Event(),
-        "full_adjacency_since": None,
         "menu_suppressed": False,
         "source_ip_available": True,
+        "ospf_raw_socket": None,
+        "ospf_raw_socket_warning_logged": False,
     }
 
 
+def close_ospf_raw_socket(context):
+    with context["lock"]:
+        raw_socket = context["ospf_raw_socket"]
+        context["ospf_raw_socket"] = None
+    if raw_socket is None:
+        return
+    try:
+        raw_socket.close()
+    except OSError:
+        pass
+
+
+def drain_ospf_raw_socket(context, raw_socket):
+    while not context["stop_event"].is_set():
+        try:
+            raw_socket.recv(65535)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+    with context["lock"]:
+        if context["ospf_raw_socket"] is raw_socket:
+            context["ospf_raw_socket"] = None
+    try:
+        raw_socket.close()
+    except OSError:
+        pass
+
+
+def ensure_ospf_raw_socket(context):
+    with context["lock"]:
+        if context["ospf_raw_socket"] is not None or not context["source_ip_available"]:
+            return
+        source_ip = context["source_ip"]
+    try:
+        raw_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, OSPF_PROTO)
+        raw_socket.bind((source_ip, 0))
+        raw_socket.settimeout(1.0)
+    except OSError as exc:
+        with context["lock"]:
+            if context["ospf_raw_socket_warning_logged"]:
+                return
+            context["ospf_raw_socket_warning_logged"] = True
+        log_message(
+            f"[WARN] Could not bind a raw IP protocol {OSPF_PROTO} receiver on {source_ip}: {exc}. "
+            "Inbound OSPF may still trigger ICMP protocol-unreachable replies from the host."
+        )
+        return
+    with context["lock"]:
+        context["ospf_raw_socket"] = raw_socket
+        context["ospf_raw_socket_warning_logged"] = False
+    threading.Thread(target=drain_ospf_raw_socket, args=(context, raw_socket), daemon=True).start()
+
+
 def send_packet(context, payload, destination=ALL_SPF_MULTICAST):
+    if not payload.haslayer(OSPF_Hdr):
+        raise ValueError("send_packet() expected an OSPF payload that already contains OSPF_Hdr.")
+    if payload[OSPF_Hdr].type == 1 and destination != ALL_SPF_MULTICAST:
+        raise ValueError("OSPF Hello packets in this broadcast-segment script must be sent to 224.0.0.5.")
     if destination == ALL_SPF_MULTICAST:
         ethernet_destination = ALL_SPF_MAC
     elif destination == ALL_DR_MULTICAST:
@@ -251,13 +311,6 @@ def build_dbd(context, _neighbor_entry, is_initial_packet=False, has_more_packet
     for lsa_header in (lsa_headers or []):
         database_description_packet = database_description_packet / lsa_header
     return database_description_packet
-
-
-def normalize_metric(metric):
-    metric_value = int(metric)
-    if not 0 <= metric_value <= 0xFFFF:
-        raise ValueError("Metric must be between 0 and 65535.")
-    return metric_value
 
 
 def build_router_lsa(context, sequence_number=BASE_LSA_SEQUENCE):
@@ -326,6 +379,10 @@ def format_neighbor_status(neighbor):
     return status_message
 
 
+def is_dr_or_bdr_neighbor(neighbor):
+    return neighbor["ip_address"] in {neighbor["designated_router"], neighbor["backup_designated_router"]} and neighbor["ip_address"] != "0.0.0.0"
+
+
 def find_lsa(context, lsa_type, lsa_id, advertising_router):
     for lsa_packet in context["local_lsdb"]:
         if get_lsa_key(lsa_packet) == (lsa_type, lsa_id, advertising_router):
@@ -373,29 +430,6 @@ def flood_lsa_packets(context, lsa_packets):
     return True
 
 
-# Manual route advertisement only runs after stable FULL adjacency via the menu gate.
-def add_router_stub_route(context, prefix, mask, metric=10):
-    network_prefix, network_mask = normalize_network(prefix, mask)
-    stub_link = OSPF_Link(type=3, id=network_prefix, data=network_mask, metric=normalize_metric(metric))
-    with context["lock"]:
-        context["manual_router_links"] = [
-            existing_link.copy()
-            for existing_link in context["manual_router_links"]
-            if (existing_link.id, existing_link.data) != (stub_link.id, stub_link.data)
-        ]
-        context["manual_router_links"].append(stub_link.copy())
-        sequence_number = next_lsa_sequence(context, 1, context["router_id"], context["router_id"])
-        router_lsa = build_router_lsa(context, sequence_number=sequence_number)
-        upsert_lsa(context, router_lsa)
-    flooded = flood_lsa_packets(context, [router_lsa])
-    scope_text = "and flooded to FULL neighbors" if flooded else "in the local LSDB only"
-    log_message(
-        f"[ROUTES] Added Router-LSA route net={stub_link.id} mask={stub_link.data} "
-        f"metric={stub_link.metric} seq=0x{router_lsa.seq:08x} {scope_text}."
-    )
-    return router_lsa
-
-
 def should_fight_back_self_lsa(context, received_lsa):
     with context["lock"]:
         existing_lsa = find_lsa(context, 1, context["router_id"], context["router_id"])
@@ -414,7 +448,7 @@ def should_fight_back_self_lsa(context, received_lsa):
     return received_links != desired_links
 
 
-def reorigin_self_router_lsa(context, sequence_number, reason=None):
+def reorigin_self_router_lsa(context, sequence_number):
     with context["lock"]:
         router_lsa = build_router_lsa(context, sequence_number=sequence_number)
         upsert_lsa(context, router_lsa)
@@ -437,7 +471,6 @@ def reset_adjacency_state(context, reason):
         context["neighbors"].clear()
         context["designated_router"] = "0.0.0.0"
         context["backup_designated_router"] = "0.0.0.0"
-        context["full_adjacency_since"] = None
         context["adjacency_ready_event"].clear()
         context["menu_suppressed"] = False
         rebuild_ospf_nbr_routes_db(context)
@@ -455,6 +488,7 @@ def refresh_runtime_source_ip(context):
         if ip_was_available:
             with context["lock"]:
                 context["source_ip_available"] = False
+            close_ospf_raw_socket(context)
             reset_adjacency_state(
                 context,
                 f"Interface {context['interface_name']} lost its usable IPv4 address or netmask. Pausing hellos until a valid address returns.",
@@ -466,6 +500,8 @@ def refresh_runtime_source_ip(context):
             context["source_ip"] = current_ip
             context["network_mask"] = current_mask
             context["source_ip_available"] = True
+        close_ospf_raw_socket(context)
+        ensure_ospf_raw_socket(context)
         refresh_local_router_lsa(context, bump_sequence=True)
         reset_adjacency_state(
             context,
@@ -479,6 +515,8 @@ def refresh_runtime_source_ip(context):
     with context["lock"]:
         context["source_ip"] = current_ip
         context["network_mask"] = current_mask
+    close_ospf_raw_socket(context)
+    ensure_ospf_raw_socket(context)
     refresh_local_router_lsa(context, bump_sequence=True)
     if current_ip != previous_ip:
         reason = (
@@ -509,31 +547,19 @@ def show_neighbors(context):
 
 def update_full_adjacency_gate(context):
     ready_message = None
-    lost_message = None
     with context["lock"]:
-        neighbors = list(context["neighbors"].values())
+        neighbors = [neighbor for neighbor in context["neighbors"].values() if is_dr_or_bdr_neighbor(neighbor)]
         everyone_full = bool(neighbors) and all(neighbor["state"] == FULL for neighbor in neighbors)
         if everyone_full:
-            if context["full_adjacency_since"] is None:
-                context["full_adjacency_since"] = time.time()
-            stable_for = time.time() - context["full_adjacency_since"]
-            if stable_for >= context["hello_interval"] * FULL_ADJACENCY_BUFFER_HELLOS and not context["adjacency_ready_event"].is_set():
+            if not context["adjacency_ready_event"].is_set():
                 context["adjacency_ready_event"].set()
-                ready_message = (
-                    "[MENU] FULL adjacency has been stable for 2 hello intervals. "
-                    "Type 'help' to view the available menu commands."
-                )
+                ready_message = "[MENU] FULL adjacency is ready. Type 'help' to view the available menu commands."
         else:
-            if context["adjacency_ready_event"].is_set():
-                lost_message = "[MENU] FULL adjacency is no longer stable. Manual Router-LSA flooding is paused."
-            context["full_adjacency_since"] = None
             context["adjacency_ready_event"].clear()
             context["menu_suppressed"] = False
     if ready_message:
         show_neighbors(context)
         log_message(ready_message)
-    if lost_message:
-        log_message(lost_message)
 
 
 # Adjacency forms in protocol order before any manual route advertisement is allowed.
@@ -559,8 +585,7 @@ def state_init(context, neighbor, hello_packet):
 def state_two_way(context, neighbor, packet, hello_packet):
     if neighbor["state"] != TWO_WAY:
         return
-    neighbor_is_dr_or_bdr = packet[IP].src in {hello_packet.router, hello_packet.backup} and packet[IP].src != "0.0.0.0"
-    if not neighbor_is_dr_or_bdr:
+    if not is_dr_or_bdr_neighbor(neighbor):
         return
     transition_neighbor(context, neighbor, EXSTART)
     neighbor["database_sequence"] = INITIAL_DBD_SEQ
@@ -747,7 +772,6 @@ def handle_lsupd(context, packet):
             reorigin_self_router_lsa(
                 context,
                 sequence_number=max(getattr(fight_back_lsa, "seq", BASE_LSA_SEQUENCE - 1) + 1, BASE_LSA_SEQUENCE),
-                reason=f"newer copy seen from {router_id}",
             )
 
     self_lsa = None
@@ -774,8 +798,7 @@ def handle_lsreq(context, packet):
                 if local_lsa is not None:
                     requested_lsa_packets.append(local_lsa.copy())
             request_layer = request_layer.payload
-        response_lsa_packets = local_lsdb_entries(context, copy_packets=True)
-    send_packet(context, build_ls_update(context, response_lsa_packets), destination=packet[IP].src)
+    send_packet(context, build_ls_update(context, requested_lsa_packets), destination=packet[IP].src)
 
 
 def dispatch_packet(context, packet):
@@ -797,10 +820,7 @@ def dispatch_packet(context, packet):
 
 
 def runtime_console(context):
-    log_message(
-        "[MENU] Waiting for FULL adjacency to stay stable for "
-        f"{FULL_ADJACENCY_BUFFER_HELLOS} hello intervals before enabling manual actions."
-    )
+    log_message("[MENU] Waiting for FULL adjacency before enabling manual actions.")
     while not context["stop_event"].is_set():
         if not context["adjacency_ready_event"].wait(timeout=1):
             continue
@@ -833,18 +853,9 @@ def runtime_console(context):
             continue
         if command == "1":
             if not context["adjacency_ready_event"].is_set():
-                log_message("[MENU] Wait until all discovered neighbors stay FULL for 2 hello intervals before flooding a manual Router-LSA.")
+                log_message("[MENU] Wait until all discovered neighbors reach FULL before flooding a manual Router-LSA.")
                 continue
-            try:
-                prefix = input("  Router-LSA network: ").strip()
-                mask = input("  Router-LSA mask: ").strip()
-                metric_text = input("  Router-LSA metric [10]: ").strip()
-                metric = int(metric_text) if metric_text else 10
-                add_router_stub_route(context, prefix, mask, metric=metric)
-            except ValueError as exc:
-                log_message(f"[MENU] Could not update Router-LSA: {exc}")
-            except EOFError:
-                continue
+            prompt_and_add_router_stub_route(context, input, log_message, normalize_network=normalize_network, ospf_link_cls=OSPF_Link, next_lsa_sequence=next_lsa_sequence, build_router_lsa=build_router_lsa, upsert_lsa=upsert_lsa,flood_lsa_packets=flood_lsa_packets)
             continue
         if command == "2":
             show_neighbors(context)
@@ -884,6 +895,7 @@ def runtime_console(context):
 
 
 def run_engine(context):
+    ensure_ospf_raw_socket(context)
     threading.Thread(
         target=sniff,
         kwargs=dict(iface=context["interface_name"], filter="proto 89", prn=lambda packet: dispatch_packet(context, packet), store=0),
@@ -903,21 +915,28 @@ def run_engine(context):
 
             with context["lock"]:
                 expired = [
-                    router_id
+                    (router_id, neighbor)
                     for router_id, neighbor in context["neighbors"].items()
                     if time.time() - neighbor["last_seen"] > DEAD_INTERVAL
                 ]
-                for router_id in expired:
+                lost_full_neighbor = context["adjacency_ready_event"].is_set() and any(
+                    neighbor["state"] == FULL and is_dr_or_bdr_neighbor(neighbor)
+                    for _, neighbor in expired
+                )
+                for router_id, _neighbor in expired:
                     del context["neighbors"][router_id]
                 if expired:
                     rebuild_ospf_nbr_routes_db(context)
-            for router_id in expired:
+            if lost_full_neighbor:
+                log_message("[MENU] FULL adjacency is no longer stable. Manual Router-LSA flooding is paused.")
+            for router_id, _neighbor in expired:
                 log_message(f"[DEAD] {router_id} expired.")
 
             update_full_adjacency_gate(context)
             time.sleep(context["hello_interval"])
     except KeyboardInterrupt:
         context["stop_event"].set()
+        close_ospf_raw_socket(context)
         log_message("\n[*] Exiting.")
 
 
