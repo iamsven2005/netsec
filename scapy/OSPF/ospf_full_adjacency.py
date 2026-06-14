@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from ospf_route_addition import prompt_and_add_router_stub_route
 
 try:
     from scapy.all import Ether, IP, conf as scapy_conf, get_if_addr, sendp, sniff
@@ -35,7 +36,6 @@ DEAD_INTERVAL = 40
 HELLO_INTERVAL = 10
 INITIAL_DBD_SEQ = 1000
 BASE_LSA_SEQUENCE = 0x80000001
-FULL_ADJACENCY_BUFFER_HELLOS = 2
 BACKBONE_AREA = "0.0.0.0"
 DEFAULT_ROUTER_ID = "99.99.99.99"
 OSPF_NBR_ROUTES_DB = {}
@@ -189,7 +189,6 @@ def make_context(interface_name, source_ip, network_mask, hello_interval):
         "manual_router_links": [],
         "adjacency_ready_event": threading.Event(),
         "stop_event": threading.Event(),
-        "full_adjacency_since": None,
         "menu_suppressed": False,
         "source_ip_available": True,
         "ospf_raw_socket": None,
@@ -314,13 +313,6 @@ def build_dbd(context, _neighbor_entry, is_initial_packet=False, has_more_packet
     return database_description_packet
 
 
-def normalize_metric(metric):
-    metric_value = int(metric)
-    if not 0 <= metric_value <= 0xFFFF:
-        raise ValueError("Metric must be between 0 and 65535.")
-    return metric_value
-
-
 def build_router_lsa(context, sequence_number=BASE_LSA_SEQUENCE):
     with context["lock"]:
         if context["designated_router"] != "0.0.0.0":
@@ -434,29 +426,6 @@ def flood_lsa_packets(context, lsa_packets):
     return True
 
 
-# Manual route advertisement only runs after stable FULL adjacency via the menu gate.
-def add_router_stub_route(context, prefix, mask, metric=10):
-    network_prefix, network_mask = normalize_network(prefix, mask)
-    stub_link = OSPF_Link(type=3, id=network_prefix, data=network_mask, metric=normalize_metric(metric))
-    with context["lock"]:
-        context["manual_router_links"] = [
-            existing_link.copy()
-            for existing_link in context["manual_router_links"]
-            if (existing_link.id, existing_link.data) != (stub_link.id, stub_link.data)
-        ]
-        context["manual_router_links"].append(stub_link.copy())
-        sequence_number = next_lsa_sequence(context, 1, context["router_id"], context["router_id"])
-        router_lsa = build_router_lsa(context, sequence_number=sequence_number)
-        upsert_lsa(context, router_lsa)
-    flooded = flood_lsa_packets(context, [router_lsa])
-    scope_text = "and flooded to FULL neighbors" if flooded else "in the local LSDB only"
-    log_message(
-        f"[ROUTES] Added Router-LSA route net={stub_link.id} mask={stub_link.data} "
-        f"metric={stub_link.metric} seq=0x{router_lsa.seq:08x} {scope_text}."
-    )
-    return router_lsa
-
-
 def should_fight_back_self_lsa(context, received_lsa):
     with context["lock"]:
         existing_lsa = find_lsa(context, 1, context["router_id"], context["router_id"])
@@ -475,7 +444,7 @@ def should_fight_back_self_lsa(context, received_lsa):
     return received_links != desired_links
 
 
-def reorigin_self_router_lsa(context, sequence_number, reason=None):
+def reorigin_self_router_lsa(context, sequence_number):
     with context["lock"]:
         router_lsa = build_router_lsa(context, sequence_number=sequence_number)
         upsert_lsa(context, router_lsa)
@@ -498,7 +467,6 @@ def reset_adjacency_state(context, reason):
         context["neighbors"].clear()
         context["designated_router"] = "0.0.0.0"
         context["backup_designated_router"] = "0.0.0.0"
-        context["full_adjacency_since"] = None
         context["adjacency_ready_event"].clear()
         context["menu_suppressed"] = False
         rebuild_ospf_nbr_routes_db(context)
@@ -579,20 +547,12 @@ def update_full_adjacency_gate(context):
     with context["lock"]:
         neighbors = list(context["neighbors"].values())
         everyone_full = bool(neighbors) and all(neighbor["state"] == FULL for neighbor in neighbors)
-        if everyone_full:
-            if context["full_adjacency_since"] is None:
-                context["full_adjacency_since"] = time.time()
-            stable_for = time.time() - context["full_adjacency_since"]
-            if stable_for >= context["hello_interval"] * FULL_ADJACENCY_BUFFER_HELLOS and not context["adjacency_ready_event"].is_set():
-                context["adjacency_ready_event"].set()
-                ready_message = (
-                    "[MENU] FULL adjacency has been stable for 2 hello intervals. "
-                    "Type 'help' to view the available menu commands."
-                )
+        if everyone_full and not context["adjacency_ready_event"].is_set():
+            context["adjacency_ready_event"].set()
+            ready_message = "[MENU] FULL adjacency is ready. Type 'help' to view the available menu commands."
         else:
             if context["adjacency_ready_event"].is_set():
                 lost_message = "[MENU] FULL adjacency is no longer stable. Manual Router-LSA flooding is paused."
-            context["full_adjacency_since"] = None
             context["adjacency_ready_event"].clear()
             context["menu_suppressed"] = False
     if ready_message:
@@ -813,7 +773,6 @@ def handle_lsupd(context, packet):
             reorigin_self_router_lsa(
                 context,
                 sequence_number=max(getattr(fight_back_lsa, "seq", BASE_LSA_SEQUENCE - 1) + 1, BASE_LSA_SEQUENCE),
-                reason=f"newer copy seen from {router_id}",
             )
 
     self_lsa = None
@@ -840,8 +799,7 @@ def handle_lsreq(context, packet):
                 if local_lsa is not None:
                     requested_lsa_packets.append(local_lsa.copy())
             request_layer = request_layer.payload
-        response_lsa_packets = local_lsdb_entries(context, copy_packets=True)
-    send_packet(context, build_ls_update(context, response_lsa_packets), destination=packet[IP].src)
+    send_packet(context, build_ls_update(context, requested_lsa_packets), destination=packet[IP].src)
 
 
 def dispatch_packet(context, packet):
@@ -863,10 +821,7 @@ def dispatch_packet(context, packet):
 
 
 def runtime_console(context):
-    log_message(
-        "[MENU] Waiting for FULL adjacency to stay stable for "
-        f"{FULL_ADJACENCY_BUFFER_HELLOS} hello intervals before enabling manual actions."
-    )
+    log_message("[MENU] Waiting for FULL adjacency before enabling manual actions.")
     while not context["stop_event"].is_set():
         if not context["adjacency_ready_event"].wait(timeout=1):
             continue
@@ -899,18 +854,9 @@ def runtime_console(context):
             continue
         if command == "1":
             if not context["adjacency_ready_event"].is_set():
-                log_message("[MENU] Wait until all discovered neighbors stay FULL for 2 hello intervals before flooding a manual Router-LSA.")
+                log_message("[MENU] Wait until all discovered neighbors reach FULL before flooding a manual Router-LSA.")
                 continue
-            try:
-                prefix = input("  Router-LSA network: ").strip()
-                mask = input("  Router-LSA mask: ").strip()
-                metric_text = input("  Router-LSA metric [10]: ").strip()
-                metric = int(metric_text) if metric_text else 10
-                add_router_stub_route(context, prefix, mask, metric=metric)
-            except ValueError as exc:
-                log_message(f"[MENU] Could not update Router-LSA: {exc}")
-            except EOFError:
-                continue
+            prompt_and_add_router_stub_route(context, input, log_message, normalize_network=normalize_network, ospf_link_cls=OSPF_Link, next_lsa_sequence=next_lsa_sequence, build_router_lsa=build_router_lsa, upsert_lsa=upsert_lsa,flood_lsa_packets=flood_lsa_packets)
             continue
         if command == "2":
             show_neighbors(context)
