@@ -547,23 +547,19 @@ def show_neighbors(context):
 
 def update_full_adjacency_gate(context):
     ready_message = None
-    lost_message = None
     with context["lock"]:
         neighbors = [neighbor for neighbor in context["neighbors"].values() if is_dr_or_bdr_neighbor(neighbor)]
         everyone_full = bool(neighbors) and all(neighbor["state"] == FULL for neighbor in neighbors)
-        if everyone_full and not context["adjacency_ready_event"].is_set():
-            context["adjacency_ready_event"].set()
-            ready_message = "[MENU] FULL adjacency is ready. Type 'help' to view the available menu commands."
+        if everyone_full:
+            if not context["adjacency_ready_event"].is_set():
+                context["adjacency_ready_event"].set()
+                ready_message = "[MENU] FULL adjacency is ready. Type 'help' to view the available menu commands."
         else:
-            if context["adjacency_ready_event"].is_set():
-                lost_message = "[MENU] FULL adjacency is no longer stable. Manual Router-LSA flooding is paused."
             context["adjacency_ready_event"].clear()
             context["menu_suppressed"] = False
     if ready_message:
         show_neighbors(context)
         log_message(ready_message)
-    if lost_message:
-        log_message(lost_message)
 
 
 # Adjacency forms in protocol order before any manual route advertisement is allowed.
@@ -919,15 +915,21 @@ def run_engine(context):
 
             with context["lock"]:
                 expired = [
-                    router_id
+                    (router_id, neighbor)
                     for router_id, neighbor in context["neighbors"].items()
                     if time.time() - neighbor["last_seen"] > DEAD_INTERVAL
                 ]
-                for router_id in expired:
+                lost_full_neighbor = context["adjacency_ready_event"].is_set() and any(
+                    neighbor["state"] == FULL and is_dr_or_bdr_neighbor(neighbor)
+                    for _, neighbor in expired
+                )
+                for router_id, _neighbor in expired:
                     del context["neighbors"][router_id]
                 if expired:
                     rebuild_ospf_nbr_routes_db(context)
-            for router_id in expired:
+            if lost_full_neighbor:
+                log_message("[MENU] FULL adjacency is no longer stable. Manual Router-LSA flooding is paused.")
+            for router_id, _neighbor in expired:
                 log_message(f"[DEAD] {router_id} expired.")
 
             update_full_adjacency_gate(context)
