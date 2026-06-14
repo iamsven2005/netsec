@@ -379,6 +379,10 @@ def format_neighbor_status(neighbor):
     return status_message
 
 
+def is_dr_or_bdr_neighbor(neighbor):
+    return neighbor["ip_address"] in {neighbor["designated_router"], neighbor["backup_designated_router"]} and neighbor["ip_address"] != "0.0.0.0"
+
+
 def find_lsa(context, lsa_type, lsa_id, advertising_router):
     for lsa_packet in context["local_lsdb"]:
         if get_lsa_key(lsa_packet) == (lsa_type, lsa_id, advertising_router):
@@ -545,7 +549,7 @@ def update_full_adjacency_gate(context):
     ready_message = None
     lost_message = None
     with context["lock"]:
-        neighbors = list(context["neighbors"].values())
+        neighbors = [neighbor for neighbor in context["neighbors"].values() if is_dr_or_bdr_neighbor(neighbor)]
         everyone_full = bool(neighbors) and all(neighbor["state"] == FULL for neighbor in neighbors)
         if everyone_full and not context["adjacency_ready_event"].is_set():
             context["adjacency_ready_event"].set()
@@ -585,8 +589,7 @@ def state_init(context, neighbor, hello_packet):
 def state_two_way(context, neighbor, packet, hello_packet):
     if neighbor["state"] != TWO_WAY:
         return
-    neighbor_is_dr_or_bdr = packet[IP].src in {hello_packet.router, hello_packet.backup} and packet[IP].src != "0.0.0.0"
-    if not neighbor_is_dr_or_bdr:
+    if not is_dr_or_bdr_neighbor(neighbor):
         return
     transition_neighbor(context, neighbor, EXSTART)
     neighbor["database_sequence"] = INITIAL_DBD_SEQ
