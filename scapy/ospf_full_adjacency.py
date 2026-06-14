@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import platform
+import socket
 import subprocess
 import sys
 import threading
@@ -28,7 +29,7 @@ ALL_SPF_MULTICAST = "224.0.0.5"
 ALL_DR_MULTICAST = "224.0.0.6"
 ALL_SPF_MAC = "01:00:5e:00:00:05"
 ALL_DR_MAC = "01:00:5e:00:00:06"
-OSPF_PROTO = 89
+OSPF_PROTO = getattr(socket, "IPPROTO_OSPF", 89)
 OSPF_OPTIONS = 0x02
 DEAD_INTERVAL = 40
 HELLO_INTERVAL = 10
@@ -191,10 +192,70 @@ def make_context(interface_name, source_ip, network_mask, hello_interval):
         "full_adjacency_since": None,
         "menu_suppressed": False,
         "source_ip_available": True,
+        "ospf_raw_socket": None,
+        "ospf_raw_socket_warning_logged": False,
     }
 
 
+def close_ospf_raw_socket(context):
+    with context["lock"]:
+        raw_socket = context["ospf_raw_socket"]
+        context["ospf_raw_socket"] = None
+    if raw_socket is None:
+        return
+    try:
+        raw_socket.close()
+    except OSError:
+        pass
+
+
+def drain_ospf_raw_socket(context, raw_socket):
+    while not context["stop_event"].is_set():
+        try:
+            raw_socket.recv(65535)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+    with context["lock"]:
+        if context["ospf_raw_socket"] is raw_socket:
+            context["ospf_raw_socket"] = None
+    try:
+        raw_socket.close()
+    except OSError:
+        pass
+
+
+def ensure_ospf_raw_socket(context):
+    with context["lock"]:
+        if context["ospf_raw_socket"] is not None or not context["source_ip_available"]:
+            return
+        source_ip = context["source_ip"]
+    try:
+        raw_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, OSPF_PROTO)
+        raw_socket.bind((source_ip, 0))
+        raw_socket.settimeout(1.0)
+    except OSError as exc:
+        with context["lock"]:
+            if context["ospf_raw_socket_warning_logged"]:
+                return
+            context["ospf_raw_socket_warning_logged"] = True
+        log_message(
+            f"[WARN] Could not bind a raw IP protocol {OSPF_PROTO} receiver on {source_ip}: {exc}. "
+            "Inbound OSPF may still trigger ICMP protocol-unreachable replies from the host."
+        )
+        return
+    with context["lock"]:
+        context["ospf_raw_socket"] = raw_socket
+        context["ospf_raw_socket_warning_logged"] = False
+    threading.Thread(target=drain_ospf_raw_socket, args=(context, raw_socket), daemon=True).start()
+
+
 def send_packet(context, payload, destination=ALL_SPF_MULTICAST):
+    if not payload.haslayer(OSPF_Hdr):
+        raise ValueError("send_packet() expected an OSPF payload that already contains OSPF_Hdr.")
+    if payload[OSPF_Hdr].type == 1 and destination != ALL_SPF_MULTICAST:
+        raise ValueError("OSPF Hello packets in this broadcast-segment script must be sent to 224.0.0.5.")
     if destination == ALL_SPF_MULTICAST:
         ethernet_destination = ALL_SPF_MAC
     elif destination == ALL_DR_MULTICAST:
@@ -455,6 +516,7 @@ def refresh_runtime_source_ip(context):
         if ip_was_available:
             with context["lock"]:
                 context["source_ip_available"] = False
+            close_ospf_raw_socket(context)
             reset_adjacency_state(
                 context,
                 f"Interface {context['interface_name']} lost its usable IPv4 address or netmask. Pausing hellos until a valid address returns.",
@@ -466,6 +528,8 @@ def refresh_runtime_source_ip(context):
             context["source_ip"] = current_ip
             context["network_mask"] = current_mask
             context["source_ip_available"] = True
+        close_ospf_raw_socket(context)
+        ensure_ospf_raw_socket(context)
         refresh_local_router_lsa(context, bump_sequence=True)
         reset_adjacency_state(
             context,
@@ -479,6 +543,8 @@ def refresh_runtime_source_ip(context):
     with context["lock"]:
         context["source_ip"] = current_ip
         context["network_mask"] = current_mask
+    close_ospf_raw_socket(context)
+    ensure_ospf_raw_socket(context)
     refresh_local_router_lsa(context, bump_sequence=True)
     if current_ip != previous_ip:
         reason = (
@@ -884,6 +950,7 @@ def runtime_console(context):
 
 
 def run_engine(context):
+    ensure_ospf_raw_socket(context)
     threading.Thread(
         target=sniff,
         kwargs=dict(iface=context["interface_name"], filter="proto 89", prn=lambda packet: dispatch_packet(context, packet), store=0),
@@ -918,6 +985,7 @@ def run_engine(context):
             time.sleep(context["hello_interval"])
     except KeyboardInterrupt:
         context["stop_event"].set()
+        close_ospf_raw_socket(context)
         log_message("\n[*] Exiting.")
 
 
