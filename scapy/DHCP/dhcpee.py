@@ -5,6 +5,7 @@ from queue import Queue
 import random
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 from threading import Event, Thread
@@ -296,6 +297,8 @@ def get_dhcp_lease_time():
 def get_requested_address(packet):
     """Return the requested DHCP address option as a string."""
     requested_address = get_dhcp_option(packet, "requested_addr")
+    if requested_address is None:
+        requested_address = get_dhcp_option(packet, "requested_ip_address")
     if requested_address is None:
         return None
 
@@ -847,6 +850,7 @@ def build_server_details_from_offer(interface, offer, offers=None):
         "netmask": netmask,
         "network": ipaddress.IPv4Network(f"{server_ip}/{netmask}", strict=False),
         "vlan_details": vlan_details,
+        "relay_only": True,
     }
     print_step("OK", f"Fallback DHCP server details: {details}")
     return details
@@ -873,6 +877,15 @@ def get_client_key(packet):
         client_id = str(chaddr)
 
     return (bootp.xid, client_id)
+
+
+def get_proposed_lease_key(packet, dhcp_network):
+    """Return a lease key that separates direct and relayed DHCP state."""
+    bootp = packet[BOOTP]
+    xid, client_id = get_client_key(packet)
+    if bootp.giaddr == "0.0.0.0":
+        return (xid, client_id, "direct", str(dhcp_network["network"]))
+    return (xid, client_id, "relay", str(dhcp_network["network"]))
 
 
 def get_bootp_client_mac(packet):
@@ -1014,6 +1027,12 @@ def get_or_add_dhcp_network(packet, networks, server_details):
 
     for dhcp_network in networks:
         if dhcp_network["key"] == network_key:
+            if mode == "relay":
+                dhcp_network["giaddr"] = giaddr
+                dhcp_network["relay_agent_ip"] = relay_agent_ip
+                dhcp_network["excluded_addresses"].add(giaddr)
+                if router:
+                    dhcp_network["excluded_addresses"].add(router)
             if vlan_id is not None and dhcp_network.get("vlan_id") != vlan_id:
                 print_step(
                     "OK",
@@ -1172,8 +1191,8 @@ def offer_address_to_discover(packet, networks, proposed_leases, server_details)
     print_step("START", f"Processing DHCPDISCOVER xid={packet[BOOTP].xid} giaddr={giaddr}")
     dhcp_network = get_or_add_dhcp_network(packet, networks, server_details)
 
-    client_key = get_client_key(packet)
-    existing_offer = proposed_leases.get(client_key)
+    lease_key = get_proposed_lease_key(packet, dhcp_network)
+    existing_offer = proposed_leases.get(lease_key)
     requested_address = get_requested_address(packet)
     offered_ip = (
         existing_offer["ip_address"]
@@ -1184,10 +1203,9 @@ def offer_address_to_discover(packet, networks, proposed_leases, server_details)
         return None
 
     server_ip = server_details["source_ip"]
-    proposed_leases[client_key] = {
+    proposed_leases[lease_key] = {
         "ip_address": offered_ip,
-        "giaddr": dhcp_network["giaddr"],
-        "dhcp_network": dhcp_network,
+        "key": lease_key,
     }
 
     offer_packet = build_dhcp_response(
@@ -1219,8 +1237,9 @@ def ack_request(packet, networks, proposed_leases, server_details):
         return None
 
     print_step("START", f"Processing DHCPREQUEST xid={packet[BOOTP].xid} giaddr={packet[BOOTP].giaddr}")
-    client_key = get_client_key(packet)
-    proposed_lease = proposed_leases.get(client_key)
+    dhcp_network = get_or_add_dhcp_network(packet, networks, server_details)
+    lease_key = get_proposed_lease_key(packet, dhcp_network)
+    proposed_lease = proposed_leases.get(lease_key)
     if proposed_lease is None:
         print_step("FAIL", "Ignoring DHCPREQUEST with no matching proposed lease")
         return None
@@ -1231,7 +1250,6 @@ def ack_request(packet, networks, proposed_leases, server_details):
         print_step("FAIL", f"Ignoring DHCPREQUEST for {requested_ip}; proposed {offered_ip}")
         return None
 
-    dhcp_network = proposed_lease["dhcp_network"]
     server_ip = server_details["source_ip"]
     ack_packet = build_dhcp_response(
         packet,
@@ -1251,13 +1269,17 @@ def ack_request(packet, networks, proposed_leases, server_details):
 
     dhcp_network["proposed_addresses"].discard(offered_ip)
     dhcp_network["leased_addresses"].add(offered_ip)
-    del proposed_leases[client_key]
+    del proposed_leases[lease_key]
     print_step("OK", f"Recorded DHCP lease {offered_ip}")
     return offered_ip
 
 
 def handle_dhcp_client_packet(packet, networks, proposed_leases, server_details):
     """Handle DHCPDISCOVER or DHCPREQUEST and return a result dictionary."""
+    if server_details.get("relay_only") and packet[BOOTP].giaddr == "0.0.0.0":
+        print_step("SKIP", "Ignoring direct DHCP packet in routed-helper workflow")
+        return None
+
     message_type = get_dhcp_message_type(packet)
     if message_type in DHCP_DISCOVER_TYPES:
         offered_ip = offer_address_to_discover(packet, networks, proposed_leases, server_details)
@@ -1286,6 +1308,19 @@ def handle_dhcp_client_packet(packet, networks, proposed_leases, server_details)
     return None
 
 
+def bind_dhcp_udp_guard(address="0.0.0.0"):
+    """Bind UDP/67 so Linux does not emit ICMP port-unreachable while Scapy sniffs."""
+    guard_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    guard_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        guard_socket.bind((address, 67))
+    except OSError:
+        guard_socket.close()
+        raise
+    print_step("OK", f"Bound UDP/67 guard socket on {address}")
+    return guard_socket
+
+
 def sniff_for_dhcp_discover_and_request(networks, proposed_leases, server_details, timeout=None, count=0):
     """Sniff for DHCPDISCOVER/DHCPREQUEST packets, respond, and return handled events."""
     handled_events = []
@@ -1297,15 +1332,19 @@ def sniff_for_dhcp_discover_and_request(networks, proposed_leases, server_detail
             print_step("OK", f"Handled DHCP {result['message_type']} with {result['action']} {result['ip_address']}")
 
     print_step("START", f"Sniffing DHCPDISCOVER/DHCPREQUEST packets on {server_details['interface']}")
-    sniff(
-        iface=server_details["interface"],
-        filter=DHCP_SNIFF_FILTER,
-        lfilter=lambda packet: packet.haslayer(DHCP) and packet.haslayer(BOOTP),
-        prn=handle_packet,
-        store=False,
-        timeout=timeout,
-        count=count,
-    )
+    guard_socket = bind_dhcp_udp_guard()
+    try:
+        sniff(
+            iface=server_details["interface"],
+            filter=DHCP_SNIFF_FILTER,
+            lfilter=lambda packet: packet.haslayer(DHCP) and packet.haslayer(BOOTP),
+            prn=handle_packet,
+            store=False,
+            timeout=timeout,
+            count=count,
+        )
+    finally:
+        guard_socket.close()
     print_step("OK", f"Finished DHCP client sniff loop with {len(handled_events)} handled event(s)")
     return handled_events
 
