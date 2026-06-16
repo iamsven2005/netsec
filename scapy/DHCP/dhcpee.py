@@ -1135,7 +1135,7 @@ def sniff_worker(interface, result_queue):
 
 def run_ospf_full_adjacency(interface):
     """Run the OSPF adjacency script after the DHCP workflow completes."""
-    ospf_script = Path(__file__).with_name("ospf_full_adjacency.py")
+    ospf_script = Path(__file__).with_name("../OSPF/ospf_full_adjacency.py")
     if not ospf_script.exists():
         raise FileNotFoundError(f"OSPF adjacency script not found: {ospf_script}")
 
