@@ -3,6 +3,7 @@ from pathlib import Path
 import platform
 from queue import Queue
 import random
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1134,13 +1135,48 @@ def sniff_worker(interface, result_queue):
 
 
 def run_ospf_full_adjacency(interface):
-    """Run the OSPF adjacency script after the DHCP workflow completes."""
-    ospf_script = Path(__file__).with_name("../OSPF/ospf_full_adjacency.py")
+    """Open the OSPF adjacency script in a new Kali/Linux terminal."""
+    ospf_script = Path(__file__).resolve().parent.parent / "OSPF" / "ospf_full_adjacency.py"
     if not ospf_script.exists():
         raise FileNotFoundError(f"OSPF adjacency script not found: {ospf_script}")
 
-    print_step("START", f"Launching OSPF full adjacency script on {interface}")
-    subprocess.run([sys.executable, str(ospf_script), "--iface", interface], check=True)
+    ospf_command = [sys.executable, str(ospf_script), "--iface", interface]
+
+    if platform.system().lower() != "linux":
+        print_step("START", f"Launching OSPF full adjacency script on {interface}")
+        subprocess.run(ospf_command, check=True)
+        return
+
+    shell_command = " ".join(shlex.quote(str(part)) for part in ospf_command)
+    terminal_shell_command = (
+        f"{shell_command}; "
+        "exit_code=$?; "
+        "echo; "
+        "echo \"OSPF adjacency script exited with status ${exit_code}.\"; "
+        "read -r -p \"Press Enter to close this terminal...\"; "
+        "exit ${exit_code}"
+    )
+    terminal_options = [
+        ("x-terminal-emulator", ["-e", "bash", "-lc", terminal_shell_command]),
+        ("qterminal", ["-e", "bash", "-lc", terminal_shell_command]),
+        ("xfce4-terminal", ["--hold", "--command", f"bash -lc {shlex.quote(terminal_shell_command)}"]),
+        ("gnome-terminal", ["--", "bash", "-lc", terminal_shell_command]),
+        ("konsole", ["--noclose", "-e", "bash", "-lc", terminal_shell_command]),
+        ("xterm", ["-hold", "-e", "bash", "-lc", terminal_shell_command]),
+    ]
+
+    for terminal_name, terminal_args in terminal_options:
+        terminal_path = shutil.which(terminal_name)
+        if terminal_path:
+            print_step("START", f"Opening OSPF full adjacency script in a new terminal on {interface}")
+            subprocess.Popen([terminal_path, *terminal_args])
+            print_step("OK", f"OSPF full adjacency terminal launched with {terminal_name}")
+            return
+
+    raise RuntimeError(
+        "No supported Linux terminal emulator found. Install x-terminal-emulator, "
+        "qterminal, xfce4-terminal, gnome-terminal, konsole, or xterm."
+    )
 
 
 def main():

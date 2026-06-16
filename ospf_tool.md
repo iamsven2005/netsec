@@ -116,7 +116,7 @@ The router ID stays fixed at `99.99.99.99`.
 ## How To Run
 
 ```bash
-sudo python3 scapy/ospf_full_adjacency.py --iface eth0
+sudo python3 scapy/OSPF/ospf_full_adjacency.py --iface eth0
 ```
 
 ## Command Line Flags
