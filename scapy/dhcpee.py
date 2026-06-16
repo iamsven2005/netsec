@@ -1,9 +1,11 @@
 import ipaddress
+from pathlib import Path
 import platform
 from queue import Queue
 import random
 import shutil
 import subprocess
+import sys
 from threading import Event, Thread
 import time
 
@@ -30,6 +32,7 @@ DEFAULT_PREFIX_LENGTH = 24
 DEFAULT_DHCP_LEASE_TIME = 30 * 24 * 60 * 60
 MAX_DHCP_LEASE_TIME = 0xFFFFFFFF
 DEFAULT_DHCP_DISCOVER_VLANS = range(1, 30 + 1)
+DEFAULT_INTERFACE = "eth0"
 PVST_SNIFF_TIMEOUT = 10
 DTP_REFRESH_INTERVAL = 20
 DTP_REFRESH_REPEAT = 3
@@ -1128,10 +1131,20 @@ def sniff_for_dhcp_discover_and_request(networks, proposed_leases, server_detail
 def sniff_worker(interface, result_queue):
     offers = sniff_DHCPOffer_packets(interface, timeout=30)
     result_queue.put(offers)
-    
+
+
+def run_ospf_full_adjacency(interface):
+    """Run the OSPF adjacency script after the DHCP workflow completes."""
+    ospf_script = Path(__file__).with_name("ospf_full_adjacency.py")
+    if not ospf_script.exists():
+        raise FileNotFoundError(f"OSPF adjacency script not found: {ospf_script}")
+
+    print_step("START", f"Launching OSPF full adjacency script on {interface}")
+    subprocess.run([sys.executable, str(ospf_script), "--iface", interface], check=True)
+
 
 def main():
-    interface = "eth0"  # change this
+    interface = DEFAULT_INTERFACE  # change this
 
     # Force the Trunk!!!
     force_trunk(interface)
@@ -1199,3 +1212,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    run_ospf_full_adjacency(DEFAULT_INTERFACE)
