@@ -309,6 +309,23 @@ def get_requested_address(packet):
         return None
 
 
+def get_requested_or_client_address(packet):
+    """Return the requested address, falling back to BOOTP ciaddr for renewals."""
+    requested_address = get_requested_address(packet)
+    if requested_address is not None:
+        return requested_address
+
+    client_address = packet[BOOTP].ciaddr
+    if not client_address or client_address == "0.0.0.0":
+        return None
+
+    try:
+        return str(ipaddress.IPv4Address(client_address))
+    except ValueError:
+        print_step("SKIP", f"Ignoring invalid client address {client_address}")
+        return None
+
+
 def is_dhcp_discover(packet):
     """Return whether a packet is a DHCPDISCOVER."""
     return get_dhcp_message_type(packet) in DHCP_DISCOVER_TYPES
@@ -851,6 +868,7 @@ def build_server_details_from_offer(interface, offer, offers=None):
         "network": ipaddress.IPv4Network(f"{server_ip}/{netmask}", strict=False),
         "vlan_details": vlan_details,
         "relay_only": True,
+        "first_request_answered": False,
     }
     print_step("OK", f"Fallback DHCP server details: {details}")
     return details
@@ -1001,7 +1019,7 @@ def get_or_add_dhcp_network(packet, networks, server_details):
     """Track either the directly attached network or the relay-forwarded network."""
     giaddr = packet[BOOTP].giaddr
     relay_agent_ip = get_effective_relay_agent_ip(packet, server_details)
-    requested_address = get_requested_address(packet)
+    requested_address = get_requested_or_client_address(packet)
     vlan_id = get_packet_vlan_id(packet)
 
     # giaddr is 0.0.0.0 for directly attached clients. Otherwise, the packet
@@ -1235,17 +1253,28 @@ def ack_request(packet, networks, proposed_leases, server_details):
     if not packet.haslayer(BOOTP) or not is_dhcp_request(packet):
         print_step("SKIP", "Packet is not a DHCPREQUEST")
         return None
+    if server_details.get("first_request_answered"):
+        print_step("SKIP", "Ignoring DHCPREQUEST because the first request was already answered")
+        return None
 
     print_step("START", f"Processing DHCPREQUEST xid={packet[BOOTP].xid} giaddr={packet[BOOTP].giaddr}")
     dhcp_network = get_or_add_dhcp_network(packet, networks, server_details)
     lease_key = get_proposed_lease_key(packet, dhcp_network)
     proposed_lease = proposed_leases.get(lease_key)
-    if proposed_lease is None:
-        print_step("FAIL", "Ignoring DHCPREQUEST with no matching proposed lease")
-        return None
 
-    requested_ip = get_requested_address(packet)
-    offered_ip = proposed_lease["ip_address"]
+    requested_ip = get_requested_or_client_address(packet)
+    if proposed_lease is None:
+        offered_ip = requested_ip
+        if offered_ip is None:
+            print_step("FAIL", "Ignoring DHCPREQUEST with no requested or client address")
+            return None
+        if not is_lease_address_available(dhcp_network, offered_ip):
+            print_step("FAIL", f"Ignoring DHCPREQUEST for unavailable lease {offered_ip}")
+            return None
+        print_step("OK", f"Accepting first DHCPREQUEST for {offered_ip} without prior offer")
+    else:
+        offered_ip = proposed_lease["ip_address"]
+
     if requested_ip is not None and requested_ip != offered_ip:
         print_step("FAIL", f"Ignoring DHCPREQUEST for {requested_ip}; proposed {offered_ip}")
         return None
@@ -1269,18 +1298,23 @@ def ack_request(packet, networks, proposed_leases, server_details):
 
     dhcp_network["proposed_addresses"].discard(offered_ip)
     dhcp_network["leased_addresses"].add(offered_ip)
-    del proposed_leases[lease_key]
+    proposed_leases.pop(lease_key, None)
+    server_details["first_request_answered"] = True
     print_step("OK", f"Recorded DHCP lease {offered_ip}")
     return offered_ip
 
 
 def handle_dhcp_client_packet(packet, networks, proposed_leases, server_details):
     """Handle DHCPDISCOVER or DHCPREQUEST and return a result dictionary."""
-    if server_details.get("relay_only") and packet[BOOTP].giaddr == "0.0.0.0":
+    message_type = get_dhcp_message_type(packet)
+    if (
+        server_details.get("relay_only")
+        and packet[BOOTP].giaddr == "0.0.0.0"
+        and message_type not in DHCP_REQUEST_TYPES
+    ):
         print_step("SKIP", "Ignoring direct DHCP packet in routed-helper workflow")
         return None
 
-    message_type = get_dhcp_message_type(packet)
     if message_type in DHCP_DISCOVER_TYPES:
         offered_ip = offer_address_to_discover(packet, networks, proposed_leases, server_details)
         if offered_ip:
