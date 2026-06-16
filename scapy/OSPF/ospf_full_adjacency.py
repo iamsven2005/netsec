@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import platform
+import shutil
 import socket
 import subprocess
 import sys
@@ -38,6 +39,7 @@ INITIAL_DBD_SEQ = 1000
 BASE_LSA_SEQUENCE = 0x80000001
 BACKBONE_AREA = "0.0.0.0"
 DEFAULT_ROUTER_ID = "99.99.99.99"
+OSPF_SNIFF_FILTER = "ip proto 89 or (vlan and ip proto 89)"
 OSPF_NBR_ROUTES_DB = {}
 
 DOWN = "DOWN"
@@ -73,6 +75,64 @@ def default_iface():
     except Exception:
         pass
     return "Ethernet" if platform.system() == "Windows" else "eth0"
+
+
+def linux_interface_exists(interface_name):
+    if platform.system().lower() != "linux" or not shutil.which("ip"):
+        return False
+    result = subprocess.run(
+        ["ip", "link", "show", "dev", interface_name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def ensure_vlan_subinterface(interface_name, vlan_id):
+    """Create/use a Linux VLAN subinterface for OSPF when --vlan is supplied."""
+    if vlan_id is None:
+        return interface_name
+
+    vlan_id = int(vlan_id)
+    if not 1 <= vlan_id <= 4094:
+        sys.exit(f"[!] Invalid VLAN ID: {vlan_id}")
+    if platform.system().lower() != "linux":
+        sys.exit("[!] --vlan requires Linux/Kali VLAN subinterface support.")
+    if not shutil.which("ip"):
+        sys.exit("[!] --vlan requires the Linux 'ip' command.")
+
+    if interface_name.endswith(f".{vlan_id}"):
+        subinterface = interface_name
+        parent_interface = interface_name.rsplit(".", 1)[0]
+    else:
+        parent_interface = interface_name
+        subinterface = f"{interface_name}.{vlan_id}"
+
+    if not linux_interface_exists(subinterface):
+        result = subprocess.run(
+            ["ip", "link", "add", "link", parent_interface, "name", subinterface, "type", "vlan", "id", str(vlan_id)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            sys.exit(f"[!] Could not create VLAN subinterface {subinterface}: {result.stderr.strip()}")
+        log_message(f"[VLAN] Created {subinterface} on {parent_interface} for VLAN {vlan_id}.")
+    else:
+        log_message(f"[VLAN] Using existing VLAN subinterface {subinterface}.")
+
+    for target_interface in (parent_interface, subinterface):
+        result = subprocess.run(
+            ["ip", "link", "set", target_interface, "up"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            sys.exit(f"[!] Could not bring {target_interface} up: {result.stderr.strip()}")
+
+    return subinterface
 
 
 def read_interface_ip(interface_name):
@@ -898,7 +958,7 @@ def run_engine(context):
     ensure_ospf_raw_socket(context)
     threading.Thread(
         target=sniff,
-        kwargs=dict(iface=context["interface_name"], filter="proto 89", prn=lambda packet: dispatch_packet(context, packet), store=0),
+        kwargs=dict(iface=context["interface_name"], filter=OSPF_SNIFF_FILTER, prn=lambda packet: dispatch_packet(context, packet), store=0),
         daemon=True,
     ).start()
     threading.Thread(target=runtime_console, args=(context,), daemon=True).start()
@@ -943,18 +1003,21 @@ def run_engine(context):
 def main():
     parser = argparse.ArgumentParser(prog="ospf_full_adjacency.py")
     parser.add_argument("--iface", default=default_iface())
+    parser.add_argument("--vlan", type=int, help="Create/use iface.VLAN and run OSPF on that VLAN subinterface")
     parser.add_argument("--interval", default=HELLO_INTERVAL, type=int)
     args = parser.parse_args()
 
-    source_ip, network_mask = read_interface_state(args.iface)
+    ospf_interface = ensure_vlan_subinterface(args.iface, args.vlan)
+
+    source_ip, network_mask = read_interface_state(ospf_interface)
     if not source_ip or not network_mask:
-        sys.exit(f"[!] No usable IPv4 address or netmask for '{args.iface}'.")
+        sys.exit(f"[!] No usable IPv4 address or netmask for '{ospf_interface}'.")
     log_message("=" * 52)
     log_message("  OSPFv2 Full Adjacency Engine")
-    log_message(f"  iface={args.iface}  src={source_ip}  rid={DEFAULT_ROUTER_ID}")
+    log_message(f"  iface={ospf_interface}  src={source_ip}  rid={DEFAULT_ROUTER_ID}")
     log_message("=" * 52)
 
-    context = make_context(args.iface, source_ip, network_mask, args.interval)
+    context = make_context(ospf_interface, source_ip, network_mask, args.interval)
     refresh_local_router_lsa(context)
     run_engine(context)
 
