@@ -868,7 +868,7 @@ def build_server_details_from_offer(interface, offer, offers=None):
         "network": ipaddress.IPv4Network(f"{server_ip}/{netmask}", strict=False),
         "vlan_details": vlan_details,
         "relay_only": True,
-        "first_request_answered": False,
+        "answered_request_xids": set(),
     }
     print_step("OK", f"Fallback DHCP server details: {details}")
     return details
@@ -1102,6 +1102,23 @@ def is_lease_address_available(dhcp_network, address):
     return True
 
 
+def is_requested_lease_address_usable(dhcp_network, address):
+    """Return whether a requested address is valid for ACKing a client request."""
+    network = dhcp_network["network"]
+    try:
+        ip_address = ipaddress.IPv4Address(address)
+    except ValueError:
+        return False
+
+    if ip_address not in network:
+        return False
+    host_number = int(ip_address) - int(network.network_address)
+    if not LEASE_HOST_MIN <= host_number <= LEASE_HOST_MAX:
+        return False
+
+    return str(ip_address) not in dhcp_network["excluded_addresses"]
+
+
 def reserve_lease_address(dhcp_network, address):
     """Reserve an address for a pending DHCP offer."""
     dhcp_network["proposed_addresses"].add(address)
@@ -1253,11 +1270,14 @@ def ack_request(packet, networks, proposed_leases, server_details):
     if not packet.haslayer(BOOTP) or not is_dhcp_request(packet):
         print_step("SKIP", "Packet is not a DHCPREQUEST")
         return None
-    if server_details.get("first_request_answered"):
-        print_step("SKIP", "Ignoring DHCPREQUEST because the first request was already answered")
+
+    bootp = packet[BOOTP]
+    answered_xids = server_details.setdefault("answered_request_xids", set())
+    if bootp.xid in answered_xids:
+        print_step("SKIP", f"Ignoring DHCPREQUEST xid={bootp.xid} because it was already answered")
         return None
 
-    print_step("START", f"Processing DHCPREQUEST xid={packet[BOOTP].xid} giaddr={packet[BOOTP].giaddr}")
+    print_step("START", f"Processing DHCPREQUEST xid={bootp.xid} giaddr={bootp.giaddr}")
     dhcp_network = get_or_add_dhcp_network(packet, networks, server_details)
     lease_key = get_proposed_lease_key(packet, dhcp_network)
     proposed_lease = proposed_leases.get(lease_key)
@@ -1268,10 +1288,10 @@ def ack_request(packet, networks, proposed_leases, server_details):
         if offered_ip is None:
             print_step("FAIL", "Ignoring DHCPREQUEST with no requested or client address")
             return None
-        if not is_lease_address_available(dhcp_network, offered_ip):
+        if not is_requested_lease_address_usable(dhcp_network, offered_ip):
             print_step("FAIL", f"Ignoring DHCPREQUEST for unavailable lease {offered_ip}")
             return None
-        print_step("OK", f"Accepting first DHCPREQUEST for {offered_ip} without prior offer")
+        print_step("OK", f"Accepting first DHCPREQUEST xid={bootp.xid} for {offered_ip} without prior offer")
     else:
         offered_ip = proposed_lease["ip_address"]
 
@@ -1299,7 +1319,7 @@ def ack_request(packet, networks, proposed_leases, server_details):
     dhcp_network["proposed_addresses"].discard(offered_ip)
     dhcp_network["leased_addresses"].add(offered_ip)
     proposed_leases.pop(lease_key, None)
-    server_details["first_request_answered"] = True
+    answered_xids.add(bootp.xid)
     print_step("OK", f"Recorded DHCP lease {offered_ip}")
     return offered_ip
 
