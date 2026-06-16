@@ -21,6 +21,7 @@ from scapy.all import (
     SNAP,
     STP,
     UDP,
+    get_if_addr,
     get_if_hwaddr,
     mac2str,
     sendp,
@@ -37,6 +38,8 @@ DEFAULT_INTERFACE = "eth0"
 PVST_SNIFF_TIMEOUT = 10
 DTP_REFRESH_INTERVAL = 20
 DTP_REFRESH_REPEAT = 3
+INTERFACE_IPV4_WAIT_INTERVAL = 2
+INTERFACE_IPV4_WAIT_TIMEOUT = 60
 DHCP_SNIFF_FILTER = "udp and (port 67 or 68) or (vlan and udp and (port 67 or 68))"
 DHCP_DISCOVER_TYPES = {1, "discover"}
 DHCP_OFFER_TYPES = {2, "offer"}
@@ -548,8 +551,62 @@ def get_kali_ipv4_addresses(interface):
 
     print_step("OK", f"Found {len(addresses)} existing IPv4 address(es) on {interface}")
     return addresses
-   
-    
+
+
+def get_interface_ipv4_addresses(interface):
+    """Return current non-zero IPv4 addresses for an interface without noisy polling logs."""
+    if platform.system().lower() == "linux" and shutil.which("ip"):
+        result = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "dev", interface, "scope", "global"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            addresses = []
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if "inet" in parts:
+                    inet_index = parts.index("inet")
+                    if inet_index + 1 < len(parts):
+                        addresses.append(parts[inet_index + 1])
+            return addresses
+
+    try:
+        address = get_if_addr(interface)
+    except Exception:
+        return []
+
+    if address and address != "0.0.0.0":
+        return [address]
+    return []
+
+
+def wait_for_interface_ipv4_address(interface, expected_address=None, timeout=INTERFACE_IPV4_WAIT_TIMEOUT):
+    """Wait until an interface has a usable IPv4 address, optionally a specific one."""
+    expected_message = f" {expected_address}" if expected_address else ""
+    print_step("START", f"Waiting for {interface} to have IPv4 address{expected_message}")
+    deadline = time.monotonic() + timeout if timeout is not None else None
+
+    while True:
+        addresses = get_interface_ipv4_addresses(interface)
+        plain_addresses = [address.split("/", 1)[0] for address in addresses]
+        if expected_address:
+            if expected_address in plain_addresses:
+                print_step("OK", f"{interface} has expected IPv4 address {expected_address}")
+                return addresses
+        elif addresses:
+            print_step("OK", f"{interface} has IPv4 address(es): {addresses}")
+            return addresses
+
+        if deadline is not None and time.monotonic() >= deadline:
+            waited_for = f" {timeout} seconds"
+            print_step("FAIL", f"Timed out after{waited_for} waiting for IPv4 address on {interface}")
+            raise TimeoutError(f"Timed out waiting for IPv4 address on {interface}")
+
+        time.sleep(INTERFACE_IPV4_WAIT_INTERVAL)
+
+
 def remove_kali_ipv4_addresses(interface):
     """Remove every current IPv4 address from a Linux interface."""
     print_step("START", f"Removing existing IPv4 addresses from Linux interface {interface}")
@@ -642,6 +699,7 @@ def set_static_address_from_offer(interface, offer):
     # over as the fallback DHCP server.
     print_step("OK", f"Selected DHCP server IP {address} as this host's static address")
     set_static_address(interface, address, netmask)
+    return address
 
 
 def build_server_details_from_offer(interface, offer, offers=None):
@@ -1228,8 +1286,10 @@ def main():
 
         selected_offer = offers[0]
         print_step("START", f"Using first DHCPOFFER result to take DHCP server IP: {selected_offer}")
-        set_static_address_from_offer(interface, selected_offer)
+        selected_address = set_static_address_from_offer(interface, selected_offer)
+        wait_for_interface_ipv4_address(interface, expected_address=selected_address)
         print_step("OK", "Static address was set to the DHCP server IP from the selected DHCPOFFER")
+        run_ospf_full_adjacency(interface)
 
         networks = []
         proposed_leases = {}
@@ -1248,4 +1308,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    run_ospf_full_adjacency(DEFAULT_INTERFACE)
