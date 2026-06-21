@@ -789,22 +789,24 @@ def state_exstart(context, neighbor, router_id, master_bit, sequence_number):
 
 
 def state_exchange(context, neighbor, packet, more_bit):
+    peer_seq = packet[OSPF_DBDesc].ddseq
     if neighbor["state"] != EXCHANGE:
-        return False
-
-    # When we are the master, the slave echoes our sequence number.  If it
-    # retransmits the same seq (because our reply was lost), resend the cached
-    # last master DBD without incrementing — otherwise the seq diverges and
-    # Cisco tears down the adjacency with "Too many retransmissions".
-    if neighbor["is_master"]:
-        peer_seq = packet[OSPF_DBDesc].ddseq
-        if peer_seq == neighbor["last_peer_seq_in"]:
-            if neighbor["last_sent_dbd"] is not None:
-                send_packet(context, neighbor["last_sent_dbd"], destination=neighbor["ip_address"])
+        if peer_seq == neighbor["last_peer_seq_in"] and neighbor["last_sent_dbd"] is not None:
+            send_packet(context, neighbor["last_sent_dbd"], destination=neighbor["ip_address"])
             return True
-        neighbor["last_peer_seq_in"] = peer_seq
+        return False
+    if peer_seq == neighbor["last_peer_seq_in"]:
+        if neighbor["last_sent_dbd"] is not None:
+            send_packet(context, neighbor["last_sent_dbd"], destination=neighbor["ip_address"])
+        return True
+    neighbor["last_peer_seq_in"] = peer_seq
 
     neighbor["requested_lsas"] = collect_unknown_lsas(context, packet)
+    if not neighbor["is_master"]:
+        neighbor["database_sequence"] = peer_seq
+        dbd = build_dbd(context, neighbor, is_master_packet=False, sequence_number=neighbor["database_sequence"])
+        neighbor["last_sent_dbd"] = dbd
+        send_packet(context, dbd, destination=neighbor["ip_address"])
     if not more_bit:
         if neighbor["requested_lsas"]:
             transition_neighbor(context, neighbor, LOADING)
