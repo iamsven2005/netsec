@@ -132,6 +132,24 @@ def find_profiles(extra_dirs: tuple = ()) -> list[tuple[str, float]]:
 
 # ── Route management ──────────────────────────────────────────────────────────
 
+def _tun_peer_ip(tun_iface: str) -> str | None:
+    """Return the point-to-point peer IP of a tun interface (the remote VPN endpoint).
+
+    OpenVPN configures tun as a p2p link; 'ip addr show tun0' contains a
+    'peer X.X.X.X' field.  We use it as the explicit nexthop so that
+    'ip route replace 0.0.0.0/1 via <peer>' works even on kernels that
+    don't resolve the nexthop implicitly from the p2p link.
+    """
+    try:
+        out = subprocess.check_output(["ip", "addr", "show", tun_iface], text=True)
+        m = re.search(r"peer (\d+\.\d+\.\d+\.\d+)", out)
+        if m:
+            return m.group(1)
+    except subprocess.CalledProcessError:
+        pass
+    return None
+
+
 def snapshot_routes() -> set[str]:
     out = subprocess.check_output(["ip", "route", "show"], text=True)
     return set(out.strip().splitlines())
@@ -201,11 +219,20 @@ def setup_forwarding(phys_iface: str, tun_iface: str) -> None:
     # Re-add clean /1 routes via tun so victim traffic is correctly routed there.
     # The VPN server's /32 host route via phys stays most-specific, keeping the
     # tunnel alive despite the /1 routes pointing everything else at tun.
+    peer = _tun_peer_ip(tun_iface)
+    route_via = ["via", peer] if peer else []
+    if peer:
+        print(f"[relay] tun peer IP: {peer} (using as nexthop for /1 routes)")
+    else:
+        print(f"[relay] Warning: could not detect tun peer IP — using 'dev {tun_iface}' only")
     for prefix in ("0.0.0.0/1", "128.0.0.0/1"):
-        subprocess.run(
-            ["ip", "route", "replace", prefix, "dev", tun_iface],
-            check=False, capture_output=True,
-        )
+        cmd = ["ip", "route", "replace", prefix] + route_via + ["dev", tun_iface]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[relay] ERROR: failed to add route {prefix} via tun: {result.stderr.strip()}")
+            print(f"[relay]        Victim traffic will NOT be relayed through the VPN tunnel")
+        else:
+            print(f"[relay] Route: {prefix} → {tun_iface}" + (f" via {peer}" if peer else ""))
 
     _rules_installed = True
     print(f"[relay] Forwarding: {phys_iface} → {tun_iface} (MASQUERADE on tun)")
