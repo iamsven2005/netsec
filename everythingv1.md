@@ -240,9 +240,6 @@ router ospf 1
  default-information originate always
 
 ip route 0.0.0.0 0.0.0.0 172.17.9.14
-
-! Rack 1C transit WAN: 172.17.9.12/30
-! Rack 1C routed public block: 203.149.210.24/29
 ip nat inside source static 192.168.100.1 203.149.210.25
 
 ! Link to R2 (192.168.100.4/30)
@@ -273,7 +270,6 @@ interface g0/1/1
  ip ospf network point-to-point
  no shutdown
 
-! PAT uses the remaining usable public IPs after reserving 203.149.210.25 for the static server NAT
 ip nat pool NAT_POOL 203.149.210.26 203.149.210.30 netmask 255.255.255.248
 ip access-list standard NAT_ACL
  permit 192.168.1.0 0.0.0.255

@@ -1,44 +1,29 @@
-en
 conf t
-hostname R1
-
-ip route 0.0.0.0 0.0.0.0 172.17.9.34
-
-interface g0/0/0
- ip address 192.168.100.1 255.255.255.252
- ip nat inside
- no shutdown
-
-interface g0/1/0
- ip address 172.17.9.33 255.255.255.252
- ip nat outside
- no shutdown
-
-ip nat pool NAT_POOL 203.149.10.65 203.149.10.68 netmask 255.255.255.248
-ip access-list standard NAT_ACL
- permit 192.168.100.0 0.0.0.255
- permit 192.168.2.0 0.0.0.255
- permit 192.168.3.0 0.0.0.7
- permit 192.168.4.0 0.0.0.127
-ip nat inside source list NAT_ACL pool NAT_POOL overload
+iprouting
+ip routing
+int g1/0/24
+no switchport
+ip address 172.17.9.13 255.255.255.252
+ip nat outside
+no shutdown
+exit
+ip route 0.0.0.0 0.0.0.0 172.17.9.14
+$203.149.210.26 203.149.210.30 netmask 255.255.255.248
+ip access-list 1 permit 192.168.100.0 0.0.0.255
+access-list 1 permit 192.168.100.0 0.0.0.255
+ip nat inside source list 1 pool NAT_POOL
 end
-
-
-
-
-
-Router(config-if)#ip add 10.0.0.2 255.255.255.252
-Router(config-if)#no shut
-Router(config-if)#ip nat inside
-Router(config-if)#ip add 172.17.9.33 255.255.255.252
-Router(config-if)#no shut
-Router(config-if)#ip nat outside
-Router(config-if)#exit
-Router(config)#access-list 1 permit 10.0.0.0 0.0.0.3
-Router(config)#ip nat pool public_pool 203.149.210.64 203.149.210.66
-% Incomplete command.
-
-Router(config)#$ol 203.149.210.64 203.149.210.66 netmask 255.255.255.248
-Router(config)#ip nat inside source list 1 pool public_pool
-Router(config)#ip route 0.0.0.0 0.0.0.0 172.17.9.34
-Router(config)#end
+conf t
+interface Vlan100
+ip address 192.168.100.2 255.255.255.0
+no shutdown
+interface Vlan100
+ip nat inside
+no shut
+vlan 100
+exit
+int range g1/0/1-12
+switchport mode access
+switchport access vlan 100
+no shutdown
+end
