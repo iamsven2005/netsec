@@ -677,7 +677,6 @@ def state_exstart(context, neighbor, router_id, master_bit, sequence_number):
     if neighbor_is_master:
         neighbor["is_master"] = False
         neighbor["database_sequence"] = sequence_number
-        send_packet(context, build_dbd(context, neighbor, is_master_packet=False, sequence_number=sequence_number), destination=neighbor["ip_address"])
         transition_neighbor(context, neighbor, EXCHANGE)
         send_lsdb_summary(context, neighbor)
     elif not master_bit and sequence_number == neighbor["database_sequence"]:

@@ -702,8 +702,20 @@ def show_neighbors(context):
 def update_full_adjacency_gate(context):
     ready_message = None
     with context["lock"]:
-        neighbors = [neighbor for neighbor in context["neighbors"].values() if is_dr_or_bdr_neighbor(neighbor)]
-        everyone_full = bool(neighbors) and all(neighbor["state"] == FULL for neighbor in neighbors)
+        expected_peer_ips = [
+            peer_ip
+            for peer_ip in {context["designated_router"], context["backup_designated_router"]}
+            if peer_ip != "0.0.0.0"
+        ]
+        neighbors_by_ip = {
+            neighbor["ip_address"]: neighbor
+            for neighbor in context["neighbors"].values()
+            if is_dr_or_bdr_neighbor(neighbor)
+        }
+        everyone_full = bool(expected_peer_ips) and all(
+            neighbors_by_ip.get(peer_ip, {}).get("state") == FULL
+            for peer_ip in expected_peer_ips
+        )
         if everyone_full:
             if not context["adjacency_ready_event"].is_set():
                 context["adjacency_ready_event"].set()
@@ -768,7 +780,6 @@ def state_exstart(context, neighbor, router_id, master_bit, sequence_number):
     if neighbor_is_master:
         neighbor["is_master"] = False
         neighbor["database_sequence"] = sequence_number
-        send_packet(context, build_dbd(context, neighbor, is_master_packet=False, sequence_number=sequence_number), destination=neighbor["ip_address"])
         transition_neighbor(context, neighbor, EXCHANGE)
         send_lsdb_summary(context, neighbor)
     elif not master_bit and sequence_number == neighbor["database_sequence"]:
