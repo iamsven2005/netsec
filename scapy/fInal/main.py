@@ -47,6 +47,7 @@ import argparse
 import os
 import sys
 import threading
+import time
 from queue import Queue
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -281,7 +282,18 @@ def debug_menu(networks: list, proposed_leases: dict, server_details: dict, c2_c
 # ── DHCP phases ───────────────────────────────────────────────────────────────
 
 def discover_offers(interface):
-    """Run the threaded DHCPDISCOVER sweep and return the captured offers."""
+    """Run the threaded DHCPDISCOVER sweep and return the captured offers.
+
+    In a relay topology (ip helper-address) the DHCPOFFER can arrive within
+    tens of milliseconds.  Scapy's sniff() needs ~100–200 ms to open its raw
+    socket and install the BPF filter.  If DISCOVERs are sent before the
+    sniffer is ready the OFFERs race past and are never captured — the 30 s
+    window expires with nothing.
+
+    Fix: wait 1 s after the sniffer thread starts (bind-wait), then retry
+    DISCOVERs every 8 s so any missed OFFERs are recovered on subsequent
+    attempts.  Three attempts span 17 s; the 30 s sniffer window covers all.
+    """
     pvst_network_map = sniff_pvst(interface)
     discovered_vlan_ids = get_discovered_vlan_ids(pvst_network_map)
     if discovered_vlan_ids:
@@ -300,8 +312,26 @@ def discover_offers(interface):
 
     print_step("START", "Starting DHCPOFFER sniffer thread")
     sniffer_thread.start()
-    print_step("START", "Sending DHCPDISCOVER packets across VLANs")
-    send_DHCPDiscover_VLANs(interface, dhcp_probe_vlan_ids)
+
+    # Give the sniffer socket time to bind before sending.  Without this the
+    # OFFERs can arrive before the BPF filter is installed and are silently
+    # dropped.  1 s is conservative; the thread typically binds in < 300 ms.
+    time.sleep(1)
+
+    for attempt in range(1, 4):  # attempts at t≈1 s, 9 s, 17 s
+        if not sniffer_thread.is_alive():
+            break
+        if attempt > 1:
+            print_step(
+                "START",
+                f"No OFFERs captured yet — retrying DHCPDISCOVER sweep "
+                f"(attempt {attempt}/3)",
+            )
+        print_step("START", f"Sending DHCPDISCOVER packets across VLANs (attempt {attempt}/3)")
+        send_DHCPDiscover_VLANs(interface, dhcp_probe_vlan_ids)
+        if attempt < 3:
+            time.sleep(8)  # wait for OFFERs before the next attempt
+
     sniffer_thread.join()
 
     offers = result_queue.get()

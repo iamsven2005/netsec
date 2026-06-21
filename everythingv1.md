@@ -30,8 +30,6 @@ int g1/0/24
  switchport trunk allowed vlan 10,20,30,40
  no shutdown
 interface range g1/0/1-22
- switchport mode access
- switchport access vlan 10
  no shutdown
 end
 
@@ -60,8 +58,6 @@ int g1/0/24
  switchport trunk allowed vlan 10,20,30,40
  no shutdown
 interface range g1/0/1-22
- switchport mode access
- switchport access vlan 20
  no shutdown
 end
 
