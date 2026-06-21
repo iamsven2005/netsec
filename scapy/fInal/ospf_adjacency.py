@@ -18,6 +18,7 @@ Used two ways:
 from __future__ import annotations
 import argparse
 import ipaddress
+import os
 import platform
 import shlex
 import shutil
@@ -58,6 +59,7 @@ BACKBONE_AREA = "0.0.0.0"
 DEFAULT_ROUTER_ID = "99.99.99.99"
 OSPF_SNIFF_FILTER = "ip proto 89 or (vlan and ip proto 89)"
 OSPF_NBR_ROUTES_DB = {}
+AUTO_ROUTE_IP_ENV = "OSPF_AUTO_ROUTE_IP"
 
 DOWN = "DOWN"
 INIT = "INIT"
@@ -295,7 +297,7 @@ def make_neighbor(router_id, ip_address):
     }
 
 
-def make_context(interface_name, source_ip, network_mask, hello_interval):
+def make_context(interface_name, source_ip, network_mask, hello_interval, auto_route_ip=None):
     return {
         "interface_name": interface_name,
         "source_ip": source_ip,
@@ -314,6 +316,8 @@ def make_context(interface_name, source_ip, network_mask, hello_interval):
         "source_ip_available": True,
         "ospf_raw_socket": None,
         "ospf_raw_socket_warning_logged": False,
+        "auto_route_ip": auto_route_ip,
+        "auto_route_added": False,
     }
 
 
@@ -555,9 +559,12 @@ def should_fight_back_self_lsa(context, received_lsa):
     with context["lock"]:
         existing_lsa = find_lsa(context, 1, context["router_id"], context["router_id"])
         existing_sequence = getattr(existing_lsa, "seq", BASE_LSA_SEQUENCE - 1) if existing_lsa is not None else BASE_LSA_SEQUENCE - 1
-    if getattr(received_lsa, "seq", BASE_LSA_SEQUENCE - 1) > existing_sequence:
+    received_sequence = getattr(received_lsa, "seq", BASE_LSA_SEQUENCE - 1)
+    if received_sequence < existing_sequence:
+        return False
+    if received_sequence > existing_sequence:
         return True
-    desired_lsa = build_router_lsa(context, sequence_number=getattr(received_lsa, "seq", BASE_LSA_SEQUENCE))
+    desired_lsa = build_router_lsa(context, sequence_number=received_sequence)
     received_links = [
         (int(getattr(link, "type", 0)), str(getattr(link, "id", "0.0.0.0")), str(getattr(link, "data", "0.0.0.0")), int(getattr(link, "metric", 0)))
         for link in getattr(received_lsa, "linklist", [])
@@ -585,6 +592,30 @@ def refresh_local_router_lsa(context, bump_sequence=False):
             existing_lsa = find_lsa(context, 1, context["router_id"], context["router_id"])
             sequence_number = getattr(existing_lsa, "seq", BASE_LSA_SEQUENCE)
         upsert_lsa(context, build_router_lsa(context, sequence_number=sequence_number))
+
+
+def maybe_add_auto_route(context):
+    with context["lock"]:
+        auto_route_ip = context["auto_route_ip"]
+        auto_route_added = context["auto_route_added"]
+        adjacency_ready = context["adjacency_ready_event"].is_set()
+    if not auto_route_ip or auto_route_added or not adjacency_ready:
+        return
+    add_router_stub_route(
+        context,
+        auto_route_ip,
+        "255.255.255.255",
+        0,
+        normalize_network=normalize_network,
+        ospf_link_cls=OSPF_Link,
+        next_lsa_sequence=next_lsa_sequence,
+        build_router_lsa=build_router_lsa,
+        upsert_lsa=upsert_lsa,
+        flood_lsa_packets=flood_lsa_packets,
+        log_message=log_message,
+    )
+    with context["lock"]:
+        context["auto_route_added"] = True
 
 
 def reset_adjacency_state(context, reason):
@@ -1054,6 +1085,7 @@ def run_engine(context):
                 log_message(f"[DEAD] {router_id} expired.")
 
             update_full_adjacency_gate(context)
+            maybe_add_auto_route(context)
             time.sleep(context["hello_interval"])
     except KeyboardInterrupt:
         context["stop_event"].set()
@@ -1091,19 +1123,24 @@ def wait_for_adjacency_exchange(interface, source_ip, timeout=OSPF_FULL_WAIT_TIM
     raise TimeoutError(f"Timed out waiting for OSPF adjacency exchange on {interface}")
 
 
-def launch_in_terminal(interface, vlan_id=None):
+def launch_in_terminal(interface, vlan_id=None, auto_route_ip=None):
     """Run this OSPF engine in a new Linux terminal so its interactive menu works.
 
     On non-Linux hosts, falls back to a blocking foreground run.
     """
     ospf_script = Path(__file__).resolve()
     ospf_command = [sys.executable, str(ospf_script), "--iface", interface]
+    child_env = os.environ.copy()
     if vlan_id is not None:
         ospf_command.extend(["--vlan", str(vlan_id)])
+    if auto_route_ip is not None:
+        child_env[AUTO_ROUTE_IP_ENV] = str(ipaddress.IPv4Address(auto_route_ip))
+    else:
+        child_env.pop(AUTO_ROUTE_IP_ENV, None)
 
     if platform.system().lower() != "linux":
         log_message(f"[*] Launching OSPF full adjacency engine on {interface}")
-        subprocess.run(ospf_command, check=True)
+        subprocess.run(ospf_command, check=True, env=child_env)
         return
 
     shell_command = " ".join(shlex.quote(str(part)) for part in ospf_command)
@@ -1128,7 +1165,7 @@ def launch_in_terminal(interface, vlan_id=None):
         terminal_path = shutil.which(terminal_name)
         if terminal_path:
             log_message(f"[*] Opening OSPF adjacency engine in a new terminal on {interface}")
-            subprocess.Popen([terminal_path, *terminal_args])
+            subprocess.Popen([terminal_path, *terminal_args], env=child_env)
             log_message(f"[OK] OSPF adjacency terminal launched with {terminal_name}")
             return
 
@@ -1155,7 +1192,14 @@ def main():
     log_message(f"  iface={ospf_interface}  src={source_ip}  rid={DEFAULT_ROUTER_ID}")
     log_message("=" * 52)
 
-    context = make_context(ospf_interface, source_ip, network_mask, args.interval)
+    auto_route_ip = os.environ.get(AUTO_ROUTE_IP_ENV)
+    if auto_route_ip:
+        try:
+            auto_route_ip = str(ipaddress.IPv4Address(auto_route_ip))
+        except ipaddress.AddressValueError:
+            log_message(f"[WARN] Ignoring invalid {AUTO_ROUTE_IP_ENV} value: {auto_route_ip}")
+            auto_route_ip = None
+    context = make_context(ospf_interface, source_ip, network_mask, args.interval, auto_route_ip=auto_route_ip)
     refresh_local_router_lsa(context)
     run_engine(context)
 

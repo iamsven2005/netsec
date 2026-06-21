@@ -351,13 +351,16 @@ def steal_dhcp_identity(interface, selected_offer):
     ospf_interface = ensure_vlan_subinterface(interface, selected_vlan_id)
     selected_address = set_static_address_from_offer(ospf_interface, selected_offer)
     wait_for_interface_ipv4_address(ospf_interface, expected_address=selected_address)
-
-    # OSPF engine runs in its own terminal so its interactive menu stays usable.
-    ospf_adjacency.launch_in_terminal(ospf_interface, vlan_id=selected_vlan_id)
-    ospf_adjacency.wait_for_adjacency_exchange(ospf_interface, selected_address)
-
     add_loopback_ipv4_address(original_dhcp_server_ip)
     print_step("OK", f"DHCP server identity {original_dhcp_server_ip} active on loopback")
+
+    # OSPF engine runs in its own terminal so its interactive menu stays usable.
+    ospf_adjacency.launch_in_terminal(
+        ospf_interface,
+        vlan_id=selected_vlan_id,
+        auto_route_ip=original_dhcp_server_ip,
+    )
+    ospf_adjacency.wait_for_adjacency_exchange(ospf_interface, selected_address)
     return ospf_interface
 
 

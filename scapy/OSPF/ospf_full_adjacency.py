@@ -494,9 +494,12 @@ def should_fight_back_self_lsa(context, received_lsa):
     with context["lock"]:
         existing_lsa = find_lsa(context, 1, context["router_id"], context["router_id"])
         existing_sequence = getattr(existing_lsa, "seq", BASE_LSA_SEQUENCE - 1) if existing_lsa is not None else BASE_LSA_SEQUENCE - 1
-    if getattr(received_lsa, "seq", BASE_LSA_SEQUENCE - 1) > existing_sequence:
+    received_sequence = getattr(received_lsa, "seq", BASE_LSA_SEQUENCE - 1)
+    if received_sequence < existing_sequence:
+        return False
+    if received_sequence > existing_sequence:
         return True
-    desired_lsa = build_router_lsa(context, sequence_number=getattr(received_lsa, "seq", BASE_LSA_SEQUENCE))
+    desired_lsa = build_router_lsa(context, sequence_number=received_sequence)
     received_links = [
         (int(getattr(link, "type", 0)), str(getattr(link, "id", "0.0.0.0")), str(getattr(link, "data", "0.0.0.0")), int(getattr(link, "metric", 0)))
         for link in getattr(received_lsa, "linklist", [])
