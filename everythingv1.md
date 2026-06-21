@@ -241,7 +241,9 @@ router ospf 1
 
 ip route 0.0.0.0 0.0.0.0 172.17.9.14
 
-ip nat inside source static 192.168.100.1 203.149.10.25
+! Rack 1C transit WAN: 172.17.9.12/30
+! Rack 1C routed public block: 203.149.210.24/29
+ip nat inside source static 192.168.100.1 203.149.210.25
 
 ! Link to R2 (192.168.100.4/30)
 interface g0/0/0
@@ -271,7 +273,7 @@ interface g0/1/1
  ip ospf network point-to-point
  no shutdown
 
-ip nat pool NAT_POOL 203.149.10.26 203.149.10.31 netmask 255.255.255.248
+ip nat pool NAT_POOL 203.149.210.26 203.149.210.30 netmask 255.255.255.248
 ip access-list standard NAT_ACL
  permit 192.168.1.0 0.0.0.255
  permit 192.168.2.0 0.0.0.255
@@ -343,7 +345,7 @@ graph TD
     PCA(["PCA — VLAN 10\n192.168.1.0/24"])
     PCB(["PCB — VLAN 20\n192.168.2.0/24"])
 
-    INET --- |WAN 203.149.10.24/29| R1
+    INET --- |Transit WAN 172.17.9.12/30\nRouted public block 203.149.210.24/29| R1
     R1 --- |192.168.100.4/30| R2
     R2 --- |DMZ 192.168.100.0/30| SRV
     R1 --- |10.10.10.4/30| DSW1
