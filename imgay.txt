@@ -11,7 +11,7 @@ interface g0/0/0
 
 interface g0/1/0
  ip address 172.17.9.33 255.255.255.252
- ip nat inside
+ ip nat outside
  no shutdown
 
 ip nat pool NAT_POOL 203.149.10.65 203.149.10.68 netmask 255.255.255.248
@@ -22,3 +22,23 @@ ip access-list standard NAT_ACL
  permit 192.168.4.0 0.0.0.127
 ip nat inside source list NAT_ACL pool NAT_POOL overload
 end
+
+
+
+
+
+Router(config-if)#ip add 10.0.0.2 255.255.255.252
+Router(config-if)#no shut
+Router(config-if)#ip nat inside
+Router(config-if)#ip add 172.17.9.33 255.255.255.252
+Router(config-if)#no shut
+Router(config-if)#ip nat outside
+Router(config-if)#exit
+Router(config)#access-list 1 permit 10.0.0.0 0.0.0.3
+Router(config)#ip nat pool public_pool 203.149.210.64 203.149.210.66
+% Incomplete command.
+
+Router(config)#$ol 203.149.210.64 203.149.210.66 netmask 255.255.255.248
+Router(config)#ip nat inside source list 1 pool public_pool
+Router(config)#ip route 0.0.0.0 0.0.0.0 172.17.9.34
+Router(config)#end
