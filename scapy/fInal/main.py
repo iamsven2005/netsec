@@ -35,10 +35,13 @@ End-to-end flow:
     2.  DHCPDISCOVER sweep across VLANs; capture DHCPOFFERs.
     3.  Steal the offered client IP (static), inject a host route via OSPF, and
         add the real DHCP server's IP to our loopback (identity theft).
-    4.  Detect the host VPN (start OpenVPN from an autologin profile if needed)
-        and read its pushed subnets.
-    5.  Inject option 121 so victims send only VPN-subnet traffic to us (relayed
-        through the tunnel) and everything else to the real router.
+    4.  Detect the host VPN (start OpenVPN from an autologin profile if needed).
+        Derive the target /24 from the tun interface's assigned IP — e.g. tun0
+        gets 10.8.0.90/28, so we target 10.8.0.0/24 (covers the full class-C
+        regardless of what narrow prefix the VPN server assigned).
+    5.  Inject option 121 with exactly two routes: <tun /24> via our identity
+        (victims send VPN-subnet traffic to us, relayed through the tunnel), and
+        0.0.0.0/0 via the real router (all other traffic goes direct — fast path).
     6.  Sniff the carried plaintext for credentials and downloaded files.
     7.  Serve DHCP as the rogue server until interrupted.
 """
@@ -381,7 +384,7 @@ def start_http_intercept(sniff_iface):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    print("Network Takeover Toolkit v2.6 — Starting...")
+    print("Network Takeover Toolkit v2.7 — Starting...")
     args = _parse_args()
     interface = DEFAULT_INTERFACE  # set in dhcp_takeover.py
 

