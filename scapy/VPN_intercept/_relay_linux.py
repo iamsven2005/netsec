@@ -2,6 +2,7 @@
 """Linux forwarding backend for vpn_relay.py — iptables + ip route + tun."""
 
 import glob
+import ipaddress
 import os
 import re
 import subprocess
@@ -13,6 +14,7 @@ _orig_ip_forward: str | None = None
 _rules_installed  = False
 _phys_iface: str | None = None
 _tun_iface:  str | None = None
+_tun_net24:  str | None = None   # /24 derived from tun IP, added by setup_forwarding
 
 # ── Search paths ──────────────────────────────────────────────────────────────
 
@@ -150,6 +152,18 @@ def _tun_peer_ip(tun_iface: str) -> str | None:
     return None
 
 
+def _tun_local_ip(tun_iface: str) -> str | None:
+    """Return the local IP address assigned to the tun interface (e.g. '10.8.0.90')."""
+    try:
+        out = subprocess.check_output(["ip", "addr", "show", tun_iface], text=True)
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/\d+", out)
+        if m:
+            return m.group(1)
+    except subprocess.CalledProcessError:
+        pass
+    return None
+
+
 def snapshot_routes() -> set[str]:
     out = subprocess.check_output(["ip", "route", "show"], text=True)
     return set(out.strip().splitlines())
@@ -194,7 +208,7 @@ def unblock_forward() -> None:
 # ── Forwarding setup / teardown ───────────────────────────────────────────────
 
 def setup_forwarding(phys_iface: str, tun_iface: str) -> None:
-    global _orig_ip_forward, _rules_installed, _phys_iface, _tun_iface
+    global _orig_ip_forward, _rules_installed, _phys_iface, _tun_iface, _tun_net24
     _phys_iface = phys_iface
     _tun_iface  = tun_iface
 
@@ -234,6 +248,22 @@ def setup_forwarding(phys_iface: str, tun_iface: str) -> None:
         else:
             print(f"[relay] Route: {prefix} → {tun_iface}" + (f" via {peer}" if peer else ""))
 
+    # Add an explicit /24 route for the VPN subnet so the full class-C is
+    # reachable via tun even when the VPN only assigns a /28.
+    # e.g. tun IP 10.8.0.90/28 → route 10.8.0.0/24 dev tun0
+    tun_ip = _tun_local_ip(tun_iface)
+    if tun_ip:
+        net24 = str(ipaddress.IPv4Interface(f"{tun_ip}/24").network)
+        _tun_net24 = net24
+        cmd = ["ip", "route", "replace", net24] + route_via + ["dev", tun_iface]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[relay] ERROR: failed to add /24 route {net24}: {result.stderr.strip()}")
+        else:
+            print(f"[relay] Route: {net24} → {tun_iface}" + (f" via {peer}" if peer else ""))
+    else:
+        print(f"[relay] Warning: could not read tun IP — /24 route not added")
+
     _rules_installed = True
     print(f"[relay] Forwarding: {phys_iface} → {tun_iface} (MASQUERADE on tun)")
 
@@ -252,6 +282,11 @@ def teardown_forwarding() -> None:
         for prefix in ("0.0.0.0/1", "128.0.0.0/1"):
             subprocess.run(
                 ["ip", "route", "del", prefix, "dev", _tun_iface],
+                check=False, capture_output=True,
+            )
+        if _tun_net24:
+            subprocess.run(
+                ["ip", "route", "del", _tun_net24, "dev", _tun_iface],
                 check=False, capture_output=True,
             )
         _rules_installed = False
