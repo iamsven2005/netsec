@@ -194,6 +194,19 @@ def setup_forwarding(phys_iface: str, tun_iface: str) -> None:
     ]
     for rule in rules:
         subprocess.run(rule, check=True)
+
+    # remove_pushed_routes strips OpenVPN's gateway-specific /1 routes, which
+    # leaves the attacker's default route (via phys) as the only path for
+    # internet-destined victim traffic — so the FORWARD rule above never fires.
+    # Re-add clean /1 routes via tun so victim traffic is correctly routed there.
+    # The VPN server's /32 host route via phys stays most-specific, keeping the
+    # tunnel alive despite the /1 routes pointing everything else at tun.
+    for prefix in ("0.0.0.0/1", "128.0.0.0/1"):
+        subprocess.run(
+            ["ip", "route", "replace", prefix, "dev", tun_iface],
+            check=False, capture_output=True,
+        )
+
     _rules_installed = True
     print(f"[relay] Forwarding: {phys_iface} → {tun_iface} (MASQUERADE on tun)")
 
@@ -209,6 +222,11 @@ def teardown_forwarding() -> None:
         ]
         for rule in rules:
             subprocess.run(rule, check=False, capture_output=True)
+        for prefix in ("0.0.0.0/1", "128.0.0.0/1"):
+            subprocess.run(
+                ["ip", "route", "del", prefix, "dev", _tun_iface],
+                check=False, capture_output=True,
+            )
         _rules_installed = False
 
     if _orig_ip_forward is not None:

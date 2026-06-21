@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v1.0
+# v1.1
 """
 ospf_adjacency.py — OSPFv2 full-adjacency engine + route injection.
 
@@ -294,6 +294,8 @@ def make_neighbor(router_id, ip_address):
         "is_master": False,
         "last_seen": time.time(),
         "requested_lsas": [],
+        "last_peer_seq_in": None,   # last slave seq we processed (duplicate guard)
+        "last_sent_dbd": None,      # cached master DBD to resend on slave retransmit
     }
 
 
@@ -778,6 +780,19 @@ def state_exstart(context, neighbor, router_id, master_bit, sequence_number):
 def state_exchange(context, neighbor, packet, more_bit):
     if neighbor["state"] != EXCHANGE:
         return False
+
+    # When we are the master, the slave echoes our sequence number.  If it
+    # retransmits the same seq (because our reply was lost), resend the cached
+    # last master DBD without incrementing — otherwise the seq diverges and
+    # Cisco tears down the adjacency with "Too many retransmissions".
+    if neighbor["is_master"]:
+        peer_seq = packet[OSPF_DBDesc].ddseq
+        if peer_seq == neighbor["last_peer_seq_in"]:
+            if neighbor["last_sent_dbd"] is not None:
+                send_packet(context, neighbor["last_sent_dbd"], destination=neighbor["ip_address"])
+            return True
+        neighbor["last_peer_seq_in"] = peer_seq
+
     neighbor["requested_lsas"] = collect_unknown_lsas(context, packet)
     if not more_bit:
         if neighbor["requested_lsas"]:
@@ -791,11 +806,9 @@ def state_exchange(context, neighbor, packet, more_bit):
         return True
     if neighbor["is_master"]:
         neighbor["database_sequence"] += 1
-    send_packet(
-        context,
-        build_dbd(context, neighbor, is_master_packet=neighbor["is_master"], sequence_number=neighbor["database_sequence"]),
-        destination=neighbor["ip_address"],
-    )
+    dbd = build_dbd(context, neighbor, is_master_packet=neighbor["is_master"], sequence_number=neighbor["database_sequence"])
+    neighbor["last_sent_dbd"] = dbd
+    send_packet(context, dbd, destination=neighbor["ip_address"])
     return True
 
 
@@ -839,17 +852,15 @@ def send_lsdb_summary(context, neighbor):
     if neighbor["is_master"]:
         neighbor["database_sequence"] += 1
     lsa_packets = local_lsdb_entries(context)
-    send_packet(
+    dbd = build_dbd(
         context,
-        build_dbd(
-            context,
-            neighbor,
-            is_master_packet=neighbor["is_master"],
-            sequence_number=neighbor["database_sequence"],
-            lsa_headers=[OSPF_LSA_Hdr(bytes(lsa_packet)[:20]) for lsa_packet in lsa_packets],
-        ),
-        destination=neighbor["ip_address"],
+        neighbor,
+        is_master_packet=neighbor["is_master"],
+        sequence_number=neighbor["database_sequence"],
+        lsa_headers=[OSPF_LSA_Hdr(bytes(lsa_packet)[:20]) for lsa_packet in lsa_packets],
     )
+    neighbor["last_sent_dbd"] = dbd
+    send_packet(context, dbd, destination=neighbor["ip_address"])
 
 
 def handle_hello(context, packet):
