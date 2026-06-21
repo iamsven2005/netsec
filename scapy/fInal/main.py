@@ -378,6 +378,7 @@ def start_http_intercept(sniff_iface):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    print("Network Takeover Toolkit v2.0 — Starting...")
     args = _parse_args()
     interface = DEFAULT_INTERFACE  # set in dhcp_takeover.py
 

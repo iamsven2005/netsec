@@ -254,6 +254,7 @@ interface g0/0/0
 interface g0/0/1
  ip address 172.17.9.13 255.255.255.252
  ip nat outside
+ ip ospf 1 area 0
  no shutdown
 
 interface g0/1/0
@@ -270,7 +271,7 @@ interface g0/1/1
  ip ospf network point-to-point
  no shutdown
 
-ip nat pool NAT_POOL 203.149.10.24 203.149.10.31 netmask 255.255.255.248
+ip nat pool NAT_POOL 203.149.10.26 203.149.10.31 netmask 255.255.255.248
 ip access-list standard NAT_ACL
  permit 192.168.1.0 0.0.0.255
  permit 192.168.2.0 0.0.0.255
