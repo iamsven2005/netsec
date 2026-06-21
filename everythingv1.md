@@ -273,6 +273,7 @@ interface g0/1/1
  ip ospf network point-to-point
  no shutdown
 
+! PAT uses the remaining usable public IPs after reserving 203.149.210.25 for the static server NAT
 ip nat pool NAT_POOL 203.149.210.26 203.149.210.30 netmask 255.255.255.248
 ip access-list standard NAT_ACL
  permit 192.168.1.0 0.0.0.255
@@ -335,15 +336,15 @@ end
 ```mermaid
 graph TD
     INET((Internet))
-    R1["R1 — NAT Gateway\ng0/0/1: 203.149.10.30/29"]
+    R1["R1 - NAT Gateway\ng0/0/1: 172.17.9.13/30\nPublic NAT block: 203.149.210.24/29"]
     SRV["Server\n192.168.100.1"]
-    R2["R2 — DHCP Server\ng0/0/0: 192.168.100.6/30"]
+    R2["R2 - DHCP Server\ng0/0/0: 192.168.100.6/30"]
     DSW1["DSW1\nSTP Root Primary / HSRP Active"]
     DSW2["DSW2\nSTP Root Secondary / HSRP Standby"]
     SW1[SW1]
     SW2[SW2]
-    PCA(["PCA — VLAN 10\n192.168.1.0/24"])
-    PCB(["PCB — VLAN 20\n192.168.2.0/24"])
+    PCA(["PCA - VLAN 10\n192.168.1.0/24"])
+    PCB(["PCB - VLAN 20\n192.168.2.0/24"])
 
     INET --- |Transit WAN 172.17.9.12/30\nRouted public block 203.149.210.24/29| R1
     R1 --- |192.168.100.4/30| R2
@@ -366,11 +367,11 @@ graph TD
 | Device | Local Port  | Destination | Dst Port    | Link                       |
 |--------|-------------|-------------|-------------|----------------------------|
 | R1     | g0/0/0      | R2          | g0/0/0      | 192.168.100.4/30           |
-| R1     | g0/0/1      | Internet    | —           | WAN 203.149.10.24/29       |
+| R1     | g0/0/1      | Internet    | -           | Transit WAN 172.17.9.12/30; public NAT block 203.149.210.24/29 |
 | R1     | g0/1/0      | DSW1        | g1/0/1      | L3 10.10.10.4/30           |
 | R1     | g0/1/1      | DSW2        | g1/0/2      | L3 10.10.10.0/30           |
 | R2     | g0/0/0      | R1          | g0/0/0      | 192.168.100.4/30           |
-| R2     | g0/0/1      | Server      | —           | DMZ 192.168.100.0/30       |
+| R2     | g0/0/1      | Server      | -           | DMZ 192.168.100.0/30       |
 | DSW1   | g1/0/1      | R1          | g0/1/0      | L3 10.10.10.4/30           |
 | DSW1   | g1/0/12     | DSW2        | g1/0/12     | L3 10.10.10.8/30           |
 | DSW1   | g1/0/23     | SW1         | g1/0/23     | Trunk VLANs 10,20,30,40    |
