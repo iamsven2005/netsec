@@ -468,8 +468,13 @@ def main():
         # ── Phase 4+5: VPN relay + option 121 policy ─────────────────────────
         networks = []
         proposed_leases = {}
+        # Use the real DHCP server IP as source_ip so all OFFERs/ACKs carry
+        # server_id = real_server_ip — clients see us as the legitimate server.
+        # Falls back to our interface IP if we never learned the real server IP.
+        server_identity = loopback_alias_ip or our_ip
         server_details = build_server_details_from_ospf(
-            ospf_interface, ospf_params, our_ip, offer=offer, dns=getattr(args, "dns", None)
+            ospf_interface, ospf_params, server_identity,
+            offer=offer, dns=getattr(args, "dns", None),
         )
 
         tun_iface = vpn_relay.enable_vpn_relay(server_details, ospf_interface)

@@ -665,22 +665,21 @@ def get_default_router_for_network(network, fallback_gateway=None):
 
 
 def get_relayed_client_network(giaddr, requested_address):
+    # The relay agent's giaddr is authoritative for which subnet the client lives
+    # on.  The requested address is only a preference WITHIN that subnet — we
+    # never switch pools to match a stale preferred IP from a different subnet.
     relay_network = ipaddress.IPv4Network(f"{giaddr}/{DEFAULT_PREFIX_LENGTH}", strict=False)
     if requested_address:
-        requested_network = ipaddress.IPv4Network(
-            f"{requested_address}/{DEFAULT_PREFIX_LENGTH}",
-            strict=False,
-        )
-        if requested_network != relay_network:
-            print_step(
-                "WARN",
-                (
-                    f"Relay giaddr {giaddr} points to {relay_network}, "
-                    f"but requested address {requested_address} points to {requested_network}; "
-                    "using requested-address network for the lease pool"
-                ),
-            )
-            return requested_network
+        try:
+            req_ip = ipaddress.IPv4Address(requested_address)
+            if req_ip not in relay_network:
+                print_step(
+                    "WARN",
+                    f"Client preferred {requested_address} is not in relay network "
+                    f"{relay_network} (giaddr={giaddr}) — ignoring preference",
+                )
+        except ValueError:
+            pass
     return relay_network
 
 
