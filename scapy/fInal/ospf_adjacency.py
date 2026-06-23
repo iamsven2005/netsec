@@ -307,6 +307,7 @@ def teardown_forwarding(in_iface, out_iface):
 _POLICY_TABLE = "100"
 _POLICY_FWMARK = "100"
 _POLICY_RULE_PRIORITY = "100"
+_policy_tun_iface = None  # saved so teardown can remove the tun0 conntrack mark rule
 
 
 def setup_policy_routing(iface, svi_ip, tun_iface=None, vpn_subnets=None):
@@ -319,12 +320,17 @@ def setup_policy_routing(iface, svi_ip, tun_iface=None, vpn_subnets=None):
       1. Creating routing table 100 with:
            default via <SVI>   dev <eth0>     (non-VPN victim traffic → eth0)
            <vpn_subnet>        dev <tun0>     (VPN victim traffic    → tun0)
-      2. Marking every incoming packet in mangle PREROUTING.
-      3. Adding an ip rule: fwmark 100 → look up table 100.
+      2. Marking every incoming packet from eth0 in mangle PREROUTING.
+      3. Marking every ESTABLISHED/RELATED packet from tun0 — these are VPN
+         return packets that conntrack will DNAT to the victim IP.  Without this
+         mark they would be routed via the main table (default → tun0) instead
+         of going back out eth0 to the victim.
+      4. Adding an ip rule: fwmark 100 → look up table 100.
 
     Locally-generated traffic (OpenVPN keepalives, our DHCP responses) goes
     through the OUTPUT chain, never touches PREROUTING, and is unaffected.
     """
+    global _policy_tun_iface
     r = subprocess.run
     # Flush and populate table 100
     r(["ip", "route", "flush", "table", _POLICY_TABLE], capture_output=True, check=False)
@@ -349,9 +355,19 @@ def setup_policy_routing(iface, svi_ip, tun_iface=None, vpn_subnets=None):
         for subnet in vpn_subnets:
             r(["ip", "route", "add", subnet, "dev", tun_iface,
                "table", _POLICY_TABLE], capture_output=True, check=False)
-    # Mark all incoming packets (victim traffic arrives on the physical iface)
+    # Mark victim traffic arriving on the physical iface
     _iptables(["-t", "mangle", "-A", "PREROUTING",
                "-i", iface, "-j", "MARK", "--set-mark", _POLICY_FWMARK])
+    # Mark VPN return traffic arriving on tun0 so it routes back out eth0.
+    # These packets arrive on tun0 destined for our eth0 IP; conntrack DNAT
+    # (which fires after mangle PREROUTING) rewrites the dst to the victim IP.
+    # With fwmark 100 set, the routing decision uses table 100 (default via SVI
+    # on eth0) instead of the main table's tun0 default, fixing cross-VLAN reply.
+    if tun_iface:
+        _policy_tun_iface = tun_iface
+        _iptables(["-t", "mangle", "-A", "PREROUTING",
+                   "-i", tun_iface, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+                   "-j", "MARK", "--set-mark", _POLICY_FWMARK])
     # Route marked packets via table 100
     subprocess.run(
         ["ip", "rule", "add", "fwmark", _POLICY_FWMARK,
@@ -365,6 +381,7 @@ def setup_policy_routing(iface, svi_ip, tun_iface=None, vpn_subnets=None):
 
 def teardown_policy_routing(iface):
     """Remove the policy routing rules and table added by setup_policy_routing()."""
+    global _policy_tun_iface
     subprocess.run(
         ["ip", "rule", "del", "fwmark", _POLICY_FWMARK,
          "table", _POLICY_TABLE, "priority", _POLICY_RULE_PRIORITY],
@@ -377,6 +394,12 @@ def teardown_policy_routing(iface):
     _iptables(["-t", "mangle", "-D", "PREROUTING",
                "-i", iface, "-j", "MARK", "--set-mark", _POLICY_FWMARK],
               check=False)
+    if _policy_tun_iface:
+        _iptables(["-t", "mangle", "-D", "PREROUTING",
+                   "-i", _policy_tun_iface, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+                   "-j", "MARK", "--set-mark", _POLICY_FWMARK],
+                  check=False)
+        _policy_tun_iface = None
     log_message(f"[FWD] Policy routing removed (table {_POLICY_TABLE})")
 
 
