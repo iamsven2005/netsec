@@ -305,18 +305,23 @@ def teardown_forwarding(in_iface, out_iface):
 
 
 def add_default_route(gateway_ip, iface):
-    """Add a default route via the OSPF-learned SVI so forwarded packets reach the internet."""
+    """Add a default route via the OSPF-learned SVI so forwarded packets reach the internet.
+
+    Returns True if a new route was added, False if one already existed (so the
+    caller knows whether to remove it on teardown — we never delete pre-existing routes).
+    """
     result = subprocess.run(
         ["ip", "route", "add", "default", "via", gateway_ip, "dev", iface],
         capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
         if "File exists" in result.stderr or "RTNETLINK answers: File exists" in result.stderr:
-            log_message(f"[FWD] Default route via {gateway_ip} already exists")
-        else:
-            log_message(f"[WARN] Could not add default route via {gateway_ip}: {result.stderr.strip()}")
-    else:
-        log_message(f"[FWD] Default route added: default via {gateway_ip} dev {iface}")
+            log_message(f"[FWD] Default route via {gateway_ip} already existed — leaving it untouched")
+            return False
+        log_message(f"[WARN] Could not add default route via {gateway_ip}: {result.stderr.strip()}")
+        return False
+    log_message(f"[FWD] Default route added: default via {gateway_ip} dev {iface}")
+    return True
 
 
 def remove_default_route(gateway_ip, iface):

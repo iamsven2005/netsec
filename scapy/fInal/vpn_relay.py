@@ -117,40 +117,43 @@ def find_ovpn_binary():
     return None
 
 
-def _is_autologin_profile(path):
-    """
-    Return True if the profile contains 'auth-user-pass <file>'.
+def _needs_interactive_auth(path):
+    """Return True if the profile has bare 'auth-user-pass' with no credential file.
 
-    Bare 'auth-user-pass' (no argument) triggers an interactive prompt we can't
-    answer unattended.  'auth-user-pass /path/to/creds' embeds the credential
-    file and needs no human input.
+    Bare 'auth-user-pass' (no argument) would block waiting for stdin input we
+    can't provide.  Profiles with certificates, or 'auth-user-pass /credfile',
+    run unattended.
     """
     try:
         with open(path, errors="replace") as f:
             for line in f:
                 stripped = line.strip()
-                if stripped.startswith("auth-user-pass"):
-                    return len(stripped.split()) >= 2  # has a filename argument
+                if stripped.lower().startswith("auth-user-pass"):
+                    parts = stripped.split()
+                    if len(parts) == 1:
+                        return True  # bare directive — needs interactive input
     except OSError:
         pass
     return False
 
 
-def find_autologin_profiles(extra_dirs=()):
-    """Return [(abs_path, mtime), ...] for autologin .ovpn profiles, newest-first."""
+def find_ovpn_profiles(extra_dirs=()):
+    """Return [(abs_path, mtime), ...] for non-interactive .ovpn profiles, newest-first.
+
+    Includes certificate-only profiles and credential-file profiles.
+    Excludes profiles that require interactive username/password input.
+    """
     dirs = list(OVPN_PROFILE_DIRS) + list(extra_dirs)
     found = {}
     for d in dirs:
         if not d:
             continue
         for p in glob.glob(os.path.join(d, "**", "*.ovpn"), recursive=True):
-            found[os.path.abspath(p)] = os.path.getmtime(p)
+            abs_p = os.path.abspath(p)
+            if not _needs_interactive_auth(abs_p):
+                found[abs_p] = os.path.getmtime(abs_p)
 
-    results = []
-    for path, mtime in sorted(found.items(), key=lambda x: x[1], reverse=True):
-        if _is_autologin_profile(path):
-            results.append((path, mtime))
-    return results
+    return sorted(found.items(), key=lambda x: x[1], reverse=True)
 
 
 def start_openvpn_if_needed():
@@ -175,9 +178,9 @@ def start_openvpn_if_needed():
         print_step("SKIP", "openvpn binary not found — no VPN relay")
         return None
 
-    profiles = find_autologin_profiles()
+    profiles = find_ovpn_profiles()
     if not profiles:
-        print_step("SKIP", "No autologin .ovpn profiles found — no VPN relay")
+        print_step("SKIP", "No .ovpn profiles found — no VPN relay")
         return None
 
     profile_path, _ = profiles[0]

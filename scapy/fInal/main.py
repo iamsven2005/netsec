@@ -378,7 +378,7 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None, vpn_subnets
     offer = offer_result[0]
 
     # ── Step 3: default route via SVI ─────────────────────────────────────────
-    ospf_adjacency.add_default_route(svi_ip, interface)
+    default_route_added = ospf_adjacency.add_default_route(svi_ip, interface)
 
     # ── Step 4: loopback alias for real DHCP server IP ───────────────────────
     # Without this, relayed DHCP unicast (dst = real server IP) triggers ICMP
@@ -416,7 +416,7 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None, vpn_subnets
         extra_subnets=vpn_subnets or [],
     )
     ospf_adjacency.wait_for_adjacency_exchange(interface, our_ip)
-    return interface, our_ip, offer, dhcp_server_ip, lsdb_subnets
+    return interface, our_ip, offer, dhcp_server_ip, lsdb_subnets, default_route_added
 
 
 def start_http_intercept(sniff_iface):
@@ -456,6 +456,7 @@ def main():
 
     ospf_iface_for_fwd = None
     loopback_alias_ip = None
+    default_route_added = False
     try:
         # ── Phase 2: detect VPN now so its subnet is included in OSPF injection ─
         # detect_vpn_subnet() starts OpenVPN if needed and returns the /24 target
@@ -468,7 +469,7 @@ def main():
             print_step("OK", f"VPN detected: {pre_tun} → subnet {pre_vpn_net24} (will inject via OSPF)")
 
         # ── Phase 3: configure IP, untagged discover, OSPF adjacency ──────────
-        ospf_interface, our_ip, offer, loopback_alias_ip, lsdb_subnets = setup_and_form_adjacency(
+        ospf_interface, our_ip, offer, loopback_alias_ip, lsdb_subnets, default_route_added = setup_and_form_adjacency(
             interface, ospf_params, target_ip=args.target, vpn_subnets=vpn_subnets,
         )
         ospf_iface_for_fwd = ospf_interface
@@ -531,7 +532,8 @@ def main():
         print_step("START", "Teardown: removing forwarding rules and restoring system state")
         if ospf_iface_for_fwd:
             ospf_adjacency.teardown_forwarding(ospf_iface_for_fwd, interface)
-            ospf_adjacency.remove_default_route(ospf_params["src_ip"], ospf_iface_for_fwd)
+            if default_route_added:
+                ospf_adjacency.remove_default_route(ospf_params["src_ip"], ospf_iface_for_fwd)
         if loopback_alias_ip:
             remove_loopback_ipv4_address(loopback_alias_ip)
         ospf_adjacency.restore_ip_forwarding(saved_ip_forward)
