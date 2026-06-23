@@ -480,6 +480,41 @@ def ensure_vlan_subinterface(parent_interface, vlan_id):
 
 
 
+def add_loopback_ipv4_address(address, prefix_length=32):
+    """Add a /32 alias to loopback so the kernel accepts packets addressed to it.
+
+    Required for cross-VLAN DHCP relay: the router sends relayed DHCP unicast to
+    the real DHCP server IP.  Without this alias, the kernel sees a packet whose
+    dst IP isn't ours, sends ICMP unreachable back to the relay agent, and the
+    relay aborts.  With the alias, the kernel accepts the packet normally.
+    """
+    if platform.system().lower() != "linux":
+        raise OSError("Loopback alias is only supported on Linux/Kali")
+    if not shutil.which("ip"):
+        raise FileNotFoundError("The Linux 'ip' command is required")
+    ipaddress.IPv4Address(address)
+    existing = [a.split("/")[0] for a in get_interface_ipv4_addresses("lo", scope=None)]
+    if address in existing:
+        print_step("OK", f"Loopback already has alias {address}")
+        return
+    run_command(
+        f"Adding loopback alias {address}/{prefix_length} (accept relay packets)",
+        ["ip", "addr", "add", f"{address}/{prefix_length}", "dev", "lo"],
+    )
+    run_command("Bringing loopback up", ["ip", "link", "set", "lo", "up"])
+
+
+def remove_loopback_ipv4_address(address, prefix_length=32):
+    """Remove the loopback alias added by add_loopback_ipv4_address()."""
+    if platform.system().lower() != "linux" or not shutil.which("ip"):
+        return
+    subprocess.run(
+        ["ip", "addr", "del", f"{address}/{prefix_length}", "dev", "lo"],
+        capture_output=True, check=False,
+    )
+    print_step("OK", f"Removed loopback alias {address}")
+
+
 def remove_kali_ipv4_addresses(interface):
     print_step("START", f"Removing existing IPv4 addresses from Linux interface {interface}")
     addresses = get_kali_ipv4_addresses(interface)

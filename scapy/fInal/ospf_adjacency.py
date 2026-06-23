@@ -236,6 +236,33 @@ def teardown_forwarding(in_iface, out_iface):
     log_message(f"[FWD] Forwarding rules removed: {in_iface} → {out_iface}")
 
 
+def add_default_route(gateway_ip, iface):
+    """Add a default route via the OSPF-learned SVI so forwarded packets reach the internet."""
+    result = subprocess.run(
+        ["ip", "route", "add", "default", "via", gateway_ip, "dev", iface],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        if "File exists" in result.stderr or "RTNETLINK answers: File exists" in result.stderr:
+            log_message(f"[FWD] Default route via {gateway_ip} already exists")
+        else:
+            log_message(f"[WARN] Could not add default route via {gateway_ip}: {result.stderr.strip()}")
+    else:
+        log_message(f"[FWD] Default route added: default via {gateway_ip} dev {iface}")
+
+
+def remove_default_route(gateway_ip, iface):
+    """Remove the default route added by add_default_route()."""
+    result = subprocess.run(
+        ["ip", "route", "del", "default", "via", gateway_ip, "dev", iface],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode == 0:
+        log_message(f"[FWD] Default route via {gateway_ip} removed")
+    else:
+        log_message(f"[WARN] Could not remove default route via {gateway_ip}: {result.stderr.strip()}")
+
+
 def withdraw_injected_routes(context):
     """Withdraw our Router-LSA by re-flooding it with age=MaxAge (3600).
 
@@ -914,20 +941,29 @@ def show_neighbors(context):
 def update_full_adjacency_gate(context):
     ready_message = None
     with context["lock"]:
-        expected_peer_ips = [
-            peer_ip
-            for peer_ip in {context["designated_router"], context["backup_designated_router"]}
-            if peer_ip != "0.0.0.0"
-        ]
-        neighbors_by_ip = {
-            neighbor["ip_address"]: neighbor
-            for neighbor in context["neighbors"].values()
-            if is_dr_or_bdr_neighbor(neighbor)
-        }
-        everyone_full = bool(expected_peer_ips) and all(
-            neighbors_by_ip.get(peer_ip, {}).get("state") == FULL
-            for peer_ip in expected_peer_ips
-        )
+        has_dr = context["designated_router"] != "0.0.0.0"
+        if has_dr:
+            # Broadcast network: require the elected DR (and BDR if present) to be FULL.
+            expected_peer_ips = [
+                peer_ip
+                for peer_ip in {context["designated_router"], context["backup_designated_router"]}
+                if peer_ip != "0.0.0.0"
+            ]
+            neighbors_by_ip = {
+                neighbor["ip_address"]: neighbor
+                for neighbor in context["neighbors"].values()
+                if is_dr_or_bdr_neighbor(neighbor)
+            }
+            everyone_full = bool(expected_peer_ips) and all(
+                neighbors_by_ip.get(peer_ip, {}).get("state") == FULL
+                for peer_ip in expected_peer_ips
+            )
+        else:
+            # Point-to-point or pre-election: any FULL neighbor suffices.
+            everyone_full = any(
+                neighbor["state"] == FULL
+                for neighbor in context["neighbors"].values()
+            )
         if everyone_full:
             if not context["adjacency_ready_event"].is_set():
                 context["adjacency_ready_event"].set()
@@ -963,7 +999,9 @@ def state_init(context, neighbor, hello_packet):
 def state_two_way(context, neighbor, packet, hello_packet):
     if neighbor["state"] != TWO_WAY:
         return
-    if not is_dr_or_bdr_neighbor(neighbor):
+    # On broadcast networks, only form full adjacency with the DR/BDR.
+    # On point-to-point networks (DR = 0.0.0.0), form adjacency with every neighbor.
+    if context["designated_router"] != "0.0.0.0" and not is_dr_or_bdr_neighbor(neighbor):
         return
     transition_neighbor(context, neighbor, EXSTART)
     neighbor["database_sequence"] = INITIAL_DBD_SEQ
