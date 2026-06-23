@@ -304,6 +304,82 @@ def teardown_forwarding(in_iface, out_iface):
     log_message(f"[FWD] Forwarding rules removed: {in_iface} → {out_iface}")
 
 
+_POLICY_TABLE = "100"
+_POLICY_FWMARK = "100"
+_POLICY_RULE_PRIORITY = "100"
+
+
+def setup_policy_routing(iface, svi_ip, tun_iface=None, vpn_subnets=None):
+    """Force all forwarded (victim) packets through a dedicated routing table.
+
+    Why: when OpenVPN runs, it injects high-priority routes via tun0 into the
+    main table.  Forwarded victim packets hit those routes and exit tun0 instead
+    of eth0.  We fix this by:
+
+      1. Creating routing table 100 with:
+           default via <SVI>   dev <eth0>     (non-VPN victim traffic → eth0)
+           <vpn_subnet>        dev <tun0>     (VPN victim traffic    → tun0)
+      2. Marking every incoming packet in mangle PREROUTING.
+      3. Adding an ip rule: fwmark 100 → look up table 100.
+
+    Locally-generated traffic (OpenVPN keepalives, our DHCP responses) goes
+    through the OUTPUT chain, never touches PREROUTING, and is unaffected.
+    """
+    r = subprocess.run
+    # Flush and populate table 100
+    r(["ip", "route", "flush", "table", _POLICY_TABLE], capture_output=True, check=False)
+    r(["ip", "route", "add", "default", "via", svi_ip, "dev", iface,
+       "table", _POLICY_TABLE], capture_output=True, check=False)
+    # The directly-connected subnet must also be in the table for ARP to work
+    result = subprocess.run(
+        ["ip", "-o", "-f", "inet", "addr", "show", "dev", iface],
+        capture_output=True, text=True, check=False,
+    )
+    for token in result.stdout.split():
+        if "/" in token and token.count(".") == 3:
+            import ipaddress as _ip
+            try:
+                net = str(_ip.IPv4Interface(token).network)
+                r(["ip", "route", "add", net, "dev", iface,
+                   "table", _POLICY_TABLE], capture_output=True, check=False)
+            except Exception:
+                pass
+            break
+    if tun_iface and vpn_subnets:
+        for subnet in vpn_subnets:
+            r(["ip", "route", "add", subnet, "dev", tun_iface,
+               "table", _POLICY_TABLE], capture_output=True, check=False)
+    # Mark all incoming packets (victim traffic arrives on the physical iface)
+    _iptables(["-t", "mangle", "-A", "PREROUTING",
+               "-i", iface, "-j", "MARK", "--set-mark", _POLICY_FWMARK])
+    # Route marked packets via table 100
+    subprocess.run(
+        ["ip", "rule", "add", "fwmark", _POLICY_FWMARK,
+         "table", _POLICY_TABLE, "priority", _POLICY_RULE_PRIORITY],
+        capture_output=True, check=False,
+    )
+    log_message(f"[FWD] Policy routing: table {_POLICY_TABLE}  fwmark {_POLICY_FWMARK}  "
+                f"default via {svi_ip} dev {iface}"
+                + (f"  vpn {vpn_subnets} via {tun_iface}" if tun_iface else ""))
+
+
+def teardown_policy_routing(iface):
+    """Remove the policy routing rules and table added by setup_policy_routing()."""
+    subprocess.run(
+        ["ip", "rule", "del", "fwmark", _POLICY_FWMARK,
+         "table", _POLICY_TABLE, "priority", _POLICY_RULE_PRIORITY],
+        capture_output=True, check=False,
+    )
+    subprocess.run(
+        ["ip", "route", "flush", "table", _POLICY_TABLE],
+        capture_output=True, check=False,
+    )
+    _iptables(["-t", "mangle", "-D", "PREROUTING",
+               "-i", iface, "-j", "MARK", "--set-mark", _POLICY_FWMARK],
+              check=False)
+    log_message(f"[FWD] Policy routing removed (table {_POLICY_TABLE})")
+
+
 def add_default_route(gateway_ip, iface):
     """Add a default route via the OSPF-learned SVI so forwarded packets reach the internet.
 

