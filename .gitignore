@@ -4,3 +4,4 @@ scapy\OSPF\__pycache__
 scapy\__pycache__
 scapy\.pyc
 .gitignore
+*.pyc
