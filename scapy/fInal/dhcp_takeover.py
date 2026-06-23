@@ -631,16 +631,15 @@ def get_learned_vlan_details(packet, server_details):
     return server_details.get("vlan_details", {}).get(vlan_id)
 
 
-def get_direct_client_network(packet, requested_address, server_details):
+def get_direct_client_network(packet, server_details):
+    # Per-VLAN detail overrides (populated from DHCPOFFER sniffing, now always empty).
     vlan_details = get_learned_vlan_details(packet, server_details)
     if vlan_details:
         return vlan_details["network"]
-    if requested_address:
-        return ipaddress.IPv4Network(f"{requested_address}/{DEFAULT_PREFIX_LENGTH}", strict=False)
-    vlan_id = get_packet_vlan_id(packet)
-    if vlan_id is not None:
-        if 1 <= vlan_id <= 254:
-            return ipaddress.IPv4Network(f"192.168.{vlan_id}.0/{DEFAULT_PREFIX_LENGTH}")
+    # Always use the OSPF-derived server subnet as the authoritative pool.
+    # Never derive the pool from the client's preferred IP — a stale lease from
+    # a different VLAN would silently move the pool to the wrong subnet, causing
+    # us to offer and ACK an IP the client can't actually reach.
     return server_details["network"]
 
 
@@ -692,7 +691,7 @@ def get_or_add_dhcp_network(packet, networks, server_details):
     vlan_id = get_packet_vlan_id(packet)
 
     if giaddr == "0.0.0.0":
-        network = get_direct_client_network(packet, requested_address, server_details)
+        network = get_direct_client_network(packet, server_details)
         subnet_mask = get_direct_client_subnet_mask(packet, network, server_details)
         network_key = ("direct", str(network))
         router = get_direct_client_router(packet, network, server_details)
