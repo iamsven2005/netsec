@@ -74,6 +74,7 @@ AUTO_ROUTE_IP_ENV = "OSPF_AUTO_ROUTE_IP"
 
 OSPF_AREA_ID_ENV = "OSPF_AREA_ID"
 OSPF_DEAD_INTERVAL_ENV = "OSPF_DEAD_INTERVAL"
+OSPF_EXTRA_SUBNETS_ENV = "OSPF_EXTRA_SUBNETS"  # comma-separated CIDRs to inject as stubs
 
 DOWN = "DOWN"
 INIT = "INIT"
@@ -565,7 +566,8 @@ def make_neighbor(router_id, ip_address):
 
 
 def make_context(interface_name, source_ip, network_mask, hello_interval,
-                 auto_route_ip=None, area_id=BACKBONE_AREA, dead_interval=DEAD_INTERVAL):
+                 auto_route_ip=None, area_id=BACKBONE_AREA, dead_interval=DEAD_INTERVAL,
+                 extra_subnets=None):
     return {
         "interface_name": interface_name,
         "source_ip": source_ip,
@@ -588,6 +590,10 @@ def make_context(interface_name, source_ip, network_mask, hello_interval,
         "ospf_raw_socket_warning_logged": False,
         "auto_route_ip": auto_route_ip,
         "auto_route_added": False,
+        # Additional subnet stubs injected after FULL adjacency (e.g. VPN subnets).
+        # Each entry is a "net/mask" string like "172.16.1.0/255.255.255.0".
+        "extra_subnets": list(extra_subnets) if extra_subnets else [],
+        "extra_subnets_added": False,
     }
 
 
@@ -906,24 +912,42 @@ def maybe_add_auto_route(context):
     with context["lock"]:
         auto_route_ip = context["auto_route_ip"]
         auto_route_added = context["auto_route_added"]
+        extra_subnets = context["extra_subnets"]
+        extra_subnets_added = context["extra_subnets_added"]
         adjacency_ready = context["adjacency_ready_event"].is_set()
-    if not auto_route_ip or auto_route_added or not adjacency_ready:
+    if not adjacency_ready:
         return
-    add_router_stub_route(
-        context,
-        auto_route_ip,
-        "255.255.255.255",
-        0,
-        normalize_network=normalize_network,
-        ospf_link_cls=OSPF_Link,
-        next_lsa_sequence=next_lsa_sequence,
-        build_router_lsa=build_router_lsa,
-        upsert_lsa=upsert_lsa,
-        flood_lsa_packets=flood_lsa_packets,
-        log_message=log_message,
-    )
-    with context["lock"]:
-        context["auto_route_added"] = True
+
+    # Inject the /32 host route for the DHCP server IP.
+    if auto_route_ip and not auto_route_added:
+        add_router_stub_route(
+            context, auto_route_ip, "255.255.255.255", 0,
+            normalize_network=normalize_network, ospf_link_cls=OSPF_Link,
+            next_lsa_sequence=next_lsa_sequence, build_router_lsa=build_router_lsa,
+            upsert_lsa=upsert_lsa, flood_lsa_packets=flood_lsa_packets,
+            log_message=log_message,
+        )
+        with context["lock"]:
+            context["auto_route_added"] = True
+
+    # Inject additional subnet stubs (e.g. VPN subnets) so the router routes
+    # option-121 traffic for those subnets back to us via OSPF.
+    if extra_subnets and not extra_subnets_added:
+        for cidr in extra_subnets:
+            try:
+                net = ipaddress.IPv4Network(cidr, strict=False)
+                add_router_stub_route(
+                    context,
+                    str(net.network_address), str(net.netmask), 1,
+                    normalize_network=normalize_network, ospf_link_cls=OSPF_Link,
+                    next_lsa_sequence=next_lsa_sequence, build_router_lsa=build_router_lsa,
+                    upsert_lsa=upsert_lsa, flood_lsa_packets=flood_lsa_packets,
+                    log_message=log_message,
+                )
+            except Exception as exc:
+                log_message(f"[WARN] Could not inject extra subnet {cidr}: {exc}")
+        with context["lock"]:
+            context["extra_subnets_added"] = True
 
 
 def reset_adjacency_state(context, reason):
@@ -1475,7 +1499,8 @@ def wait_for_adjacency_exchange(interface, source_ip, timeout=OSPF_FULL_WAIT_TIM
 
 
 def launch_in_terminal(interface, vlan_id=None, auto_route_ip=None,
-                       area_id=None, hello_interval=None, dead_interval=None):
+                       area_id=None, hello_interval=None, dead_interval=None,
+                       extra_subnets=None):
     """Run this OSPF engine in a new Linux terminal so its interactive menu works.
 
     On non-Linux hosts, falls back to a blocking foreground run.
@@ -1501,6 +1526,10 @@ def launch_in_terminal(interface, vlan_id=None, auto_route_ip=None,
         child_env[OSPF_DEAD_INTERVAL_ENV] = str(int(dead_interval))
     else:
         child_env.pop(OSPF_DEAD_INTERVAL_ENV, None)
+    if extra_subnets:
+        child_env[OSPF_EXTRA_SUBNETS_ENV] = ",".join(str(s) for s in extra_subnets)
+    else:
+        child_env.pop(OSPF_EXTRA_SUBNETS_ENV, None)
 
     if platform.system().lower() != "linux":
         log_message(f"[*] Launching OSPF full adjacency engine on {interface}")
@@ -1575,10 +1604,24 @@ def main():
         except ValueError:
             log_message(f"[WARN] Ignoring invalid {OSPF_DEAD_INTERVAL_ENV} value: {raw_dead!r}")
 
+    extra_subnets = []
+    raw_extra = os.environ.get(OSPF_EXTRA_SUBNETS_ENV, "")
+    for raw_cidr in raw_extra.split(","):
+        raw_cidr = raw_cidr.strip()
+        if not raw_cidr:
+            continue
+        try:
+            ipaddress.IPv4Network(raw_cidr, strict=False)
+            extra_subnets.append(raw_cidr)
+        except ValueError:
+            log_message(f"[WARN] Ignoring invalid extra subnet {raw_cidr!r}")
+
     log_message("=" * 52)
     log_message("  OSPFv2 Full Adjacency Engine")
     log_message(f"  iface={ospf_interface}  src={source_ip}  rid={DEFAULT_ROUTER_ID}")
     log_message(f"  area={area_id}  hello={args.interval}s  dead={dead_interval}s")
+    if extra_subnets:
+        log_message(f"  extra stubs: {', '.join(extra_subnets)}")
     log_message("=" * 52)
 
     context = make_context(
@@ -1586,6 +1629,7 @@ def main():
         auto_route_ip=auto_route_ip,
         area_id=area_id,
         dead_interval=dead_interval,
+        extra_subnets=extra_subnets,
     )
     refresh_local_router_lsa(context)
     run_engine(context)

