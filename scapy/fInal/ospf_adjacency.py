@@ -167,7 +167,8 @@ def sniff_ospf_hellos(iface, timeout=30, count=1):
     log_message(f"[OSPF]   hello_interval : {p['hello_interval']}s")
     log_message(f"[OSPF]   dead_interval  : {p['dead_interval']}s")
     log_message(f"[OSPF]   options        : 0x{p['options']:02x}  (E-bit={'set' if p['options'] & 0x02 else 'clear — stub area'})")
-    log_message(f"[OSPF]   auth_type      : {p['auth_type']}  ({['none', 'simple-password', 'MD5'].get(p['auth_type'], 'unknown') if isinstance(['none', 'simple-password', 'MD5'], list) else {0:'none',1:'simple-password',2:'MD5'}.get(p['auth_type'],'unknown')})")
+    _auth_names = {0: 'none', 1: 'simple-password', 2: 'MD5'}
+    log_message(f"[OSPF]   auth_type      : {p['auth_type']}  ({_auth_names.get(p['auth_type'], 'unknown')})")
     log_message(f"[OSPF]   dr             : {p['dr']}")
     log_message(f"[OSPF]   bdr            : {p['bdr']}")
     log_message("[OSPF] ─────────────────────────────────────────────────────────")
