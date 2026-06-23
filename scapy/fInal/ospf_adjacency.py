@@ -50,6 +50,7 @@ try:
         OSPF_LSReq,
         OSPF_LSUpd,
         OSPF_Link,
+        OSPF_Network_LSA,
         OSPF_Router_LSA,
     )
 except ImportError:
@@ -166,6 +167,72 @@ def sniff_ospf_hellos(iface, timeout=30):
                     f"auth={_auth_names.get(p['auth_type'], '?')}  "
                     f"E-bit={'1' if p['options'] & 0x02 else '0(stub)'}")
     return results
+
+
+# ── OSPF LSDB passive sniffer ────────────────────────────────────────────────
+
+def sniff_ospf_lsdb_subnets(iface, out_list, timeout=120):
+    """Sniff LS Update packets and extract all advertised subnets into out_list.
+
+    Designed to run in a background daemon thread started just before adjacency
+    formation.  The LSDB exchange floods all Router-LSAs and Network-LSAs during
+    the EXCHANGE/LOADING phase; sniffing the wire captures the full topology
+    without needing access to the adjacency engine's internal context.
+
+    Parses:
+      Type-1 Router-LSA — stub links (link type=3): directly connected subnets
+      Type-2 Network-LSA — transit/broadcast segment subnets
+
+    Each entry appended to out_list:
+      prefix       "192.168.1.0/24"
+      network      "192.168.1.0"
+      netmask      "255.255.255.0"
+      adv_router   advertising router ID
+      lsa_type     "Router-LSA" | "Network-LSA"
+      metric       TOS-0 cost (Router-LSA only, else 0)
+    """
+    seen = set()
+
+    def _add(net_str, mask_str, adv, lsa_label, metric=0):
+        try:
+            network = ipaddress.IPv4Network(f"{net_str}/{mask_str}", strict=False)
+        except Exception:
+            return
+        key = str(network)
+        if key in seen:
+            return
+        seen.add(key)
+        out_list.append({
+            "prefix":     str(network),
+            "network":    str(network.network_address),
+            "netmask":    str(network.netmask),
+            "adv_router": adv,
+            "lsa_type":   lsa_label,
+            "metric":     metric,
+        })
+
+    def _handle(pkt):
+        if not (pkt.haslayer(OSPF_Hdr) and pkt.haslayer(OSPF_LSUpd)):
+            return
+        for lsa in getattr(pkt[OSPF_LSUpd], "lsalist", []):
+            lsa_type  = getattr(lsa, "type", None)
+            adv       = str(getattr(lsa, "adrouter", "?"))
+            if lsa_type == 1:  # Router-LSA: scan stub links
+                for link in getattr(lsa, "linklist", []):
+                    if int(getattr(link, "type", 0)) != 3:
+                        continue
+                    _add(str(getattr(link, "id",   "0.0.0.0")),
+                         str(getattr(link, "data", "0.0.0.0")),
+                         adv, "Router-LSA",
+                         int(getattr(link, "metric", 0)))
+            elif lsa_type == 2:  # Network-LSA: the DR's interface IP + mask
+                _add(str(getattr(lsa, "id",   "0.0.0.0")),
+                     str(getattr(lsa, "mask", "255.255.255.0")),
+                     adv, "Network-LSA")
+
+    log_message(f"[LSDB] Background subnet sniffer started on {iface} (timeout={timeout}s)")
+    sniff(iface=iface, filter=OSPF_SNIFF_FILTER, prn=_handle, store=False, timeout=timeout)
+    log_message(f"[LSDB] Subnet sniffer done — {len(out_list)} unique network(s) captured")
 
 
 # ── IP forwarding + iptables MITM relay helpers ───────────────────────────────

