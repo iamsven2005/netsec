@@ -246,26 +246,6 @@ else:
 
 print(f"""
 {'═' * 58}
-  Reset complete.
-
-  ┌─────────────────────────────────────────────────────┐
-  │  MANUAL STEP — reset the switch port on Cisco CLI   │
-  └─────────────────────────────────────────────────────┘
-
-  The attacker's port is still in TRUNK mode from DTP.
-  SSH to SW1 or SW2 and run:
-
-    conf t
-    interface <attacker-port>
-      switchport mode access
-      switchport access vlan <VLAN>
-      no shutdown
-    end
-    write memory
-
-  Then verify:
-    show interfaces status
-    show spanning-tree
 
   After the port is back in access mode, ARP tables on
   DSW1/DSW2 and other hosts should flush within ~5 min

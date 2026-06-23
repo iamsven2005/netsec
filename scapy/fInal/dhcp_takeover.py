@@ -764,13 +764,20 @@ def build_server_details_from_offer(interface, offer, offers=None):
         print_step("FAIL", "Selected offer does not contain a subnet mask")
         raise ValueError("Selected offer does not contain a subnet mask")
 
+    # The client subnet is determined by the IP the legitimate server OFFERED
+    # (yiaddr), not by the server's own management IP.  Using server_ip here
+    # would give the server's admin subnet (e.g. 100.0/24) instead of the pool
+    # the server actually serves (e.g. 10.1.2.0/24).
+    offered_client_ip = get_offered_client_ip(offer)
+    client_network = ipaddress.IPv4Network(f"{offered_client_ip}/{netmask}", strict=False)
+
     details = {
         "interface": interface,
         "source_ip": server_ip,
         "gateway": gateway,
         "netmask": netmask,
         "dns": dns,
-        "network": ipaddress.IPv4Network(f"{server_ip}/{netmask}", strict=False),
+        "network": client_network,
         "vlan_details": vlan_details,
         "relay_only": True,
         "answered_request_xids": set(),
@@ -782,7 +789,7 @@ def build_server_details_from_offer(interface, offer, offers=None):
         "opt121_subnets": list(HIJACK_ROUTE_PREFIXES),
         "opt121_default_via_router": False,
     }
-    print_step("OK", f"Fallback DHCP server details: source_ip={server_ip} dns={dns} gateway={gateway}")
+    print_step("OK", f"Fallback DHCP server details: source_ip={server_ip} client_network={client_network} dns={dns} gateway={gateway}")
     return details
 
 
