@@ -52,4 +52,4 @@ Hi all, I roughly broke down the ICT2217 project timeline so we don’t rush at 
 Suggested target: **attack working by 19 Jun**, otherwise July may become very tight 😅
 
 Report document:
-https://docs.google.com/document/d/13WToVedRRENMo2EE-CRZoAYiNDGJCTCHEMUNCV8HSO0/edit?usp=sharing
+https://docs.google.com/document/d/1XUnHJ_M1wCz90MIbPeqOzpmUXQBvzkyq/edit?usp=sharing&ouid=111394012869341403431&rtpof=true&sd=true
