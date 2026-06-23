@@ -622,9 +622,11 @@ def get_direct_client_router(packet, network, server_details):
 
 
 def get_default_router_for_network(network, fallback_gateway=None):
+    if fallback_gateway:
+        return fallback_gateway
     if network.prefixlen == DEFAULT_PREFIX_LENGTH:
         return str(network.network_address + 1)
-    return fallback_gateway
+    return None
 
 
 def get_relayed_client_network(giaddr, requested_address):

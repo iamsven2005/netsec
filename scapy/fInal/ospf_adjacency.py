@@ -101,35 +101,39 @@ def log_message(message):
 
 # ── Passive OSPF Hello sniffing ───────────────────────────────────────────────
 
-def sniff_ospf_hellos(iface, timeout=30, count=1):
+def sniff_ospf_hellos(iface, timeout=30):
     """Passively sniff OSPF Hello packets on 224.0.0.5 to learn SVI parameters.
 
-    Returns a dict of learned params on success, or None on timeout.  The
-    caller uses these values to match timers/area/mask before forming an
-    adjacency, so the SVI accepts our Hellos without manual configuration.
+    Collects all unique Hello sources seen during the timeout window (de-duped
+    by router_id).  Returns a list of param dicts, ordered by first appearance.
+    Returns an empty list on timeout.  The caller uses ospf_hellos[0] for
+    adjacency formation and passes the full list to the debug menu.
 
-    Learned fields:
-        router_id      OSPF router ID of the SVI (OSPF_Hdr.src)
-        src_ip         SVI interface IP (IP.src) — also the subnet gateway
-        netmask        Interface netmask (OSPF_Hello.mask)
-        area_id        OSPF area identifier (OSPF_Hdr.area)
+    Each dict contains:
+        router_id      OSPF router ID of the SVI
+        src_ip         SVI interface IP (= subnet gateway)
+        netmask        Interface netmask
+        area_id        OSPF area identifier
         hello_interval Hello interval in seconds
         dead_interval  Dead interval in seconds
-        options        Options byte (bit 1 = E, i.e. not-stub area)
-        auth_type      Authentication type (0=none, 1=simple, 2=MD5)
-        dr             Designated Router IP (0.0.0.0 if election pending)
+        options        Options byte (E-bit set = normal area, clear = stub)
+        auth_type      0=none  1=simple-password  2=MD5
+        dr             Designated Router IP
         bdr            Backup DR IP
     """
-    learned = []
+    seen_ids = {}  # router_id -> param dict, insertion-ordered
 
     def _handle(pkt):
         if not (pkt.haslayer(OSPF_Hdr) and pkt.haslayer(OSPF_Hello) and pkt.haslayer(IP)):
             return
         if pkt[OSPF_Hdr].type != 1:
             return
+        rid = str(pkt[OSPF_Hdr].src)
+        if rid in seen_ids:
+            return
         h = pkt[OSPF_Hello]
-        params = {
-            "router_id":      str(pkt[OSPF_Hdr].src),
+        seen_ids[rid] = {
+            "router_id":      rid,
             "src_ip":         str(pkt[IP].src),
             "netmask":        str(h.mask),
             "area_id":        str(pkt[OSPF_Hdr].area),
@@ -140,39 +144,28 @@ def sniff_ospf_hellos(iface, timeout=30, count=1):
             "dr":             str(h.router),
             "bdr":            str(h.backup),
         }
-        learned.append(params)
-        return True  # stop_filter
 
-    log_message(f"[OSPF] Passively sniffing OSPF Hellos on {iface} (timeout={timeout}s)...")
-    sniff(
-        iface=iface,
-        filter=OSPF_SNIFF_FILTER,
-        prn=_handle,
-        store=False,
-        timeout=timeout,
-        stop_filter=lambda p: bool(learned),
-        count=count,
-    )
+    log_message(f"[OSPF] Sniffing OSPF Hellos on {iface} for {timeout}s ...")
+    sniff(iface=iface, filter=OSPF_SNIFF_FILTER, prn=_handle, store=False, timeout=timeout)
 
-    if not learned:
+    results = list(seen_ids.values())
+    if not results:
         log_message(f"[OSPF] No OSPF Hellos received on {iface} within {timeout}s.")
-        return None
+        return []
 
-    p = learned[0]
-    log_message("[OSPF] ── Learned SVI parameters ─────────────────────────────")
-    log_message(f"[OSPF]   router_id      : {p['router_id']}")
-    log_message(f"[OSPF]   src_ip (GW)    : {p['src_ip']}")
-    log_message(f"[OSPF]   netmask        : {p['netmask']}")
-    log_message(f"[OSPF]   area_id        : {p['area_id']}")
-    log_message(f"[OSPF]   hello_interval : {p['hello_interval']}s")
-    log_message(f"[OSPF]   dead_interval  : {p['dead_interval']}s")
-    log_message(f"[OSPF]   options        : 0x{p['options']:02x}  (E-bit={'set' if p['options'] & 0x02 else 'clear — stub area'})")
-    _auth_names = {0: 'none', 1: 'simple-password', 2: 'MD5'}
-    log_message(f"[OSPF]   auth_type      : {p['auth_type']}  ({_auth_names.get(p['auth_type'], 'unknown')})")
-    log_message(f"[OSPF]   dr             : {p['dr']}")
-    log_message(f"[OSPF]   bdr            : {p['bdr']}")
-    log_message("[OSPF] ─────────────────────────────────────────────────────────")
-    return p
+    _auth_names = {0: "none", 1: "simple-password", 2: "MD5"}
+    for p in results:
+        import ipaddress as _ip
+        try:
+            subnet = _ip.IPv4Network(f"{p['src_ip']}/{p['netmask']}", strict=False)
+        except Exception:
+            subnet = f"{p['src_ip']}/{p['netmask']}"
+        log_message(f"[OSPF] SVI  router_id={p['router_id']}  ip={p['src_ip']}  "
+                    f"subnet={subnet}  area={p['area_id']}  "
+                    f"hello={p['hello_interval']}s  dead={p['dead_interval']}s  "
+                    f"auth={_auth_names.get(p['auth_type'], '?')}  "
+                    f"E-bit={'1' if p['options'] & 0x02 else '0(stub)'}")
+    return results
 
 
 # ── IP forwarding + iptables MITM relay helpers ───────────────────────────────

