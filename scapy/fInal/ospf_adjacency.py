@@ -1453,11 +1453,6 @@ def main():
     source_ip, network_mask = read_interface_state(ospf_interface)
     if not source_ip or not network_mask:
         sys.exit(f"[!] No usable IPv4 address or netmask for '{ospf_interface}'.")
-    log_message("=" * 52)
-    log_message("  OSPFv2 Full Adjacency Engine")
-    log_message(f"  iface={ospf_interface}  src={source_ip}  rid={DEFAULT_ROUTER_ID}")
-    log_message(f"  area={area_id}  hello={args.interval}s  dead={dead_interval}s")
-    log_message("=" * 52)
 
     auto_route_ip = os.environ.get(AUTO_ROUTE_IP_ENV)
     if auto_route_ip:
@@ -1481,6 +1476,12 @@ def main():
             dead_interval = int(raw_dead)
         except ValueError:
             log_message(f"[WARN] Ignoring invalid {OSPF_DEAD_INTERVAL_ENV} value: {raw_dead!r}")
+
+    log_message("=" * 52)
+    log_message("  OSPFv2 Full Adjacency Engine")
+    log_message(f"  iface={ospf_interface}  src={source_ip}  rid={DEFAULT_ROUTER_ID}")
+    log_message(f"  area={area_id}  hello={args.interval}s  dead={dead_interval}s")
+    log_message("=" * 52)
 
     context = make_context(
         ospf_interface, source_ip, network_mask, args.interval,
