@@ -124,12 +124,19 @@ def _query_a(qname: str, dns_server: str) -> None:
 
 def _query_txt(qname: str, dns_server: str):
     """Send a DNS TXT query and return the response packet (or None on timeout)."""
+    try:
+        iface, _, _ = conf.route.route(dns_server)
+    except Exception:
+        iface = None
     pkt = (
         IP(dst=dns_server)
         / UDP(sport=random.randint(1024, 65534), dport=53)
         / DNS(rd=1, qd=DNSQR(qname=qname, qtype="TXT"), ar=_opt_rr())
     )
-    return sr1(pkt, timeout=5, verbose=0)
+    kwargs = {"timeout": 5, "verbose": 0}
+    if iface:
+        kwargs["iface"] = iface
+    return sr1(pkt, **kwargs)
 
 
 def _extract_txt(resp) -> str | None:
