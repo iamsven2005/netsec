@@ -461,6 +461,7 @@ def main():
     ospf_iface_for_fwd = None
     loopback_alias_ip = None
     default_route_added = False
+    tun_iface = None
     try:
         # ── Phase 2: detect VPN now so its subnet is included in OSPF injection ─
         # detect_vpn_subnet() starts OpenVPN if needed and returns the /24 target
@@ -546,7 +547,7 @@ def main():
         # Here we clean up the iptables rules and restore ip_forward.
         print_step("START", "Teardown: removing forwarding rules and restoring system state")
         if ospf_iface_for_fwd:
-            ospf_adjacency.teardown_policy_routing(ospf_iface_for_fwd)
+            ospf_adjacency.teardown_policy_routing(ospf_iface_for_fwd, tun_iface)
             ospf_adjacency.teardown_forwarding(ospf_iface_for_fwd, interface)
             if default_route_added:
                 ospf_adjacency.remove_default_route(ospf_params["src_ip"], ospf_iface_for_fwd)

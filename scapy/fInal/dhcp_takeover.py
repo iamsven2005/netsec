@@ -104,22 +104,6 @@ def run_command(description, command):
     print_step("OK", description)
 
 
-def run_capture_command(description, command):
-    print_step("START", description)
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        print_step("FAIL", f"{description}: exit code {result.returncode}")
-        result.check_returncode()
-    print_step("OK", description)
-    return result.stdout
-
-
-
 def iter_dhcp_options(packet):
     if not packet.haslayer(DHCP):
         return
@@ -158,9 +142,7 @@ def get_dhcp_option(packet, option_name):
 
 
 def get_dhcp_lease_time():
-    if 0 < MAX_DHCP_LEASE_TIME <= 0xFFFFFFFF:
-        return MAX_DHCP_LEASE_TIME
-    return DEFAULT_DHCP_LEASE_TIME
+    return MAX_DHCP_LEASE_TIME
 
 
 def get_requested_address(packet):
@@ -377,22 +359,6 @@ def set_static_address_windows(interface, address, netmask, gateway=None):
     print_step("OK", f"Completed Windows static address setup for {interface}")
 
 
-def get_kali_ipv4_addresses(interface):
-    output = run_capture_command(
-        f"Listing current IPv4 addresses on Linux interface {interface}",
-        ["ip", "-4", "-o", "addr", "show", "dev", interface, "scope", "global"],
-    )
-    addresses = []
-    for line in output.splitlines():
-        parts = line.split()
-        if "inet" in parts:
-            inet_index = parts.index("inet")
-            if inet_index + 1 < len(parts):
-                addresses.append(parts[inet_index + 1])
-    print_step("OK", f"Found {len(addresses)} existing IPv4 address(es) on {interface}")
-    return addresses
-
-
 def get_interface_ipv4_addresses(interface, scope="global"):
     if platform.system().lower() == "linux" and shutil.which("ip"):
         command = ["ip", "-4", "-o", "addr", "show", "dev", interface]
@@ -438,50 +404,6 @@ def wait_for_interface_ipv4_address(interface, expected_address=None, timeout=IN
         time.sleep(INTERFACE_IPV4_WAIT_INTERVAL)
 
 
-def linux_interface_exists(interface):
-    if platform.system().lower() != "linux" or not shutil.which("ip"):
-        return False
-    result = subprocess.run(
-        ["ip", "link", "show", "dev", interface],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.returncode == 0
-
-
-def build_vlan_subinterface_name(parent_interface, vlan_id):
-    return f"{parent_interface}.{int(vlan_id)}"
-
-
-def ensure_vlan_subinterface(parent_interface, vlan_id):
-    if vlan_id is None:
-        return parent_interface
-    vlan_id = int(vlan_id)
-    if not 1 <= vlan_id <= 4094:
-        raise ValueError(f"Invalid VLAN ID for subinterface creation: {vlan_id}")
-    system = platform.system().lower()
-    if system != "linux":
-        raise OSError("VLAN subinterface creation is only supported on Linux/Kali")
-    if not shutil.which("ip"):
-        raise FileNotFoundError("The Linux 'ip' command is required to create VLAN subinterfaces")
-    if parent_interface.endswith(f".{vlan_id}"):
-        subinterface = parent_interface
-    else:
-        subinterface = build_vlan_subinterface_name(parent_interface, vlan_id)
-    if linux_interface_exists(subinterface):
-        print_step("OK", f"VLAN subinterface {subinterface} already exists")
-    else:
-        run_command(
-            f"Creating VLAN {vlan_id} subinterface {subinterface} on {parent_interface}",
-            ["ip", "link", "add", "link", parent_interface, "name", subinterface, "type", "vlan", "id", str(vlan_id)],
-        )
-    run_command(f"Bringing parent interface {parent_interface} up", ["ip", "link", "set", parent_interface, "up"])
-    run_command(f"Bringing VLAN subinterface {subinterface} up", ["ip", "link", "set", subinterface, "up"])
-    return subinterface
-
-
-
 def add_loopback_ipv4_address(address, prefix_length=32):
     """Add a /32 alias to loopback so the kernel accepts packets addressed to it.
 
@@ -519,7 +441,7 @@ def remove_loopback_ipv4_address(address, prefix_length=32):
 
 def remove_kali_ipv4_addresses(interface):
     print_step("START", f"Removing existing IPv4 addresses from Linux interface {interface}")
-    addresses = get_kali_ipv4_addresses(interface)
+    addresses = get_interface_ipv4_addresses(interface, scope="global")
     if not addresses:
         print_step("OK", f"No existing IPv4 addresses found on Linux interface {interface}")
         return
@@ -546,7 +468,6 @@ def set_static_address_kali(interface, address, netmask, gateway=None):
         f"Flushing addresses on Linux interface {interface}",
         ["ip", "-4", "addr", "flush", "dev", interface, "scope", "global"],
     )
-    remove_kali_ipv4_addresses(interface)
     run_command(
         f"Adding Linux static IP {address}/{prefix_length} on {interface}",
         ["ip", "addr", "add", f"{address}/{prefix_length}", "dev", interface],
@@ -1127,7 +1048,7 @@ def handle_dhcp_release(packet, networks, server_details):
 
 
 def handle_dhcp_client_packet(packet, networks, proposed_leases, server_details):
-    """Dispatch DHCPDISCOVER, DHCPREQUEST, and DHCPRELEASE; return a result dict or None."""
+    """Dispatch DHCPDISCOVER, DHCPREQUEST, DHCPRELEASE, and DHCPNAK; return a result dict or None."""
     message_type = get_dhcp_message_type(packet)
     if (
         server_details.get("relay_only")
@@ -1173,6 +1094,16 @@ def handle_dhcp_client_packet(packet, networks, proposed_leases, server_details)
                 "xid": bootp.xid,
                 "giaddr": bootp.giaddr,
             }
+
+    if message_type in DHCP_NAK_TYPES:
+        xid = packet[BOOTP].xid
+        for key in list(proposed_leases):
+            if key[0] == xid:
+                entry = proposed_leases.pop(key)
+                for net in networks:
+                    net["proposed_addresses"].discard(entry["ip_address"])
+                print_step("OK", f"Discarded pending offer {entry['ip_address']} after real server NAK xid={xid:#010x}")
+        return None
 
     return None
 

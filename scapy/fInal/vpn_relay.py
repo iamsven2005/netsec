@@ -71,7 +71,6 @@ _openvpn_proc = None          # subprocess.Popen if we started OpenVPN
 _fwd_phys_iface = None
 _fwd_tun_iface = None
 _fwd_rules = []               # [(delete_flag_args, rule_args), ...] for teardown
-_orig_ip_forward = None
 _cleanup_registered = False
 _cleanup_done = False
 
@@ -269,19 +268,10 @@ def setup_victim_forwarding(phys_iface, tun_iface, vpn_subnets):
 
     All rules are recorded in _fwd_rules for exact reversal at teardown.
     """
-    global _fwd_phys_iface, _fwd_tun_iface, _orig_ip_forward
+    global _fwd_phys_iface, _fwd_tun_iface
 
     _fwd_phys_iface = phys_iface
     _fwd_tun_iface = tun_iface
-
-    try:
-        with open("/proc/sys/net/ipv4/ip_forward") as f:
-            _orig_ip_forward = f.read().strip()
-        with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
-            f.write("1\n")
-        print_step("OK", "Enabled IPv4 forwarding")
-    except OSError as exc:
-        print_step("WARN", f"Could not set ip_forward: {exc}")
 
     for subnet in vpn_subnets:
         nat_rule = ["-o", tun_iface, "-d", subnet, "-j", "MASQUERADE"]
@@ -353,7 +343,7 @@ def enable_vpn_relay(server_details, phys_iface, tun=None, vpn_net24=None):
 
 def teardown():
     """Remove iptables rules, restore ip_forward, and stop OpenVPN if we started it."""
-    global _fwd_rules, _orig_ip_forward, _cleanup_done
+    global _fwd_rules, _cleanup_done
     if _cleanup_done:
         return
     _cleanup_done = True
@@ -361,15 +351,6 @@ def teardown():
     for table_flag, args in reversed(_fwd_rules):
         _iptables(table_flag, args, check=False)
     _fwd_rules = []
-
-    if _orig_ip_forward is not None:
-        try:
-            with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
-                f.write(_orig_ip_forward + "\n")
-        except OSError:
-            pass
-        _orig_ip_forward = None
-        print_step("OK", "Restored ip_forward")
 
     if _openvpn_proc is not None and _openvpn_proc.poll() is None:
         _openvpn_proc.terminate()

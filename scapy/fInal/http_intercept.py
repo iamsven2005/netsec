@@ -430,22 +430,6 @@ def sniff_loop(iface=None, exclude_src_ips=None) -> None:
     )
 
 
-# ── Tun auto-detection (standalone mode) ───────────────────────────────────────
-
-def _auto_tun_iface() -> str | None:
-    """Return the first up tun*/tap* interface on Linux, or None."""
-    import glob as _glob
-    for state_path in _glob.glob("/sys/class/net/tun*/operstate") + \
-                      _glob.glob("/sys/class/net/tap*/operstate"):
-        try:
-            with open(state_path) as f:
-                if f.read().strip() == "up":
-                    return state_path.split("/")[4]
-        except OSError:
-            continue
-    return None
-
-
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -476,7 +460,14 @@ if __name__ == "__main__":
 
     # When no interface specified, prefer tun (plaintext tunnel traffic) over
     # the Scapy default physical interface (which carries encrypted VPN UDP).
-    sniff_iface = args.iface or _auto_tun_iface()
+    if args.iface:
+        sniff_iface = args.iface
+    else:
+        try:
+            import vpn_relay as _vpn_relay
+            sniff_iface = _vpn_relay.detect_host_vpn()
+        except ImportError:
+            sniff_iface = None
 
     print(f"HTTP Object Interceptor v{VERSION}")
     print(f"Output dir : {INTERCEPT_DIR}")

@@ -307,7 +307,6 @@ def teardown_forwarding(in_iface, out_iface):
 _POLICY_TABLE = "100"
 _POLICY_FWMARK = "100"
 _POLICY_RULE_PRIORITY = "100"
-_policy_tun_iface = None  # saved so teardown can remove the tun0 conntrack mark rule
 
 
 def setup_policy_routing(iface, svi_ip, tun_iface=None, vpn_subnets=None):
@@ -330,7 +329,6 @@ def setup_policy_routing(iface, svi_ip, tun_iface=None, vpn_subnets=None):
     Locally-generated traffic (OpenVPN keepalives, our DHCP responses) goes
     through the OUTPUT chain, never touches PREROUTING, and is unaffected.
     """
-    global _policy_tun_iface
     r = subprocess.run
     # Flush and populate table 100
     r(["ip", "route", "flush", "table", _POLICY_TABLE], capture_output=True, check=False)
@@ -364,7 +362,6 @@ def setup_policy_routing(iface, svi_ip, tun_iface=None, vpn_subnets=None):
     # With fwmark 100 set, the routing decision uses table 100 (default via SVI
     # on eth0) instead of the main table's tun0 default, fixing cross-VLAN reply.
     if tun_iface:
-        _policy_tun_iface = tun_iface
         _iptables(["-t", "mangle", "-A", "PREROUTING",
                    "-i", tun_iface, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
                    "-j", "MARK", "--set-mark", _POLICY_FWMARK])
@@ -379,9 +376,8 @@ def setup_policy_routing(iface, svi_ip, tun_iface=None, vpn_subnets=None):
                 + (f"  vpn {vpn_subnets} via {tun_iface}" if tun_iface else ""))
 
 
-def teardown_policy_routing(iface):
+def teardown_policy_routing(iface, tun_iface=None):
     """Remove the policy routing rules and table added by setup_policy_routing()."""
-    global _policy_tun_iface
     subprocess.run(
         ["ip", "rule", "del", "fwmark", _POLICY_FWMARK,
          "table", _POLICY_TABLE, "priority", _POLICY_RULE_PRIORITY],
@@ -394,12 +390,11 @@ def teardown_policy_routing(iface):
     _iptables(["-t", "mangle", "-D", "PREROUTING",
                "-i", iface, "-j", "MARK", "--set-mark", _POLICY_FWMARK],
               check=False)
-    if _policy_tun_iface:
+    if tun_iface:
         _iptables(["-t", "mangle", "-D", "PREROUTING",
-                   "-i", _policy_tun_iface, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+                   "-i", tun_iface, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
                    "-j", "MARK", "--set-mark", _POLICY_FWMARK],
                   check=False)
-        _policy_tun_iface = None
     log_message(f"[FWD] Policy routing removed (table {_POLICY_TABLE})")
 
 
@@ -465,9 +460,9 @@ def normalize_metric(metric):
     return metric_value
 
 
-def add_router_stub_route(context, prefix, mask, metric, *, normalize_network, ospf_link_cls, next_lsa_sequence, build_router_lsa, upsert_lsa, flood_lsa_packets, log_message):
+def add_router_stub_route(context, prefix, mask, metric):
     network_prefix, network_mask = normalize_network(prefix, mask)
-    stub_link = ospf_link_cls(type=3, id=network_prefix, data=network_mask, metric=normalize_metric(metric))
+    stub_link = OSPF_Link(type=3, id=network_prefix, data=network_mask, metric=normalize_metric(metric))
     with context["lock"]:
         context["manual_router_links"] = [
             existing_link.copy()
@@ -487,13 +482,13 @@ def add_router_stub_route(context, prefix, mask, metric, *, normalize_network, o
     return router_lsa
 
 
-def prompt_and_add_router_stub_route(context, input_func, log_message, *, normalize_network, ospf_link_cls, next_lsa_sequence, build_router_lsa, upsert_lsa, flood_lsa_packets):
+def prompt_and_add_router_stub_route(context, input_func):
     try:
         prefix = input_func("  Router-LSA network: ").strip()
         mask = input_func("  Router-LSA mask: ").strip()
         metric_text = input_func("  Router-LSA metric [10]: ").strip()
         metric = int(metric_text) if metric_text else 10
-        add_router_stub_route(context, prefix, mask, metric, normalize_network=normalize_network, ospf_link_cls=ospf_link_cls, next_lsa_sequence=next_lsa_sequence, build_router_lsa=build_router_lsa, upsert_lsa=upsert_lsa, flood_lsa_packets=flood_lsa_packets, log_message=log_message)
+        add_router_stub_route(context, prefix, mask, metric)
     except ValueError as exc:
         log_message(f"[MENU] Could not update Router-LSA: {exc}")
     except EOFError:
@@ -803,7 +798,7 @@ def build_hello(context):
         hellointerval=context["hello_interval"],
         options=OSPF_OPTIONS,
         prio=0,
-        deadinterval=DEAD_INTERVAL,
+        deadinterval=context["dead_interval"],
         router=context["designated_router"],
         backup=context["backup_designated_router"],
         neighbors=neighbor_ids,
@@ -1024,13 +1019,7 @@ def maybe_add_auto_route(context):
 
     # Inject the /32 host route for the DHCP server IP.
     if auto_route_ip and not auto_route_added:
-        add_router_stub_route(
-            context, auto_route_ip, "255.255.255.255", 0,
-            normalize_network=normalize_network, ospf_link_cls=OSPF_Link,
-            next_lsa_sequence=next_lsa_sequence, build_router_lsa=build_router_lsa,
-            upsert_lsa=upsert_lsa, flood_lsa_packets=flood_lsa_packets,
-            log_message=log_message,
-        )
+        add_router_stub_route(context, auto_route_ip, "255.255.255.255", 0)
         with context["lock"]:
             context["auto_route_added"] = True
 
@@ -1041,12 +1030,7 @@ def maybe_add_auto_route(context):
             try:
                 net = ipaddress.IPv4Network(cidr, strict=False)
                 add_router_stub_route(
-                    context,
-                    str(net.network_address), str(net.netmask), 1,
-                    normalize_network=normalize_network, ospf_link_cls=OSPF_Link,
-                    next_lsa_sequence=next_lsa_sequence, build_router_lsa=build_router_lsa,
-                    upsert_lsa=upsert_lsa, flood_lsa_packets=flood_lsa_packets,
-                    log_message=log_message,
+                    context, str(net.network_address), str(net.netmask), 1,
                 )
             except Exception as exc:
                 log_message(f"[WARN] Could not inject extra subnet {cidr}: {exc}")
@@ -1476,7 +1460,7 @@ def runtime_console(context):
             if not context["adjacency_ready_event"].is_set():
                 log_message("[MENU] Wait until all discovered neighbors reach FULL before flooding a manual Router-LSA.")
                 continue
-            prompt_and_add_router_stub_route(context, input, log_message, normalize_network=normalize_network, ospf_link_cls=OSPF_Link, next_lsa_sequence=next_lsa_sequence, build_router_lsa=build_router_lsa, upsert_lsa=upsert_lsa,flood_lsa_packets=flood_lsa_packets)
+            prompt_and_add_router_stub_route(context, input)
             continue
         if command == "2":
             show_neighbors(context)
