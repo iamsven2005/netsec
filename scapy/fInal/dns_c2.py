@@ -31,7 +31,7 @@ import threading
 import time
 
 from scapy.all import IP, UDP, send, sr1, conf
-from scapy.layers.dns import DNS, DNSQR, DNSRR
+from scapy.layers.dns import DNS, DNSQR
 
 conf.verb = 0
 
