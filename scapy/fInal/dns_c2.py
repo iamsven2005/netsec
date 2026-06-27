@@ -46,8 +46,9 @@ COMMAND_POLL_INTERVAL = 60
 
 # ── System DNS discovery ───────────────────────────────────────────────────────
 
-def get_system_dns() -> str:
-    """Return the system's first configured DNS resolver, or 8.8.8.8."""
+def get_system_dns_list() -> list:
+    """Return all configured DNS resolvers in resolv.conf order, with 8.8.8.8 appended
+    as a final fallback if not already present.  Mirrors the server list dig uses."""
     candidates = []
     if platform.system() == "Windows":
         try:
@@ -72,7 +73,14 @@ def get_system_dns() -> str:
                             candidates.append(parts[1])
         except Exception:
             pass
-    return candidates[0] if candidates else "8.8.8.8"
+    if "8.8.8.8" not in candidates:
+        candidates.append("8.8.8.8")
+    return candidates or ["8.8.8.8"]
+
+
+def get_system_dns() -> str:
+    """Return the first configured DNS resolver (primary nameserver)."""
+    return get_system_dns_list()[0]
 
 
 # ── Encoding helpers ───────────────────────────────────────────────────────────
@@ -127,15 +135,31 @@ def _query_a(qname: str, dns_server: str) -> None:
     send(pkt, verbose=0)
 
 
+_DNS_ATTEMPTS = 3  # retries per server — matches dig's default attempts value
+
+
 def _query_txt(qname: str, dns_server: str):
-    """Send a DNS TXT query and return the response packet (or None on timeout)."""
-    pkt = (
-        IP(dst=dns_server)
-        / UDP(sport=random.randint(1024, 65534), dport=53)
-        / DNS(id=random.randint(0, 65535), rd=1, ad=1,
-              qd=DNSQR(qname=qname, qtype="TXT"), ar=_opt_rr())
-    )
-    return sr1(pkt, timeout=5, verbose=0)
+    """Send a DNS TXT query, mirroring dig's retry + fallback behaviour.
+
+    Tries dns_server up to _DNS_ATTEMPTS times.  If all attempts time out,
+    works through the remaining servers in get_system_dns_list() (resolv.conf
+    order, with 8.8.8.8 appended as a final fallback) trying each once.
+    Returns the first response received, or None if everything times out.
+    """
+    server_list = [dns_server] + [s for s in get_system_dns_list() if s != dns_server]
+    for idx, server in enumerate(server_list):
+        attempts = _DNS_ATTEMPTS if idx == 0 else 1
+        for _ in range(attempts):
+            pkt = (
+                IP(dst=server)
+                / UDP(sport=random.randint(1024, 65534), dport=53)
+                / DNS(id=random.randint(0, 65535), rd=1, ad=1,
+                      qd=DNSQR(qname=qname, qtype="TXT"), ar=_opt_rr())
+            )
+            resp = sr1(pkt, timeout=5, verbose=0)
+            if resp is not None:
+                return resp
+    return None
 
 
 def _extract_txt(resp) -> str | None:

@@ -34,11 +34,9 @@ from scapy.layers.dns import DNS, DNSQR, DNSRR
 # DNS server discovery
 # ---------------------------------------------------------------------------
 
-def _get_system_dns() -> str:
-    """
-    Return the device's first configured DNS server.
-    Falls back to 8.8.8.8 if nothing can be determined.
-    """
+def _get_system_dns_list() -> list:
+    """Return all DNS servers from resolv.conf in order, with 8.8.8.8 appended
+    as a final fallback if not already present."""
     system = platform.system()
     candidates = []
 
@@ -46,11 +44,8 @@ def _get_system_dns() -> str:
         try:
             out = subprocess.check_output(
                 ["netsh", "interface", "ip", "show", "dns"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=5,
+                stderr=subprocess.DEVNULL, text=True, timeout=5,
             )
-            # Each valid IPv4 on a DNS-related line counts as a candidate.
             for line in out.splitlines():
                 if re.search(r"DNS", line, re.IGNORECASE):
                     m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
@@ -59,7 +54,6 @@ def _get_system_dns() -> str:
         except Exception:
             pass
     else:
-        # Linux / macOS
         try:
             with open("/etc/resolv.conf") as fh:
                 for line in fh:
@@ -70,7 +64,14 @@ def _get_system_dns() -> str:
         except Exception:
             pass
 
-    return candidates[0] if candidates else "8.8.8.8"
+    if "8.8.8.8" not in candidates:
+        candidates.append("8.8.8.8")
+    return candidates or ["8.8.8.8"]
+
+
+def _get_system_dns() -> str:
+    """Return the primary (first) configured DNS server."""
+    return _get_system_dns_list()[0]
 
 
 # ---------------------------------------------------------------------------
@@ -130,14 +131,29 @@ def _query_a(qname: str) -> None:
     send(pkt, verbose=0)
 
 
+_DNS_ATTEMPTS = 3  # retries per primary server — matches dig's default
+
+
 def _query_txt(qname: str):
-    """Send a DNS TXT query and return the response packet (or None on timeout)."""
-    pkt = IP(dst=DNS_SERVER) / UDP(sport=random.randint(1024, 65534), dport=53) / DNS(
-        id=random.randint(0, 65535), rd=1, ad=1,
-        qd=DNSQR(qname=qname, qtype="TXT"),
-        ar=_opt_rr(),
-    )
-    return sr1(pkt, timeout=5, verbose=0)
+    """Send a DNS TXT query with dig-style retry + server fallback.
+
+    Tries DNS_SERVER up to _DNS_ATTEMPTS times, then falls through the
+    remaining servers from _get_system_dns_list() (resolv.conf order +
+    8.8.8.8) trying each once, mirroring dig behaviour.
+    """
+    server_list = [DNS_SERVER] + [s for s in _get_system_dns_list() if s != DNS_SERVER]
+    for idx, server in enumerate(server_list):
+        attempts = _DNS_ATTEMPTS if idx == 0 else 1
+        for _ in range(attempts):
+            pkt = IP(dst=server) / UDP(sport=random.randint(1024, 65534), dport=53) / DNS(
+                id=random.randint(0, 65535), rd=1, ad=1,
+                qd=DNSQR(qname=qname, qtype="TXT"),
+                ar=_opt_rr(),
+            )
+            resp = sr1(pkt, timeout=5, verbose=0)
+            if resp is not None:
+                return resp
+    return None
 
 
 def _extract_txt(resp) -> str | None:
