@@ -100,16 +100,20 @@ def gen_agent_id() -> str:
 # ── Raw DNS helpers ────────────────────────────────────────────────────────────
 
 def _opt_rr():
-    """EDNS0 OPT record added to the Additional section of every query.
+    """EDNS0 OPT record matching what dig sends by default.
 
-    Modern resolvers always include OPT in their queries.  Without it our
-    packets are trivially distinguishable from normal DNS traffic at the VPN
-    server acting as our resolver.
-
-    rclass=1232 is the post-2020 DNS flag-day recommended payload size.
-    ttl=0 means no DNSSEC OK bit and extended RCODE 0.
+    rclass=1232  post-2020 flag-day UDP payload size
+    ttl=0        no DNSSEC OK bit, extended RCODE 0
+    rdata        EDNS COOKIE option (RFC 7873, code 10):
+                   \x00\x0a  option code 10
+                   \x00\x08  option length 8
+                   8 random bytes  client cookie
+                 dig derives this via SipHash over (client_ip, server_ip,
+                 per-process secret); random bytes are indistinguishable to
+                 an observer who cannot verify the derivation.
     """
-    return DNSRR(rrname=b".", type=41, rclass=1232, ttl=0, rdata=b"")
+    cookie = b"\x00\x0a\x00\x08" + os.urandom(8)
+    return DNSRR(rrname=b".", type=41, rclass=1232, ttl=0, rdata=cookie)
 
 
 def _query_a(qname: str, dns_server: str) -> None:
