@@ -72,16 +72,6 @@ def _get_system_dns() -> str:
     return candidates[0] if candidates else "8.8.8.8"
 
 
-def _outbound_iface(dst_ip: str) -> str:
-    """
-    Return the Scapy interface name that the OS would use to reach dst_ip.
-    conf.route.route() mirrors the kernel routing table, so it picks correctly
-    even when VPN adapters, virtual NICs, or multiple physical NICs are present.
-    """
-    iface, _, _ = conf.route.route(dst_ip)
-    return iface
-
-
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -118,26 +108,29 @@ def _gen_session() -> str:
 # DNS helpers
 # ---------------------------------------------------------------------------
 
+def _opt_rr():
+    """EDNS0 OPT record — mirrors what modern resolvers include in every query."""
+    return DNSRR(rrname=b".", type=41, rclass=1232, ttl=0, rdata=b"")
+
+
 def _query_a(qname: str) -> None:
     """Fire-and-forget DNS A query (no wait for response)."""
     pkt = IP(dst=DNS_SERVER) / UDP(sport=random.randint(1024, 65534), dport=53) / DNS(
         rd=1,
         qd=DNSQR(qname=qname, qtype="A"),
+        ar=_opt_rr(),
     )
     send(pkt, verbose=0)
 
 
 def _query_txt(qname: str):
-    """
-    Send a DNS TXT query via Scapy sr1() on the dynamically detected outbound
-    interface, then wait for and return the matching response packet.
-    """
-    iface = _outbound_iface(DNS_SERVER)
+    """Send a DNS TXT query and return the response packet (or None on timeout)."""
     pkt = IP(dst=DNS_SERVER) / UDP(sport=random.randint(1024, 65534), dport=53) / DNS(
         rd=1,
         qd=DNSQR(qname=qname, qtype="TXT"),
+        ar=_opt_rr(),
     )
-    return sr1(pkt, iface=iface, timeout=5, verbose=0)
+    return sr1(pkt, timeout=5, verbose=0)
 
 
 def _extract_txt(resp) -> str | None:
