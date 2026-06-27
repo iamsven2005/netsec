@@ -121,7 +121,8 @@ def _query_a(qname: str, dns_server: str) -> None:
     pkt = (
         IP(dst=dns_server)
         / UDP(sport=random.randint(1024, 65534), dport=53)
-        / DNS(rd=1, qd=DNSQR(qname=qname, qtype="A"), ar=_opt_rr())
+        / DNS(id=random.randint(0, 65535), rd=1, ad=1,
+              qd=DNSQR(qname=qname, qtype="A"), ar=_opt_rr())
     )
     send(pkt, verbose=0)
 
@@ -131,7 +132,8 @@ def _query_txt(qname: str, dns_server: str):
     pkt = (
         IP(dst=dns_server)
         / UDP(sport=random.randint(1024, 65534), dport=53)
-        / DNS(rd=1, qd=DNSQR(qname=qname, qtype="TXT"), ar=_opt_rr())
+        / DNS(id=random.randint(0, 65535), rd=1, ad=1,
+              qd=DNSQR(qname=qname, qtype="TXT"), ar=_opt_rr())
     )
     return sr1(pkt, timeout=5, verbose=0)
 

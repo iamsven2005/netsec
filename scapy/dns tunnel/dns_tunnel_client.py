@@ -123,7 +123,7 @@ def _opt_rr():
 def _query_a(qname: str) -> None:
     """Fire-and-forget DNS A query (no wait for response)."""
     pkt = IP(dst=DNS_SERVER) / UDP(sport=random.randint(1024, 65534), dport=53) / DNS(
-        rd=1,
+        id=random.randint(0, 65535), rd=1, ad=1,
         qd=DNSQR(qname=qname, qtype="A"),
         ar=_opt_rr(),
     )
@@ -133,7 +133,7 @@ def _query_a(qname: str) -> None:
 def _query_txt(qname: str):
     """Send a DNS TXT query and return the response packet (or None on timeout)."""
     pkt = IP(dst=DNS_SERVER) / UDP(sport=random.randint(1024, 65534), dport=53) / DNS(
-        rd=1,
+        id=random.randint(0, 65535), rd=1, ad=1,
         qd=DNSQR(qname=qname, qtype="TXT"),
         ar=_opt_rr(),
     )
