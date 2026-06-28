@@ -71,7 +71,11 @@ interface g0/1/0
 end
 
 
-
+R2
+en
+conf t
+Ip dhcp relay information trust-all
+end
 
 
 show ip dhcp snooping
