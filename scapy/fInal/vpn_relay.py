@@ -35,9 +35,11 @@ import glob
 import ipaddress
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 from dhcp_takeover import print_step
@@ -71,6 +73,7 @@ _openvpn_proc = None          # subprocess.Popen if we started OpenVPN
 _fwd_phys_iface = None
 _fwd_tun_iface = None
 _fwd_rules = []               # [(delete_flag_args, rule_args), ...] for teardown
+_fwd_rules_lock = threading.Lock()
 _cleanup_registered = False
 _cleanup_done = False
 
@@ -110,10 +113,7 @@ def find_ovpn_binary():
     for p in OVPN_BINARY_PATHS:
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
-    result = subprocess.run(["which", "openvpn"], capture_output=True, text=True)
-    if result.returncode == 0 and result.stdout.strip():
-        return result.stdout.strip()
-    return None
+    return shutil.which("openvpn")
 
 
 def _needs_interactive_auth(path):
@@ -132,7 +132,8 @@ def _needs_interactive_auth(path):
                     if len(parts) == 1:
                         return True  # bare directive — needs interactive input
     except OSError:
-        pass
+        print_step("WARN", f"Cannot read profile {path} — skipping")
+        return True  # treat unreadable profile as interactive to avoid blocking openvpn
     return False
 
 
@@ -277,9 +278,11 @@ def setup_victim_forwarding(phys_iface, tun_iface, vpn_subnets):
         nat_rule = ["-o", tun_iface, "-d", subnet, "-j", "MASQUERADE"]
         fwd_rule = ["-i", phys_iface, "-o", tun_iface, "-d", subnet, "-j", "ACCEPT"]
         if _iptables(["-t", "nat", "-A", "POSTROUTING"], nat_rule):
-            _fwd_rules.append((["-t", "nat", "-D", "POSTROUTING"], nat_rule))
+            with _fwd_rules_lock:
+                _fwd_rules.append((["-t", "nat", "-D", "POSTROUTING"], nat_rule))
         if _iptables(["-A", "FORWARD"], fwd_rule):
-            _fwd_rules.append((["-D", "FORWARD"], fwd_rule))
+            with _fwd_rules_lock:
+                _fwd_rules.append((["-D", "FORWARD"], fwd_rule))
 
     if vpn_subnets:
         return_rule = [
@@ -288,7 +291,8 @@ def setup_victim_forwarding(phys_iface, tun_iface, vpn_subnets):
             "-j", "ACCEPT",
         ]
         if _iptables(["-A", "FORWARD"], return_rule):
-            _fwd_rules.append((["-D", "FORWARD"], return_rule))
+            with _fwd_rules_lock:
+                _fwd_rules.append((["-D", "FORWARD"], return_rule))
 
     print_step("OK", f"Forwarding installed: {phys_iface} → {tun_iface} for {vpn_subnets}")
 
@@ -343,14 +347,16 @@ def enable_vpn_relay(server_details, phys_iface, tun=None, vpn_net24=None):
 
 def teardown():
     """Remove iptables rules, restore ip_forward, and stop OpenVPN if we started it."""
-    global _fwd_rules, _cleanup_done
+    global _cleanup_done
     if _cleanup_done:
         return
     _cleanup_done = True
 
-    for table_flag, args in reversed(_fwd_rules):
+    with _fwd_rules_lock:
+        rules_snapshot = list(reversed(_fwd_rules))
+        _fwd_rules.clear()
+    for table_flag, args in rules_snapshot:
         _iptables(table_flag, args, check=False)
-    _fwd_rules = []
 
     if _openvpn_proc is not None and _openvpn_proc.poll() is None:
         _openvpn_proc.terminate()

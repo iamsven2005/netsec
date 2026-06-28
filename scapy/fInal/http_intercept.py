@@ -13,10 +13,9 @@ import os
 import re
 import gzip
 import zlib
-import argparse
 from collections import defaultdict
 from urllib.parse import parse_qs
-from scapy.all import sniff, IP, TCP, Raw, get_if_list
+from scapy.all import sniff, IP, TCP, Raw
 
 INTERCEPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "intercepted")
 os.makedirs(INTERCEPT_DIR, exist_ok=True)
@@ -430,56 +429,3 @@ def sniff_loop(iface=None, exclude_src_ips=None) -> None:
     )
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description=f"HTTP Object Interceptor v{VERSION} — saves downloaded files from HTTP traffic"
-    )
-    parser.add_argument("-i", "--iface", default=None,
-                        help="Interface to sniff on (default: auto-detect tun, then Scapy default)")
-    parser.add_argument("-p", "--port", type=int, default=80,
-                        help="HTTP port to monitor (default: 80)")
-    parser.add_argument("--all", action="store_true",
-                        help="Save all non-HTML responses, not just Content-Disposition: attachment")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Print each HTTP response's headers and body preview before saving")
-    parser.add_argument("--list-ifaces", action="store_true",
-                        help="List available network interfaces and exit")
-    args = parser.parse_args()
-
-    if args.list_ifaces:
-        print("Available interfaces:")
-        for iface in get_if_list():
-            print(f"  {iface}")
-        raise SystemExit(0)
-
-    HTTP_PORT = args.port
-    ATTACHMENT_ONLY = not args.all
-    VERBOSE = args.verbose
-
-    # When no interface specified, prefer tun (plaintext tunnel traffic) over
-    # the Scapy default physical interface (which carries encrypted VPN UDP).
-    if args.iface:
-        sniff_iface = args.iface
-    else:
-        try:
-            import vpn_relay as _vpn_relay
-            sniff_iface = _vpn_relay.detect_host_vpn()
-        except ImportError:
-            sniff_iface = None
-
-    print(f"HTTP Object Interceptor v{VERSION}")
-    print(f"Output dir : {INTERCEPT_DIR}")
-    print(f"Interface  : {sniff_iface or 'default'}" +
-          ("  (auto-detected tun)" if sniff_iface and not args.iface else ""))
-    print(f"Port filter: tcp port {HTTP_PORT}")
-    print(f"Mode       : {'attachment-only' if ATTACHMENT_ONLY else 'capture all'}")
-    print("Ctrl+C to stop.\n")
-
-    sniff(
-        iface=sniff_iface,
-        filter=f"tcp port {HTTP_PORT}",
-        prn=packet_handler,
-        store=False,
-    )

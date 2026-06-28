@@ -43,8 +43,9 @@ from scapy.all import (
 
 DEFAULT_SUBNET_MASK = "255.255.255.0"
 DEFAULT_PREFIX_LENGTH = 24
-DEFAULT_DHCP_LEASE_TIME = 30 * 24 * 60 * 60
 MAX_DHCP_LEASE_TIME = 0xFFFFFFFF
+DHCP_T1_FACTOR = 0.5
+DHCP_T2_FACTOR = 0.875
 DEFAULT_INTERFACE = "eth0"
 INTERFACE_IPV4_WAIT_INTERVAL = 2
 INTERFACE_IPV4_WAIT_TIMEOUT = 60
@@ -141,10 +142,6 @@ def get_dhcp_option(packet, option_name):
     )
 
 
-def get_dhcp_lease_time():
-    return MAX_DHCP_LEASE_TIME
-
-
 def get_requested_address(packet):
     requested_address = get_dhcp_option(packet, "requested_addr")
     if requested_address is None:
@@ -174,10 +171,6 @@ def get_requested_or_client_address(packet):
 
 def is_dhcp_discover(packet):
     return get_dhcp_message_type(packet) in DHCP_DISCOVER_TYPES
-
-
-def is_dhcp_offer(packet):
-    return get_dhcp_message_type(packet) in DHCP_OFFER_TYPES
 
 
 def is_dhcp_request(packet):
@@ -439,20 +432,6 @@ def remove_loopback_ipv4_address(address, prefix_length=32):
     print_step("OK", f"Removed loopback alias {address}")
 
 
-def remove_kali_ipv4_addresses(interface):
-    print_step("START", f"Removing existing IPv4 addresses from Linux interface {interface}")
-    addresses = get_interface_ipv4_addresses(interface, scope="global")
-    if not addresses:
-        print_step("OK", f"No existing IPv4 addresses found on Linux interface {interface}")
-        return
-    for current_address in addresses:
-        run_command(
-            f"Removing existing Linux IPv4 address {current_address} from {interface}",
-            ["ip", "addr", "del", current_address, "dev", interface],
-        )
-    print_step("OK", f"Removed {len(addresses)} existing IPv4 address(es) from {interface}")
-
-
 def set_static_address_kali(interface, address, netmask, gateway=None):
     print_step("START", f"Preparing Kali static address setup for {interface}")
     if shutil.which("dhclient"):
@@ -463,7 +442,6 @@ def set_static_address_kali(interface, address, netmask, gateway=None):
     else:
         print_step("SKIP", "dhclient was not found; skipping DHCP lease release")
     prefix_length = ipaddress.IPv4Network(f"0.0.0.0/{netmask}").prefixlen
-    remove_kali_ipv4_addresses(interface)
     run_command(
         f"Flushing addresses on Linux interface {interface}",
         ["ip", "-4", "addr", "flush", "dev", interface, "scope", "global"],
@@ -538,13 +516,6 @@ def get_packet_vlan_id(packet):
     return None
 
 
-def get_effective_relay_agent_ip(packet, server_details):
-    giaddr = packet[BOOTP].giaddr
-    if giaddr != "0.0.0.0":
-        return giaddr
-    return giaddr
-
-
 def get_learned_vlan_details(packet, server_details):
     vlan_id = get_packet_vlan_id(packet)
     if vlan_id is None:
@@ -607,7 +578,7 @@ def get_relayed_client_network(giaddr, requested_address):
 
 def get_or_add_dhcp_network(packet, networks, server_details):
     giaddr = packet[BOOTP].giaddr
-    relay_agent_ip = get_effective_relay_agent_ip(packet, server_details)
+    relay_agent_ip = giaddr
     requested_address = get_requested_or_client_address(packet)
     vlan_id = get_packet_vlan_id(packet)
 
@@ -733,7 +704,7 @@ def build_dhcp_response(packet, message_type, offered_ip, dhcp_network, server_i
     subnet_mask = dhcp_network["subnet_mask"]
     router = dhcp_network["router"]
     vlan_id = dhcp_network.get("vlan_id")
-    lease_time = get_dhcp_lease_time()
+    lease_time = MAX_DHCP_LEASE_TIME
     is_relayed = dhcp_network["mode"] == "relay"
     client_mac = get_bootp_client_mac(packet)
     broadcast_requested = bool(int(bootp.flags) & 0x8000)
@@ -802,8 +773,8 @@ def build_dhcp_response(packet, message_type, offered_ip, dhcp_network, server_i
     dhcp_options.extend(
         [
             ("lease_time", lease_time),
-            ("renewal_time", lease_time // 2),
-            ("rebinding_time", int(lease_time * 0.875)),
+            ("renewal_time", int(lease_time * DHCP_T1_FACTOR)),
+            ("rebinding_time", int(lease_time * DHCP_T2_FACTOR)),
             "end",
         ]
     )
