@@ -116,7 +116,7 @@ def _query_a(qname: str) -> None:
         rd=1,
         qd=DNSQR(qname=qname, qtype="A"),
     )
-    sr1(pkt, timeout=1, verbose=0)
+    conf.iface = IFACE; sr1(pkt, timeout=1, verbose=0)
 
 
 def _query_txt(qname: str):
@@ -125,7 +125,7 @@ def _query_txt(qname: str):
         rd=1,
         qd=DNSQR(qname=qname, qtype="TXT"),
     )
-    return sr1(pkt, timeout=5, verbose=0)
+    conf.iface = IFACE; return sr1(pkt, timeout=5, verbose=0)
 
 
 def _extract_txt(resp) -> str | None:
