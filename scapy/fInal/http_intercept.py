@@ -4,7 +4,7 @@ HTTP Object Interceptor — captures files downloaded over HTTP.
 Equivalent to Wireshark's Export Objects > HTTP.
 Reassembles TCP streams before parsing, handles chunked encoding.
 """
-VERSION = "1.2"
+VERSION = "1.3"
 
 import base64
 import datetime
@@ -26,9 +26,8 @@ os.makedirs(INTERCEPT_DIR, exist_ok=True)
 # are discarded to avoid saving body bytes misinterpreted as headers.
 streams = defaultdict(lambda: {"buf": b"", "next_seq": None, "ooo": {}, "trusted": False})
 
-HTTP_PORT = 80        # overridden by argparse at startup
-ATTACHMENT_ONLY = True  # overridden by --all flag
-VERBOSE = False         # overridden by --verbose flag
+HTTP_PORT = 80
+ATTACHMENT_ONLY = True
 
 # ── Credential capture globals ─────────────────────────────────────────────────
 
@@ -103,10 +102,7 @@ def try_extract(stream_key):
         if sep == -1:
             break
 
-        try:
-            header_text = buf[:sep].decode("utf-8", errors="replace")
-        except Exception:
-            break
+        header_text = buf[:sep].decode("utf-8", errors="replace")
 
         lines = header_text.split("\r\n")
         if not lines[0].startswith("HTTP/"):
@@ -178,8 +174,7 @@ def decompress_body(headers, body):
         if "deflate" in encoding:
             return zlib.decompress(body)
     except Exception as e:
-        if VERBOSE:
-            print(f"[!] Decompression failed ({encoding}): {e}")
+        print(f"[!] Decompression failed ({encoding}): {e}")
     return body
 
 
@@ -190,13 +185,6 @@ def save_object(headers, body, stream_key):
     raw_ct = headers.get("content-type", "application/octet-stream")
     content_type = raw_ct.split(";")[0].strip().lower()
     disposition = headers.get("content-disposition", "")
-
-    if VERBOSE:
-        src, _, dst, dport = stream_key
-        print(f"[~] Response from {src}  Content-Type: {raw_ct}  "
-              f"Content-Encoding: {headers.get('content-encoding', '-')}  "
-              f"Content-Disposition: {disposition or '-'}  "
-              f"Body: {len(body)} bytes  preview: {body[:60]!r}")
 
     # Pull filename from Content-Disposition: attachment; filename="..."
     filename = None
@@ -258,10 +246,7 @@ def _extract_creds_from_request(buf: bytes, src_ip: str, dst_ip: str, dst_port: 
         if sep == -1:
             break
 
-        try:
-            header_text = buf[:sep].decode("utf-8", errors="replace")
-        except Exception:
-            break
+        header_text = buf[:sep].decode("utf-8", errors="replace")
 
         lines   = header_text.split("\r\n")
         headers = {}

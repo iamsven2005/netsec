@@ -1,33 +1,29 @@
 #!/usr/bin/env python3
-# v2.1
+# v2.2
 """
 ospf_adjacency.py — OSPFv2 full-adjacency engine + route injection + MITM relay.
 
-Self-contained module.  Used two ways:
+Library module called by main.py.  Public API:
 
-  Standalone CLI:
-      sudo python3 ospf_adjacency.py --iface eth0 [--vlan 20]
-      Runs the interactive engine with a menu (add Router-LSA routes, show LSDB).
+  Passive sniffing (before adjacency):
+      sniff_ospf_hellos(iface)             -> learn SVI parameters from Hello packets
+      sniff_ospf_lsdb_subnets(iface, list) -> capture advertised subnets into a list
 
-  As a library (called by main.py):
-      sniff_ospf_hellos(iface)             -> passively learn SVI parameters from
-                                              OSPF Hello packets before forming
-                                              any adjacency
-      launch_in_terminal(interface, ...)   -> spawn the full-adjacency engine in a
-                                              new terminal so its menu stays usable
-      wait_for_adjacency_exchange(iface)   -> block until LS exchange is seen
+  In-process engine (run in a daemon thread by main.py):
+      make_context(iface, ip, ...)         -> build the shared context dict
+      run_engine_headless(context)         -> Hello loop + packet dispatch
+      withdraw_injected_routes(context)    -> MaxAge-flood self Router-LSA on exit
 
   MITM relay helpers (all Linux-only):
       enable_ip_forwarding()               -> save and enable ip_forward
       restore_ip_forwarding(old)           -> write back saved value
       setup_forwarding(in_iface, out)      -> iptables FORWARD + MASQUERADE rules
       teardown_forwarding(in_iface, out)   -> remove those rules
-      withdraw_injected_routes(context)    -> MaxAge-flood our Router-LSA to pull
-                                              injected stubs from neighbours' RIBs
+      setup_policy_routing(iface, svi_ip)  -> per-victim routing table (fwmark 100)
+      teardown_policy_routing(iface)       -> remove policy routing rules
 """
 from __future__ import annotations
 import ipaddress
-import platform
 import socket
 import subprocess
 import sys
@@ -35,7 +31,7 @@ import threading
 import time
 
 try:
-    from scapy.all import Ether, IP, conf as scapy_conf, get_if_addr, sendp, sniff
+    from scapy.all import Ether, IP, get_if_addr, sendp, sniff
     from scapy.contrib.ospf import (
         OSPF_DBDesc,
         OSPF_Hdr,
@@ -484,65 +480,20 @@ def read_interface_ip(interface_name):
             return address
     except Exception as exc:
         log_message(f"[WARN] get_if_addr({interface_name}): {exc}")
-    if platform.system() == "Windows":
-        try:
-            if interface_name.startswith("\\Device\\"):
-                alias = scapy_conf.ifaces.dev_from_networkname(interface_name).name
-                address = get_if_addr(alias)
-            else:
-                network_name = scapy_conf.ifaces.dev_from_name(interface_name).network_name
-                address = get_if_addr(network_name)
-            if address and address != "0.0.0.0":
-                return address
-        except Exception:
-            pass
     return None
 
 
 def read_interface_netmask(interface_name):
     try:
-        if platform.system() == "Windows":
-            alias = interface_name
-            try:
-                if interface_name.startswith("\\Device\\"):
-                    alias = scapy_conf.ifaces.dev_from_networkname(interface_name).name
-                else:
-                    alias = scapy_conf.ifaces.dev_from_name(interface_name).name
-            except Exception:
-                pass
-            result = subprocess.run(
-                [
-                    "netsh",
-                    "interface",
-                    "ipv4",
-                    "show",
-                    "addresses",
-                    f"name={alias}",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            prefix_text = ""
-            for line in result.stdout.splitlines():
-                if "(mask " in line:
-                    prefix_text = line.split("(mask ", 1)[1].split(")", 1)[0].strip()
-                    break
-                if "Subnet Mask" in line:
-                    prefix_text = line.split(":", 1)[1].strip()
-                    break
-        else:
-            result = subprocess.run(
-                ["ip", "-o", "-f", "inet", "addr", "show", "dev", interface_name],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            prefix_text = ""
-            for token in result.stdout.split():
-                if "/" in token and token.count(".") == 3:
-                    prefix_text = token.split("/", 1)[1]
-                    break
+        result = subprocess.run(
+            ["ip", "-o", "-f", "inet", "addr", "show", "dev", interface_name],
+            capture_output=True, text=True, check=False,
+        )
+        prefix_text = ""
+        for token in result.stdout.split():
+            if "/" in token and token.count(".") == 3:
+                prefix_text = token.split("/", 1)[1]
+                break
         if prefix_text.count(".") == 3:
             return prefix_text
         if prefix_text.isdigit():

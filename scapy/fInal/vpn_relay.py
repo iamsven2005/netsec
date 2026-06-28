@@ -72,7 +72,7 @@ OPENVPN_TUN_WAIT_TIMEOUT = 30  # seconds to wait for tun after starting OpenVPN
 _openvpn_proc = None          # subprocess.Popen if we started OpenVPN
 _fwd_phys_iface = None
 _fwd_tun_iface = None
-_fwd_rules = []               # [(delete_flag_args, rule_args), ...] for teardown
+_fwd_rules = []               # [(table_flag, args), ...] for teardown
 _fwd_rules_lock = threading.Lock()
 _cleanup_registered = False
 _cleanup_done = False
@@ -250,7 +250,7 @@ def configure_passthrough(server_details):
 
 def _iptables(table_flag, args, *, check=True):
     """Run an iptables command; return True on success."""
-    cmd = ["iptables"] + table_flag + args
+    cmd = ["iptables"] + list(table_flag) + list(args)
     res = subprocess.run(cmd, capture_output=True, check=False)
     if res.returncode != 0 and check:
         print_step("WARN", f"iptables failed ({res.returncode}): {' '.join(cmd)}")
@@ -275,24 +275,20 @@ def setup_victim_forwarding(phys_iface, tun_iface, vpn_subnets):
     _fwd_tun_iface = tun_iface
 
     for subnet in vpn_subnets:
-        nat_rule = ["-o", tun_iface, "-d", subnet, "-j", "MASQUERADE"]
-        fwd_rule = ["-i", phys_iface, "-o", tun_iface, "-d", subnet, "-j", "ACCEPT"]
-        if _iptables(["-t", "nat", "-A", "POSTROUTING"], nat_rule):
+        nat_args = ["-o", tun_iface, "-d", subnet, "-j", "MASQUERADE"]
+        fwd_args = ["-i", phys_iface, "-o", tun_iface, "-d", subnet, "-j", "ACCEPT"]
+        if _iptables(["-t", "nat", "-A", "POSTROUTING"], nat_args):
             with _fwd_rules_lock:
-                _fwd_rules.append((["-t", "nat", "-D", "POSTROUTING"], nat_rule))
-        if _iptables(["-A", "FORWARD"], fwd_rule):
+                _fwd_rules.append((["-t", "nat", "-D", "POSTROUTING"], nat_args))
+        if _iptables(["-A", "FORWARD"], fwd_args):
             with _fwd_rules_lock:
-                _fwd_rules.append((["-D", "FORWARD"], fwd_rule))
+                _fwd_rules.append((["-D", "FORWARD"], fwd_args))
 
     if vpn_subnets:
-        return_rule = [
-            "-i", tun_iface,
-            "-m", "state", "--state", "RELATED,ESTABLISHED",
-            "-j", "ACCEPT",
-        ]
-        if _iptables(["-A", "FORWARD"], return_rule):
+        return_args = ["-i", tun_iface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"]
+        if _iptables(["-A", "FORWARD"], return_args):
             with _fwd_rules_lock:
-                _fwd_rules.append((["-D", "FORWARD"], return_rule))
+                _fwd_rules.append((["-D", "FORWARD"], return_args))
 
     print_step("OK", f"Forwarding installed: {phys_iface} → {tun_iface} for {vpn_subnets}")
 

