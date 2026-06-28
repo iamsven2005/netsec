@@ -138,25 +138,38 @@ def _gen_session() -> str:
 # DNS helpers
 # ---------------------------------------------------------------------------
 
+def _edns0_opt() -> DNSRR:
+    """EDNS0 OPT pseudo-RR matching dig's default wire format (udp=1232, no DNSSEC)."""
+    return DNSRR(rrname=b"\x00", type=41, rclass=1232, ttl=0, rdata=b"")
+
+
+def _dns_flags() -> dict:
+    """Common DNS query flags: RD + AD, random non-zero ID."""
+    return dict(id=random.randint(1, 65535), rd=1, ad=1)
+
+
 def _query_a(qname: str) -> None:
-    """Fire-and-forget DNS A query routed via the correct outbound interface."""
+    """Fire-and-forget DNS A query with EDNS0, matching dig's wire format."""
     iface = _outbound_iface(DNS_SERVER)
+    opt = _edns0_opt()
     pkt = IP(dst=DNS_SERVER) / UDP(sport=random.randint(1024, 65534), dport=53) / DNS(
-        rd=1,
+        **_dns_flags(),
         qd=DNSQR(qname=qname, qtype="A"),
+        ar=opt,
+        arcount=1,
     )
     send(pkt, iface=iface, verbose=0)
 
 
 def _query_txt(qname: str):
-    """
-    Send a DNS TXT query via Scapy sr1() on the dynamically detected outbound
-    interface, then wait for and return the matching response packet.
-    """
+    """DNS TXT query with EDNS0 on the correct outbound interface, waits for reply."""
     iface = _outbound_iface(DNS_SERVER)
+    opt = _edns0_opt()
     pkt = IP(dst=DNS_SERVER) / UDP(sport=random.randint(1024, 65534), dport=53) / DNS(
-        rd=1,
+        **_dns_flags(),
         qd=DNSQR(qname=qname, qtype="TXT"),
+        ar=opt,
+        arcount=1,
     )
     return sr1(pkt, iface=iface, timeout=5, verbose=0)
 
