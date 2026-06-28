@@ -11,7 +11,9 @@ Usage:
   e.g. sudo python3 dns_debug_client.py command.d.lootforge.org
 """
 
+import os
 import random
+import struct
 import sys
 from scapy.all import IP, UDP, send, sr1, conf
 from scapy.layers.dns import DNS, DNSQR, DNSRR
@@ -24,15 +26,18 @@ IFACE      = "tun0"
 
 def _build_edns0_opt() -> DNSRR:
     """
-    Build an EDNS0 OPT pseudo-RR matching dig's output:
-      name=. type=OPT(41) rclass=1232 (UDP payload size) ttl=0
+    Build an EDNS0 OPT pseudo-RR matching dig's wire format:
+      name=. type=OPT(41) rclass=1232 ttl=0
+      rdata = COOKIE option (code=10, len=8, 8 random bytes)
     """
+    client_cookie = os.urandom(8)
+    cookie_opt = struct.pack("!HH", 10, 8) + client_cookie
     return DNSRR(
-        rrname=b"\x00",   # root label "."
-        type=41,          # OPT
-        rclass=1232,      # advertised UDP payload size
-        ttl=0,            # extended RCODE + EDNS version (both 0)
-        rdata=b"",
+        rrname=b"\x00",
+        type=41,
+        rclass=1232,
+        ttl=0,
+        rdata=cookie_opt,
     )
 
 

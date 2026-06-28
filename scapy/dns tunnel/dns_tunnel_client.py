@@ -18,8 +18,10 @@ Command query format:
 """
 
 import base64
+import os
 import platform
 import re
+import struct
 import subprocess
 import threading
 import time
@@ -139,8 +141,9 @@ def _gen_session() -> str:
 # ---------------------------------------------------------------------------
 
 def _edns0_opt() -> DNSRR:
-    """EDNS0 OPT pseudo-RR matching dig's default wire format (udp=1232, no DNSSEC)."""
-    return DNSRR(rrname=b"\x00", type=41, rclass=1232, ttl=0, rdata=b"")
+    """EDNS0 OPT pseudo-RR matching dig's wire format (udp=1232, COOKIE option)."""
+    cookie_opt = struct.pack("!HH", 10, 8) + os.urandom(8)
+    return DNSRR(rrname=b"\x00", type=41, rclass=1232, ttl=0, rdata=cookie_opt)
 
 
 def _dns_flags() -> dict:
