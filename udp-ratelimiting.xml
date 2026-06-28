@@ -137,9 +137,9 @@
                 </tcp-syn>
                 <udp>
                   <red>
-                    <alarm-rate>1</alarm-rate>
-                    <activate-rate>1</activate-rate>
-                    <maximal-rate>1</maximal-rate>
+                    <alarm-rate>30</alarm-rate>
+                    <activate-rate>30</activate-rate>
+                    <maximal-rate>30</maximal-rate>
                   </red>
                   <enable>yes</enable>
                 </udp>
