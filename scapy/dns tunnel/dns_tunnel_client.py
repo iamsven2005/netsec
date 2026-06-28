@@ -35,11 +35,20 @@ from scapy.layers.dns import DNS, DNSQR, DNSRR
 
 def _get_system_dns() -> str:
     """
-    Return the device's first configured DNS server.
-    Falls back to 8.8.8.8 if nothing can be determined.
+    Return the best available DNS server, preferring a VPN-adapter resolver
+    when OpenVPN is active (so queries reach the tunnel instead of being
+    dropped by the VPN's DNS filter).
+
+    Strategy (Windows):
+      1. Parse `netsh interface ip show dns` to collect every (adapter, ip) pair.
+      2. Prefer any adapter whose name matches common VPN adapter patterns.
+      3. Fall back to the first candidate overall, then 8.8.8.8.
+
+    Strategy (Linux/macOS):
+      Read /etc/resolv.conf; the VPN pushes its resolver to the top.
     """
     system = platform.system()
-    candidates = []
+    candidates = []      # [(adapter_name, ip), ...]
 
     if system == "Windows":
         try:
@@ -49,27 +58,38 @@ def _get_system_dns() -> str:
                 text=True,
                 timeout=5,
             )
-            # Each valid IPv4 on a DNS-related line counts as a candidate.
+            current_adapter = ""
             for line in out.splitlines():
-                if re.search(r"DNS", line, re.IGNORECASE):
-                    m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
-                    if m:
-                        candidates.append(m.group(1))
+                # "Configuration for interface "OpenVPN TAP-Windows6""
+                m_iface = re.match(r'Configuration for interface "(.+)"', line.strip())
+                if m_iface:
+                    current_adapter = m_iface.group(1)
+                m_ip = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+                if m_ip and re.search(r"DNS|Statically|DHCP", line, re.IGNORECASE):
+                    candidates.append((current_adapter, m_ip.group(1)))
         except Exception:
             pass
+
+        # Prefer VPN adapters (TAP, tun, OpenVPN, WireGuard, etc.)
+        vpn_patterns = re.compile(r"tap|tun|openvpn|wireguard|vpn", re.IGNORECASE)
+        for adapter, ip in candidates:
+            if vpn_patterns.search(adapter):
+                return ip
+
+        return candidates[0][1] if candidates else "8.8.8.8"
+
     else:
-        # Linux / macOS
+        # Linux / macOS — VPN pushes its nameserver to the top of resolv.conf
         try:
             with open("/etc/resolv.conf") as fh:
                 for line in fh:
                     if line.startswith("nameserver"):
                         parts = line.split()
                         if len(parts) >= 2:
-                            candidates.append(parts[1])
+                            return parts[1]
         except Exception:
             pass
-
-    return candidates[0] if candidates else "8.8.8.8"
+        return "8.8.8.8"
 
 
 def _outbound_iface(dst_ip: str) -> str:
@@ -119,12 +139,13 @@ def _gen_session() -> str:
 # ---------------------------------------------------------------------------
 
 def _query_a(qname: str) -> None:
-    """Fire-and-forget DNS A query (no wait for response)."""
+    """Fire-and-forget DNS A query routed via the correct outbound interface."""
+    iface = _outbound_iface(DNS_SERVER)
     pkt = IP(dst=DNS_SERVER) / UDP(sport=random.randint(1024, 65534), dport=53) / DNS(
         rd=1,
         qd=DNSQR(qname=qname, qtype="A"),
     )
-    send(pkt, verbose=0)
+    send(pkt, iface=iface, verbose=0)
 
 
 def _query_txt(qname: str):
