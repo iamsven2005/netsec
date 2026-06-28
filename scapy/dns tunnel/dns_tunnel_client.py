@@ -25,7 +25,7 @@ import threading
 import time
 import random
 import string
-from scapy.all import IP, UDP, send, sr1, conf
+from scapy.all import IP, UDP, sr1, conf
 from scapy.layers.dns import DNS, DNSQR, DNSRR
 
 
@@ -111,12 +111,12 @@ def _gen_session() -> str:
 # ---------------------------------------------------------------------------
 
 def _query_a(qname: str) -> None:
-    """Fire-and-forget DNS A query (no wait for response)."""
+    """Fire-and-forget DNS A query (response discarded)."""
     pkt = IP(dst=DNS_SERVER) / UDP(sport=random.randint(1024, 65534), dport=53) / DNS(
         rd=1,
         qd=DNSQR(qname=qname, qtype="A"),
     )
-    send(pkt, verbose=0)
+    sr1(pkt, timeout=1, verbose=0)
 
 
 def _query_txt(qname: str):
