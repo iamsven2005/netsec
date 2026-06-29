@@ -24,9 +24,9 @@ vlan 10
 vlan 20
  name VLAN20
 vlan 30
- name Marketing
+ name VLAN30
 vlan 40
- name Networking
+ name VLAN40
 spanning-tree mode rapid-pvst
 spanning-tree vlan 10,20,30,40 priority 61440
 interface g1/0/24
@@ -36,8 +36,14 @@ interface g1/0/24
 interface range g1/0/1-12
  switchport access vlan 10
  no shutdown
-interface range g1/0/13-22
+interface range g1/0/13-18
  switchport access vlan 20
+ no shutdown
+interface range g1/0/19-20
+ switchport access vlan 40
+ no shutdown
+interface range g1/0/21-22
+ switchport access vlan 40
  no shutdown
 end
 
@@ -54,14 +60,14 @@ vlan 10
 vlan 20
  name VLAN20
 vlan 30
- name Marketing
+ name VLAN30
 vlan 40
- name Networking
+ name VLAN40
 spanning-tree mode rapid-pvst
 spanning-tree vlan 10,20,30,40 root primary
 ip routing
 router ospf 1
- router-id 3.3.3.3
+ router-id 2.2.2.2
 
 interface g1/0/1
  no switchport

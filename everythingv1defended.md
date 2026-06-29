@@ -29,18 +29,6 @@ router ospf 1
 interface g1/0/1
  ip ospf message-digest-key 1 md5 CISCO123
 
-interface vlan10
- ip ospf message-digest-key 1 md5 CISCO123
-
-interface vlan20
- ip ospf message-digest-key 1 md5 CISCO123
-
-interface vlan30
- ip ospf message-digest-key 1 md5 CISCO123
-
-interface vlan40
- ip ospf message-digest-key 1 md5 CISCO123
-
 
 ip dhcp snooping
 ip dhcp snooping vlan 10,20,30,40

