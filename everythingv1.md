@@ -40,7 +40,7 @@ interface range g1/0/13-18
  switchport access vlan 20
  no shutdown
 interface range g1/0/19-20
- switchport access vlan 40
+ switchport access vlan 30
  no shutdown
 interface range g1/0/21-22
  switchport access vlan 40
