@@ -770,7 +770,7 @@ def handle_dhcp_client_packet(packet, networks, proposed_leases, server_details)
             }
 
     if message_type in DHCP_RELEASE_TYPES:
-        released_ip = handle_dhcp_release(packet, networks, server_details)
+        released_ip = handle_dhcp_release(packet, networks)
         if released_ip:
             bootp = packet[BOOTP]
             return {
