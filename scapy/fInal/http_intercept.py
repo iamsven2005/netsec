@@ -27,7 +27,6 @@ os.makedirs(INTERCEPT_DIR, exist_ok=True)
 streams = defaultdict(lambda: {"buf": b"", "next_seq": None, "ooo": {}, "trusted": False})
 
 HTTP_PORT = 80
-ATTACHMENT_ONLY = True
 
 # ── Credential capture globals ─────────────────────────────────────────────────
 
@@ -162,9 +161,6 @@ EXT_MAP = {
     "image/gif":                ".gif",
 }
 
-SKIP_TYPES = {"text/html", "text/css", "application/javascript", "text/javascript"}
-
-
 def decompress_body(headers, body):
     """Decompress gzip/deflate body if Content-Encoding says so."""
     encoding = headers.get("content-encoding", "").lower()
@@ -194,12 +190,7 @@ def save_object(headers, body, stream_key):
 
     is_attachment = "attachment" in disposition.lower()
 
-    # In default mode only save explicit file downloads; --all saves everything.
-    if ATTACHMENT_ONLY and not is_attachment:
-        return
-
-    # Skip page assets when running in --all mode
-    if not is_attachment and content_type in SKIP_TYPES:
+    if not is_attachment:
         return
 
     # Decompress before saving so the file is human-readable
@@ -207,7 +198,7 @@ def save_object(headers, body, stream_key):
 
     if not filename:
         ext = EXT_MAP.get(content_type, ".bin")
-        src, sport, dst, dport = stream_key
+        src, _, dst, dport = stream_key
         filename = f"object_{src}_{dport}{ext}"
 
     filename = re.sub(r'[^\w\-_\.]', '_', os.path.basename(filename))

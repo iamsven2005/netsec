@@ -988,7 +988,7 @@ def state_exstart(context, neighbor, router_id, master_bit, sequence_number):
         return False
     try:
         neighbor_is_master = int(ipaddress.IPv4Address(router_id)) > int(ipaddress.IPv4Address(context["router_id"]))
-    except Exception:
+    except ValueError:
         neighbor_is_master = False
     if neighbor_is_master:
         neighbor["is_master"] = False

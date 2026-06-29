@@ -59,7 +59,6 @@ import http_intercept
 from dhcp_takeover import (
     print_step,
     DEFAULT_INTERFACE,
-    IMPERSONATE_REAL_SERVER,
     send_dhcpdiscover,
     sniff_dhcpoffer,
     get_interface_ipv4_addresses,
@@ -777,11 +776,7 @@ def main():
             f"VPN relay via {tun_iface} → {server_details.get('opt121_subnets')}"
             if tun_iface else "passthrough only"
         )
-        print_step(
-            "START",
-            f"Rogue DHCP server starting — {relay_mode} | "
-            f"impersonate={'ON' if IMPERSONATE_REAL_SERVER else 'OFF'}",
-        )
+        print_step("START", f"Rogue DHCP server starting — {relay_mode}")
         handled_events = sniff_for_dhcp_discover_and_request(
             networks,
             proposed_leases,
