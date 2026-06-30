@@ -37,8 +37,6 @@ ip route 192.168.100.1 255.255.255.255 10.10.10.6
 ip dhcp snooping
 ip dhcp snooping vlan 10,20,30,40
 
-interface g1/0/2
- ip dhcp snooping trust
 
 interface g1/0/24
  ip dhcp snooping trust
@@ -97,7 +95,7 @@ show ip ospf neighbor
 
 
 
-
+-- NO defences --
 
 
 
