@@ -29,6 +29,10 @@ router ospf 1
 interface g1/0/1
  ip ospf message-digest-key 1 md5 CISCO123
 
+! Static host routes for critical infrastructure
+ip route 192.168.100.6 255.255.255.255 192.168.100.6
+ip route 192.168.100.1 255.255.255.255 10.10.10.6
+
 
 ip dhcp snooping
 ip dhcp snooping vlan 10,20,30,40
@@ -52,9 +56,15 @@ conf t
 
 router ospf 1
  area 0 authentication message-digest
+ passive-interface default
+ no passive-interface g0/1/0
 
 interface g0/1/0
  ip ospf message-digest-key 1 md5 CISCO123
+
+! Static host routes for critical infrastructure
+ip route 192.168.100.6 255.255.255.255 10.10.10.5
+ip route 192.168.100.1 255.255.255.255 192.168.100.1
 
 end
 
@@ -124,17 +134,9 @@ router ospf 1
 interface g1/0/1
  no ip ospf message-digest-key 1 md5 CISCO123
 
-interface Vlan10
- no ip ospf message-digest-key 1 md5 CISCO123
+no ip route 192.168.100.6 255.255.255.255 192.168.100.6
+no ip route 192.168.100.1 255.255.255.255 10.10.10.6
 
-interface Vlan20
- no ip ospf message-digest-key 1 md5 CISCO123
-
-interface Vlan30
- no ip ospf message-digest-key 1 md5 CISCO123
-
-interface Vlan40
- no ip ospf message-digest-key 1 md5 CISCO123
 
 
 
@@ -160,8 +162,12 @@ conf t
 
 router ospf 1
  no area 0 authentication message-digest
+ no passive-interface default
 
 interface g0/1/0
  no ip ospf message-digest-key 1 md5 CISCO123
+
+no ip route 192.168.100.6 255.255.255.255 10.10.10.5
+no ip route 192.168.100.1 255.255.255.255 192.168.100.1
 
 end
