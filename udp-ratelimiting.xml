@@ -101,7 +101,51 @@
               </layer3>
             </entry>
             <entry name="ethernet1/2">
-              <virtual-wire/>
+              <layer3>
+                <ndp-proxy>
+                  <enabled>no</enabled>
+                </ndp-proxy>
+                <sdwan-link-settings>
+                  <upstream-nat>
+                    <enable>no</enable>
+                    <static-ip/>
+                  </upstream-nat>
+                  <enable>no</enable>
+                  <ipv6-enable>no</ipv6-enable>
+                </sdwan-link-settings>
+                <ip>
+                  <entry name="10.10.10.6/30"/>
+                </ip>
+                <interface-management-profile>dns-test</interface-management-profile>
+                <lldp>
+                  <enable>no</enable>
+                </lldp>
+              </layer3>
+              <lacp>
+                <port-priority>32768</port-priority>
+              </lacp>
+            </entry>
+            <entry name="ethernet1/3">
+              <layer3>
+                <ndp-proxy>
+                  <enabled>no</enabled>
+                </ndp-proxy>
+                <sdwan-link-settings>
+                  <upstream-nat>
+                    <enable>no</enable>
+                    <static-ip/>
+                  </upstream-nat>
+                  <enable>no</enable>
+                  <ipv6-enable>no</ipv6-enable>
+                </sdwan-link-settings>
+                <ip>
+                  <entry name="172.17.9.5/30"/>
+                </ip>
+                <interface-management-profile>dns-test</interface-management-profile>
+                <lldp>
+                  <enable>no</enable>
+                </lldp>
+              </layer3>
             </entry>
           </ethernet>
           <loopback>
@@ -137,9 +181,9 @@
                 </tcp-syn>
                 <udp>
                   <red>
-                    <alarm-rate>1000000</alarm-rate>
-                    <activate-rate>1</activate-rate>
-                    <maximal-rate>1</maximal-rate>
+                    <alarm-rate>30</alarm-rate>
+                    <activate-rate>30</activate-rate>
+                    <maximal-rate>30</maximal-rate>
                   </red>
                   <enable>yes</enable>
                 </udp>
@@ -336,11 +380,52 @@
                     <enable>yes</enable>
                   </entry>
                 </dampening-profile>
+                <routing-options>
+                  <graceful-restart>
+                    <enable>yes</enable>
+                  </graceful-restart>
+                </routing-options>
               </bgp>
+              <rip>
+                <enable>no</enable>
+              </rip>
+              <ospf>
+                <enable>no</enable>
+              </ospf>
+              <ospfv3>
+                <enable>no</enable>
+              </ospfv3>
             </protocol>
             <interface>
               <member>ethernet1/1</member>
+              <member>ethernet1/2</member>
+              <member>ethernet1/3</member>
             </interface>
+            <ecmp>
+              <algorithm>
+                <ip-modulo/>
+              </algorithm>
+            </ecmp>
+            <routing-table>
+              <ip>
+                <static-route>
+                  <entry name="default-route">
+                    <nexthop>
+                      <ip-address>172.17.9.6</ip-address>
+                    </nexthop>
+                    <bfd>
+                      <profile>None</profile>
+                    </bfd>
+                    <interface>ethernet1/3</interface>
+                    <metric>10</metric>
+                    <destination>0.0.0.0/0</destination>
+                    <route-table>
+                      <unicast/>
+                    </route-table>
+                  </entry>
+                </static-route>
+              </ip>
+            </routing-table>
           </entry>
         </virtual-router>
       </network>
@@ -391,13 +476,16 @@
               <network>
                 <layer3>
                   <member>ethernet1/1</member>
+                  <member>ethernet1/2</member>
                 </layer3>
                 <zone-protection-profile>dns</zone-protection-profile>
               </network>
             </entry>
             <entry name="untrust">
               <network>
-                <layer3/>
+                <layer3>
+                  <member>ethernet1/3</member>
+                </layer3>
               </network>
             </entry>
           </zone>
@@ -429,13 +517,81 @@
                   <action>allow</action>
                   <log-end>yes</log-end>
                 </entry>
+                <entry name="new" uuid="4156bdc2-83fb-4c22-a000-737c589e9d5a">
+                  <to>
+                    <member>untrust</member>
+                  </to>
+                  <from>
+                    <member>trust</member>
+                  </from>
+                  <source>
+                    <member>any</member>
+                  </source>
+                  <destination>
+                    <member>any</member>
+                  </destination>
+                  <source-user>
+                    <member>any</member>
+                  </source-user>
+                  <category>
+                    <member>any</member>
+                  </category>
+                  <application>
+                    <member>any</member>
+                  </application>
+                  <service>
+                    <member>application-default</member>
+                  </service>
+                  <source-hip>
+                    <member>any</member>
+                  </source-hip>
+                  <destination-hip>
+                    <member>any</member>
+                  </destination-hip>
+                  <action>allow</action>
+                  <log-start>no</log-start>
+                  <log-end>yes</log-end>
+                </entry>
               </rules>
             </security>
+            <nat>
+              <rules>
+                <entry name="new" uuid="a8b60398-1a4b-479b-9a3e-27e76f4381a4">
+                  <source-translation>
+                    <dynamic-ip>
+                      <translated-address>
+                        <member>203.149.210.9</member>
+                        <member>203.149.210.10</member>
+                        <member>203.149.210.11</member>
+                        <member>203.149.210.12</member>
+                        <member>203.149.210.13</member>
+                        <member>203.149.210.14</member>
+                      </translated-address>
+                    </dynamic-ip>
+                  </source-translation>
+                  <to>
+                    <member>untrust</member>
+                  </to>
+                  <from>
+                    <member>trust</member>
+                  </from>
+                  <source>
+                    <member>any</member>
+                  </source>
+                  <destination>
+                    <member>any</member>
+                  </destination>
+                  <service>any</service>
+                </entry>
+              </rules>
+            </nat>
           </rulebase>
           <import>
             <network>
               <interface>
                 <member>ethernet1/1</member>
+                <member>ethernet1/2</member>
+                <member>ethernet1/3</member>
               </interface>
             </network>
           </import>
