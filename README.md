@@ -53,3 +53,35 @@ Suggested target: **attack working by 19 Jun**, otherwise July may become very t
 
 Report document:
 https://docs.google.com/document/d/1XUnHJ_M1wCz90MIbPeqOzpmUXQBvzkyq/edit?usp=sharing&ouid=111394012869341403431&rtpof=true&sd=true
+
+
+plug wire to mgt port and a management cable to fw2 on the patch panel
+
+on your laptop, change address to 192.168.1.2 (or wtv samw subnet address
+
+visit https://192.168.1.1
+username admin
+password admin
+change password to Student@s1t
+
+go to tera term and type admin and Student@s1t
+
+set system ztp disable
+
+wait for the https page to come back online
+
+login again
+
+at the grey top panel, look for device
+
+look for operation at the top bar of the device page
+
+click on import config and import the XML file
+
+once done click on load config in same page
+
+at the top left corner of the page you should see a commit button
+
+click and wait for changes
+
+test if it works
