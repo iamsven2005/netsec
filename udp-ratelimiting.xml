@@ -139,12 +139,33 @@
                   <ipv6-enable>no</ipv6-enable>
                 </sdwan-link-settings>
                 <ip>
-                  <entry name="172.17.9.5/30"/>
+                  <entry name="172.17.9.33/30"/>
                 </ip>
                 <interface-management-profile>dns-test</interface-management-profile>
                 <lldp>
                   <enable>no</enable>
                 </lldp>
+              </layer3>
+            </entry>
+            <entry name="ethernet1/8">
+              <layer3>
+                <ndp-proxy>
+                  <enabled>no</enabled>
+                </ndp-proxy>
+                <sdwan-link-settings>
+                  <upstream-nat>
+                    <enable>no</enable>
+                    <static-ip/>
+                  </upstream-nat>
+                  <enable>no</enable>
+                  <ipv6-enable>no</ipv6-enable>
+                </sdwan-link-settings>
+                <lldp>
+                  <enable>no</enable>
+                </lldp>
+                <ip>
+                  <entry name="192.168.100.4/30"/>
+                </ip>
               </layer3>
             </entry>
           </ethernet>
@@ -390,16 +411,71 @@
                 <enable>no</enable>
               </rip>
               <ospf>
-                <enable>no</enable>
+                <enable>yes</enable>
+                <area>
+                  <entry name="0.0.0.0">
+                    <type>
+                      <normal/>
+                    </type>
+                    <interface>
+                      <entry name="ethernet1/2">
+                        <bfd>
+                          <profile>Inherit-vr-global-setting</profile>
+                        </bfd>
+                        <enable>yes</enable>
+                        <passive>no</passive>
+                        <gr-delay>10</gr-delay>
+                        <metric>10</metric>
+                        <priority>1</priority>
+                        <hello-interval>10</hello-interval>
+                        <dead-counts>4</dead-counts>
+                        <retransmit-interval>5</retransmit-interval>
+                        <transit-delay>1</transit-delay>
+                        <link-type>
+                          <p2p/>
+                        </link-type>
+                      </entry>
+                    </interface>
+                  </entry>
+                </area>
+                <router-id>1.1.1.1</router-id>
+                <global-bfd>
+                  <profile>default</profile>
+                </global-bfd>
+                <reject-default-route>yes</reject-default-route>
+                <export-rules>
+                  <entry name="def">
+                    <new-path-type>ext-2</new-path-type>
+                    <metric>10</metric>
+                  </entry>
+                </export-rules>
+                <allow-redist-default-route>yes</allow-redist-default-route>
               </ospf>
               <ospfv3>
                 <enable>no</enable>
               </ospfv3>
+              <redist-profile>
+                <entry name="def">
+                  <filter>
+                    <type>
+                      <member>static</member>
+                    </type>
+                    <destination>
+                      <member>0.0.0.0/0</member>
+                    </destination>
+                  </filter>
+                  <priority>10</priority>
+                  <action>
+                    <redist/>
+                  </action>
+                </entry>
+              </redist-profile>
             </protocol>
             <interface>
               <member>ethernet1/1</member>
               <member>ethernet1/2</member>
               <member>ethernet1/3</member>
+              <member>ethernet1/8</member>
             </interface>
             <ecmp>
               <algorithm>
@@ -411,7 +487,7 @@
                 <static-route>
                   <entry name="default-route">
                     <nexthop>
-                      <ip-address>172.17.9.6</ip-address>
+                      <ip-address>172.17.9.34</ip-address>
                     </nexthop>
                     <bfd>
                       <profile>None</profile>
@@ -488,6 +564,13 @@
                 </layer3>
               </network>
             </entry>
+            <entry name="dmz">
+              <network>
+                <layer3>
+                  <member>ethernet1/8</member>
+                </layer3>
+              </network>
+            </entry>
           </zone>
           <service/>
           <service-group/>
@@ -495,7 +578,7 @@
           <rulebase>
             <security>
               <rules>
-                <entry name="rule1" uuid="7ea31909-9971-4b71-a308-f1ea4962e32a">
+                <entry name="rule1" uuid="9de4e53e-f868-4cec-96c1-65eed4462549">
                   <from>
                     <member>trust</member>
                   </from>
@@ -517,7 +600,7 @@
                   <action>allow</action>
                   <log-end>yes</log-end>
                 </entry>
-                <entry name="new" uuid="4156bdc2-83fb-4c22-a000-737c589e9d5a">
+                <entry name="new" uuid="9772ebda-9fe7-49b4-88a6-57b60630f890">
                   <to>
                     <member>untrust</member>
                   </to>
@@ -556,16 +639,16 @@
             </security>
             <nat>
               <rules>
-                <entry name="new" uuid="a8b60398-1a4b-479b-9a3e-27e76f4381a4">
+                <entry name="new" uuid="02c80e22-3204-4428-ba52-63cdd08b2024">
                   <source-translation>
                     <dynamic-ip>
                       <translated-address>
-                        <member>203.149.210.9</member>
-                        <member>203.149.210.10</member>
-                        <member>203.149.210.11</member>
-                        <member>203.149.210.12</member>
-                        <member>203.149.210.13</member>
-                        <member>203.149.210.14</member>
+                        <member>203.149.210.65</member>
+                        <member>203.149.210.66</member>
+                        <member>203.149.210.67</member>
+                        <member>203.149.210.68</member>
+                        <member>203.149.210.69</member>
+                        <member>203.149.210.70</member>
                       </translated-address>
                     </dynamic-ip>
                   </source-translation>
@@ -592,6 +675,7 @@
                 <member>ethernet1/1</member>
                 <member>ethernet1/2</member>
                 <member>ethernet1/3</member>
+                <member>ethernet1/8</member>
               </interface>
             </network>
           </import>
