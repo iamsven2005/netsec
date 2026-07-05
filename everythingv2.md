@@ -2,9 +2,8 @@
 #sandisk=vpn
 #sd=victim
 
-https://docs.google.com/document/d/1XUnHJ_M1wCz90MIbPeqOzpmUXQBvzkyq/edit?usp=sharing&ouid=111394012869341403431&rtpof=true&sd=true
-
-rack 1c isp1
+rack 1a isp1
+203.149.210.8/29
 
 en
 write erase
@@ -116,41 +115,31 @@ end
 
 
 
-R1
-
+R1 —
 en
 conf t
 hostname R1
-router ospf 1
- router-id 1.1.1.1
- default-information originate always
 
-ip route 0.0.0.0 0.0.0.0 172.17.9.14
+ip route 0.0.0.0 0.0.0.0 172.17.10.6
 
 ! DMZ - VPN server (192.168.100.0/30)
 interface g0/0/0
- ip address 192.168.100.2 255.255.255.252
+ ip address 192.168.200.1 255.255.255.252
  ip nat inside
- ip ospf 1 area 0
- ip ospf network point-to-point
  no shutdown
 
 interface g0/0/1
- ip address 172.17.9.13 255.255.255.252
- ip nat outside
+ ip address 192.168.150.1 255.255.255.252
+ ip nat inside
  no shutdown
 
 interface g0/1/0
- ip address 10.10.10.6 255.255.255.252
- ip nat inside
- ip ospf 1 area 0
- ip ospf network point-to-point
+ ip address 172.17.10.5 255.255.255.252
+ ip nat outside
  no shutdown
 
-ip nat pool NAT_POOL 203.149.210.25 203.149.210.30 netmask 255.255.255.248
-access-list 1 permit 192.168.0.0 0.0.255.255
-ip nat inside source list 1 pool NAT_POOL overload
-ip nat inside source static 192.168.100.1 203.149.210.24
+ip nat inside source static 192.168.200.2 129.126.142.8
+ip nat inside source static 192.168.150.2 129.126.142.9
 end
 
 
@@ -201,7 +190,7 @@ end
 ```mermaid
 graph TD
     INET((Internet))
-    R1["R1 — NAT Gateway\ng0/0/1: 172.17.9.13/30"]
+    FW["FW — Edge Router / NAT Gateway"]
     VPN["VPN Server\n192.168.100.1"]
     R2["R2 — DHCP Server\ng0/0/0: 192.168.100.6/30"]
     DSW1["DSW1\nSTP Root Primary / L3 Switch"]
@@ -209,9 +198,9 @@ graph TD
     PCA(["PCA — VLAN 10\n192.168.1.0/24"])
     PCB(["PCB — VLAN 20\n192.168.2.0/24"])
 
-    INET --- |WAN 172.17.9.12/30| R1
-    R1 --- |DMZ 192.168.100.0/30| VPN
-    R1 --- |10.10.10.4/30| DSW1
+    INET --- |WAN 172.17.9.32/30| FW
+    FW --- |L3 10.10.10.4/30| DSW1
+    FW --- |Po8| VPN
     DSW1 --- |192.168.100.4/30| R2
     DSW1 --- |trunk g1/0/24| S1
     S1 --- PCA
@@ -224,16 +213,16 @@ graph TD
 
 | Device | Local Port  | Destination | Dst Port    | Link                         |
 |--------|-------------|-------------|-------------|------------------------------|
-| R1     | g0/0/0      | VPN Server  | —           | DMZ 192.168.100.0/30         |
-| R1     | g0/0/1      | Internet    | —           | WAN 172.17.9.12/30           |
-| R1     | g0/1/0      | DSW1        | g1/0/1      | L3 10.10.10.4/30             |
-| R2     | g0/0/0      | DSW1        | g1/0/2      | 192.168.100.4/30             |
-| DSW1   | g1/0/1      | R1          | g0/1/0      | L3 10.10.10.4/30             |
-| DSW1   | g1/0/2      | R2          | g0/0/0      | 192.168.100.4/30             |
-| DSW1   | g1/0/24     | S1          | g1/0/24     | Trunk VLANs 10,20,30,40      |
-| S1     | g1/0/24     | DSW1        | g1/0/24     | Trunk VLANs 10,20,30,40      |
-| S1     | g1/0/1-12   | PCA         | —           | Access VLAN 10               |
-| S1     | g1/0/13-18  | PCB         | —           | Access VLAN 20               |
+| FW     | Po3         | Internet    | —           | WAN 172.17.9.4/30 (fw=.5) light blue|
+| FW     | Po2         | DSW1        | g1/0/1      | L3 10.10.10.4/30 (FW=.6)  light green   |
+| FW     | Po8         | VPN Server  | —           | 192.168.100.4/30 (FW=.9)  orange   |
+| R2     | g0/0/0      | DSW1        | g1/0/2      | 192.168.100.4/30          dark green   |
+| DSW1   | g1/0/1      | FW          | Po2         | L3 10.10.10.4/30 (DSW1=.5)light green   |
+| DSW1   | g1/0/2      | R2          | g0/0/0      | 192.168.100.4/30          dark green   |
+| DSW1   | g1/0/24     | S1          | g1/0/24     | Trunk VLANs 10,20,30,40   short yellow   |
+| S1     | g1/0/24     | DSW1        | g1/0/24     | Trunk VLANs 10,20,30,40   short yellow   |
+| S1     | g1/0/1-12   | PCA         | —           | Access VLAN 10             red  |
+| S1     | g1/0/13-18  | PCB         | —           | Access VLAN 20             green |
 | S1     | g1/0/19-20  | PCC         | —           | Access VLAN 30               |
 | S1     | g1/0/21-22  | PCD         | —           | Access VLAN 40               |
 

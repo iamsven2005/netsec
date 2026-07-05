@@ -55,13 +55,7 @@ OVPN_BINARY_PATHS = [
 ]
 
 OVPN_PROFILE_DIRS = [
-    os.path.dirname(os.path.abspath(__file__)),  # same dir as this script
-    os.path.expanduser("~/.config/OpenVPN Connect/profiles"),
-    "/etc/openvpn",
-    "/etc/openvpn/client",
-    os.path.expanduser("~/.config/openvpn"),
-    os.path.expanduser("~/openvpn"),
-    ".",
+    os.path.dirname(os.path.abspath(__file__)),
 ]
 
 OPENVPN_TUN_WAIT_TIMEOUT = 30  # seconds to wait for tun after starting OpenVPN

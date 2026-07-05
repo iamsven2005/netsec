@@ -135,9 +135,8 @@ def sniff_ospf_hellos(iface, timeout=30):
 
     _auth_names = {0: "none", 1: "simple-password", 2: "MD5"}
     for p in results:
-        import ipaddress as _ip
         try:
-            subnet = _ip.IPv4Network(f"{p['src_ip']}/{p['netmask']}", strict=False)
+            subnet = ipaddress.IPv4Network(f"{p['src_ip']}/{p['netmask']}", strict=False)
         except Exception:
             subnet = f"{p['src_ip']}/{p['netmask']}"
         log_message(f"[OSPF] SVI  router_id={p['router_id']}  ip={p['src_ip']}  "
@@ -319,9 +318,8 @@ def setup_policy_routing(iface, svi_ip, tun_iface=None, vpn_subnets=None):
     )
     for token in result.stdout.split():
         if "/" in token and token.count(".") == 3:
-            import ipaddress as _ip
             try:
-                net = str(_ip.IPv4Interface(token).network)
+                net = str(ipaddress.IPv4Interface(token).network)
                 r(["ip", "route", "add", net, "dev", iface,
                    "table", _POLICY_TABLE], capture_output=True, check=False)
             except Exception as exc:

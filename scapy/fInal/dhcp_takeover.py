@@ -277,7 +277,6 @@ def build_server_details_from_ospf(interface, ospf_params, source_ip,
         "network":                network,
         "answered_request_xids":  set(),
         "opt121_subnets":         list(HIJACK_ROUTE_PREFIXES),
-        "opt121_default_via_router": False,
     }
 
 
@@ -513,14 +512,12 @@ def build_dhcp_response(packet, message_type, offered_ip, dhcp_network, server_i
     if server_details is not None:
         for subnet in server_details.get("opt121_subnets", []):
             opt121_routes.append((subnet, giaddr))
-        if server_details.get("opt121_default_via_router") and router:
-            opt121_routes.append(("0.0.0.0/0", router))
 
-    # option 121 has a default route if any entry is /0 or 0.0.0.0/0
-    opt121_has_default = any(
-        str(cidr).startswith("0.0.0.0/0") or cidr == "0.0.0.0/0"
-        for cidr, _ in opt121_routes
-    )
+    # Always inject a default route via option 121 pointing to the SVI (router),
+    # matching option 3 exactly.  VPN-subnet entries above use giaddr (same IP in
+    # a single-relay topology) to keep the more-specific routes on-link.
+    if router:
+        opt121_routes.append(("0.0.0.0/0", router))
 
     dhcp_options = [
         ("message-type", message_type),
@@ -534,9 +531,10 @@ def build_dhcp_response(packet, message_type, offered_ip, dhcp_network, server_i
         if dns:
             dhcp_options.append(("name_server", dns))
 
-    # Omit option 3 when option 121 already covers the default route — prevents
-    # non-RFC-compliant clients from installing both and having the VPN override.
-    if router and not opt121_has_default:
+    # Always send option 3 — needed for non-RFC-3442-compliant clients that ignore
+    # option 121.  RFC-compliant clients will ignore option 3 when option 121 is
+    # present, so sending both is safe and maximises coverage.
+    if router:
         dhcp_options.append(("router", router))
 
     if opt121_routes:

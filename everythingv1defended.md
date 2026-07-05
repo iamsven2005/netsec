@@ -30,8 +30,8 @@ interface g1/0/1
  ip ospf message-digest-key 1 md5 CISCO123
 
 ! Static host routes for critical infrastructure
-ip route 192.168.100.6 255.255.255.255 192.168.100.6
-ip route 192.168.100.1 255.255.255.255 10.10.10.6
+! ip route 192.168.100.6 255.255.255.255 192.168.100.6
+! ip route 192.168.100.1 255.255.255.255 10.10.10.6
 
 
 ip dhcp snooping
@@ -85,6 +85,11 @@ show ip ospf neighbor
 
 
 
+FW
+network>virtual routers>default
+ospf >auth profiles> add keyID&name(anything) key CISCO123
+1 time set up ^
+go to ospf>areas>0.0.0.0>interface>e1/2>auth profile> <name>
 
 
 
@@ -136,10 +141,6 @@ no ip route 192.168.100.6 255.255.255.255 192.168.100.6
 no ip route 192.168.100.1 255.255.255.255 10.10.10.6
 
 
-
-
-interface g1/0/2
- no ip dhcp snooping trust
 
 interface g1/0/24
  no ip dhcp snooping trust
